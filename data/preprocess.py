@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from datetime import datetime
 import json
+import os
 
 def load_data(data_path: str) -> pd.DataFrame:
     """Load transaction data from CSV or parquet file."""
@@ -15,16 +16,21 @@ def load_data(data_path: str) -> pd.DataFrame:
     # Use posted_date as timestamp if available
     if 'posted_date' in df.columns:
         df['timestamp'] = df['posted_date']
-    elif 'books_create_timestamp' in df.columns:
-        df['timestamp'] = df['books_create_timestamp']
-    else:
-        print("Warning: No timestamp column found, generating dummy timestamps")
-        start_date = pd.to_datetime('2022-01-01')
-        end_date = pd.to_datetime('2023-01-01')
-        time_range = (end_date - start_date).days
-        random_days = np.random.randint(0, time_range, size=len(df))
-        df['timestamp'] = start_date + pd.to_timedelta(random_days, unit='D')
+    else: 
+        df['timestamp'] = df['books_create_timestamp'] 
     
+
+    # Convert timestamp to datetime and handle parsing errors
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    
+    # Check if there are any NaT values and inform the user
+    nat_count = df['timestamp'].isna().sum()
+    if nat_count > 0:
+        print(f"Warning: Found {nat_count} rows with invalid timestamps. These will be removed.")
+        
+    # Remove rows with NaT timestamps
+    df = df.dropna(subset=['timestamp'])
+    df = df.drop('is_uncat_fdp_logic', axis=1)
     return df
 
 def extract_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -51,10 +57,11 @@ def extract_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
+    
 def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
     """Extract features from transaction amount."""
-    # Log transform amount
-    df['amount_log'] = np.log1p(df['amount'])
+    # Log transform amount (ensure amounts are positive)
+    df['amount_log'] = np.log1p(np.maximum(0, df['amount']))
     
     # Amount statistics per user
     user_amount_stats = df.groupby('user_id')['amount'].agg([
@@ -71,19 +78,58 @@ def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
         'user_transaction_count'
     ]
     
+    # Ensure std is never zero to avoid division by zero
+    user_amount_stats['user_amount_std'] = user_amount_stats['user_amount_std'].replace(0, 1)
+    
     # Merge with original dataframe
     df = df.merge(user_amount_stats, on='user_id', how='left')
     
-    # Amount relative to user statistics
-    df['amount_relative_to_mean'] = df['amount'] / df['user_amount_mean']
+    # Amount relative to user statistics (with safe division)
+    df['amount_relative_to_mean'] = df['amount'] / df['user_amount_mean'].replace(0, 1)
     df['amount_relative_to_std'] = (df['amount'] - df['user_amount_mean']) / df['user_amount_std']
     
-    # Amount percentiles
-    df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
-        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop')
-    )
+    # Handle percentile calculation safely
+    try:
+        df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
+            lambda x: pd.qcut(x, q=min(10, len(x)), labels=False, duplicates='drop') if len(x) > 1 else 0
+        )
+    except Exception:
+        df['amount_percentile'] = 0
     
     return df
+# def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
+#     """Extract features from transaction amount."""
+#     # Log transform amount
+#     df['amount_log'] = np.log1p(df['amount'])
+    
+#     # Amount statistics per user
+#     user_amount_stats = df.groupby('user_id')['amount'].agg([
+#         'mean', 'std', 'min', 'max', 'count'
+#     ]).reset_index()
+    
+#     # Rename columns
+#     user_amount_stats.columns = [
+#         'user_id',
+#         'user_amount_mean',
+#         'user_amount_std',
+#         'user_amount_min',
+#         'user_amount_max',
+#         'user_transaction_count'
+#     ]
+    
+#     # Merge with original dataframe
+#     df = df.merge(user_amount_stats, on='user_id', how='left')
+    
+#     # Amount relative to user statistics
+#     df['amount_relative_to_mean'] = df['amount'] / df['user_amount_mean']
+#     df['amount_relative_to_std'] = (df['amount'] - df['user_amount_mean']) / df['user_amount_std']
+    
+#     # Amount percentiles
+#     df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
+#         lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop')
+#     )
+    
+#     return df
 
 def extract_merchant_features(df: pd.DataFrame) -> pd.DataFrame:
     """Extract features from merchant information."""
@@ -144,6 +190,24 @@ def encode_categorical_features(
     
     return df, label_encoders
 
+# def scale_numerical_features(
+#     df: pd.DataFrame,
+#     numerical_columns: List[str],
+#     scalers: Optional[Dict[str, StandardScaler]] = None
+# ) -> Tuple[pd.DataFrame, Dict[str, StandardScaler]]:
+#     """Scale numerical features using StandardScaler."""
+#     if scalers is None:
+#         scalers = {}
+    
+#     for col in numerical_columns:
+#         if col not in scalers:
+#             scalers[col] = StandardScaler()
+#             df[col] = scalers[col].fit_transform(df[[col]])
+#         else:
+#             df[col] = scalers[col].transform(df[[col]])
+    
+#     return df, scalers
+
 def scale_numerical_features(
     df: pd.DataFrame,
     numerical_columns: List[str],
@@ -154,6 +218,18 @@ def scale_numerical_features(
         scalers = {}
     
     for col in numerical_columns:
+        if col not in df.columns:
+            continue
+            
+        # Replace infinity values with NaN
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+        
+        # Fill NaN values with column mean or 0
+        if df[col].isna().any():
+            mean_val = df[col].mean()
+            df[col] = df[col].fillna(0 if pd.isna(mean_val) else mean_val)
+        
+        # Now perform scaling
         if col not in scalers:
             scalers[col] = StandardScaler()
             df[col] = scalers[col].fit_transform(df[[col]])
@@ -191,12 +267,14 @@ def preprocess_data(
             'account_type_id',
             'tax_account_type',
             'company_name',
-            'industry_name',
+            'industry_code',
             'region_name',
             'language_name',
             'category_name',
             'category_id',
             'user_category_id'
+            
+            
         ]
         # Filter out columns that don't exist in the dataframe
         categorical_columns = [col for col in categorical_columns if col in df.columns]
@@ -239,7 +317,7 @@ def preprocess_data(
         'account_type_id': 'unknown',
         'tax_account_type': 'unknown',
         'company_name': 'unknown',
-        'industry_name': 'unknown',
+        'industry_code': 'unknown',
         'region_name': 'unknown',
         'language_name': 'unknown',
         'category_name': 'unknown'
@@ -250,9 +328,20 @@ def preprocess_data(
     
     # Scale numerical features
     df, scalers = scale_numerical_features(df, numerical_columns)
+
+    if output_path.endswith('/') or os.path.isdir(output_path):
+        os.makedirs(output_path, exist_ok=True)
+        output_file = os.path.join(output_path, 'processed_data.csv')
+    else:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        output_file = output_path
     
     # Save preprocessed data
-    df.to_csv(output_path, index=False)
+    df.to_csv(output_file, index=False)
+
+    
+    # # Save preprocessed data
+    # df.to_csv(output_path, index=False)
     
     # Save label mappings if provided
     if label_mapping_path:
