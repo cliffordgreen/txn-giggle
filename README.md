@@ -1,20 +1,50 @@
-# Transaction Classification System
+# Transaction Classification Model
 
-A state-of-the-art multi-modal transaction classification model that predicts both global and user-specific categories for financial transactions. The system combines:
+This project implements a multi-modal transaction classification model that leverages:
+1. Graph structure of transactions and merchants
+2. Sequential history of user transactions
+3. Text descriptions and memos
 
-- Graph Neural Networks (GNN) for cross-transaction relationships
-- Sequential models for per-user transaction patterns
-- Transformer-based text encoding for transaction descriptions
-- Multi-task learning for category prediction
+## Key Features
 
-## Features
+### Fusion Mechanisms
+The model supports three different fusion mechanisms to combine information from different modalities:
+- **Multi-Task Fusion**: Trains separate classifiers for each modality and combines them with a weighted sum
+- **Attention Fusion**: Uses an attention mechanism to dynamically weight the importance of each modality
+- **Gating Fusion**: Uses gate values to control information flow from each modality
 
-- Heterogeneous graph modeling of transaction relationships
-- Temporal pattern recognition via LSTM/GRU
-- BERT-based text understanding
-- Robust handling of missing data
-- Multi-modal feature fusion
-- Multi-task learning for category prediction
+### Sequence Handling
+- Enhanced time delta encoding to capture temporal patterns
+- Attention-weighted representation of transaction history
+- Normalization of large time gaps
+
+### Graph Structure
+- Heterogeneous graph with transaction, merchant, and category nodes
+- Multiple edge types (belongs_to, categorized_as, temporal, similar_amount)
+- Message passing via graph neural networks
+
+### Text Processing
+- Multi-field encoding of transaction descriptions and memos
+- Pretrained language model for semantic understanding
+- Field-specific weights to handle different text fields
+
+## Results
+
+The modality weights for different fusion approaches (based on synthetic data):
+
+| Fusion Type | Graph Weight | Sequence Weight | Text Weight | Accuracy |
+|-------------|--------------|----------------|-------------|----------|
+| Multi-Task  | 0.1798       | 0.6588         | 0.1613      | 0.0000   |
+| Attention   | 0.3847       | 0.3872         | 0.2281      | 0.0000   |
+| Gating      | 0.4382       | 0.3980         | 0.7514      | 0.0417   |
+
+*Note: These results are based on synthetic data and don't reflect real transaction patterns.*
+
+## Future Work
+- Train with real transaction data
+- Add user personalization features
+- Implement contrastive learning for better representations
+- Support for more input modalities (location, device, etc.)
 
 ## Installation
 

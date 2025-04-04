@@ -62,7 +62,7 @@ class TransactionClassifier(pl.LightningModule):
         seq_num_layers: int = 2,
         text_model_name: str = 'bert-base-uncased',
         text_max_length: int = 128,
-        fusion_type: str = 'multi_task',  # Options: 'attention', 'gating', 'multi_task'
+        fusion_type: str = 'gating',  # Options: 'attention', 'gating', 'multi_task'
         fusion_hidden_dim: int = 256,
         fusion_dropout: float = 0.2,
         learning_rate: float = 1e-4,
@@ -199,15 +199,47 @@ class TransactionClassifier(pl.LightningModule):
         
         return global_logits, user_logits, fusion_weights
     
+    def _log_modality_weights(self, attention_weights, phase='train'):
+        """Log modality weights for analysis."""
+        # Handle different return types from different fusion methods
+        if isinstance(attention_weights, dict):
+            # GatingFusion returns a dictionary of weights
+            modality_weights = {k: v.mean().item() for k, v in attention_weights.items()}
+            
+            # Log each modality weight
+            for modality, weight in modality_weights.items():
+                self.log(f'{phase}_weight_{modality}', weight)
+            
+            # Convert to tensor for dominant modality calculation
+            weight_values = torch.tensor([modality_weights[k] for k in self.modality_dims.keys()])
+            dominant_idx = weight_values.argmax().item()
+        else:
+            # Average across the batch dimension for tensor weights
+            avg_weights = attention_weights.mean(dim=0)
+            
+            # Get weights for each modality
+            modality_weights = {k: v.item() for k, v in zip(self.modality_dims.keys(), avg_weights)}
+            
+            # Log each modality weight
+            for modality, weight in modality_weights.items():
+                self.log(f'{phase}_weight_{modality}', weight)
+            
+            # Log the dominant modality
+            dominant_idx = avg_weights.argmax().item()
+            
+        # Log dominant modality index
+        dominant_modality = list(self.modality_dims.keys())[dominant_idx]
+        self.log(f'{phase}_dominant_modality', dominant_idx, prog_bar=True)
+        
+        return modality_weights
+    
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """Training step with loss computation for multi-task learning."""
+        """Training step with multi-task learning."""
         # Forward pass to get logits for both tasks
         global_logits, user_logits, attention_weights = self(batch)
         
         # Log modality attention weights
-        avg_weights = {k: v.mean().item() for k, v in zip(self.modality_dims.keys(), attention_weights.mean(dim=0))}
-        for key, value in avg_weights.items():
-            self.log(f'train_weight_{key}', value)
+        self._log_modality_weights(attention_weights, phase='train')
         
         # Compute losses for both tasks
         global_loss = self.criterion(global_logits, batch['labels'])
@@ -234,9 +266,7 @@ class TransactionClassifier(pl.LightningModule):
         global_logits, user_logits, attention_weights = self(batch)
         
         # Log modality attention weights
-        avg_weights = {k: v.mean().item() for k, v in zip(self.modality_dims.keys(), attention_weights.mean(dim=0))}
-        for key, value in avg_weights.items():
-            self.log(f'val_weight_{key}', value)
+        self._log_modality_weights(attention_weights, phase='val')
         
         # Compute losses for both tasks
         global_loss = self.criterion(global_logits, batch['labels'])
@@ -263,9 +293,7 @@ class TransactionClassifier(pl.LightningModule):
         global_logits, user_logits, attention_weights = self(batch)
         
         # Log modality attention weights
-        avg_weights = {k: v.mean().item() for k, v in zip(self.modality_dims.keys(), attention_weights.mean(dim=0))}
-        for key, value in avg_weights.items():
-            self.log(f'test_weight_{key}', value)
+        modality_weights = self._log_modality_weights(attention_weights, phase='test')
         
         # Compute losses for both tasks
         global_loss = self.criterion(global_logits, batch['labels'])

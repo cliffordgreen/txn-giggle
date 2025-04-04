@@ -155,29 +155,46 @@ class TransactionDataModule(pl.LightningDataModule):
     
     def _build_graph(self):
         """Build heterogeneous transaction graph with multiple node types and edge types."""
+        print("Building graph (this may take a while for large datasets)...")
+        
         # Create transaction node features with cyclical time encoding
         transaction_features = []
-        for _, row in self.transactions_df.iterrows():
-            # Cyclical encoding for time features
-            hour = row['hour']
-            day = row['weekday']
+        print("Processing transaction features...")
+        
+        # Process in chunks to reduce memory pressure
+        chunk_size = 10000
+        num_chunks = (len(self.transactions_df) + chunk_size - 1) // chunk_size
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, len(self.transactions_df))
+            chunk = self.transactions_df.iloc[start_idx:end_idx]
             
-            # Hour encoding (24-hour cycle)
-            hour_sin = np.sin(2 * np.pi * hour / 24)
-            hour_cos = np.cos(2 * np.pi * hour / 24)
+            chunk_features = []
+            for _, row in chunk.iterrows():
+                # Cyclical encoding for time features
+                hour = row['hour']
+                day = row['weekday']
+                
+                # Hour encoding (24-hour cycle)
+                hour_sin = np.sin(2 * np.pi * hour / 24)
+                hour_cos = np.cos(2 * np.pi * hour / 24)
+                
+                # Day encoding (7-day cycle)
+                day_sin = np.sin(2 * np.pi * day / 7)
+                day_cos = np.cos(2 * np.pi * day / 7)
+                
+                # Combine features
+                features = [
+                    row['amount'],  # Raw amount
+                    hour_sin, hour_cos,  # Cyclical hour encoding
+                    day_sin, day_cos,    # Cyclical day encoding
+                    row['timestamp'].timestamp()  # Absolute timestamp
+                ]
+                chunk_features.append(features)
             
-            # Day encoding (7-day cycle)
-            day_sin = np.sin(2 * np.pi * day / 7)
-            day_cos = np.cos(2 * np.pi * day / 7)
+            transaction_features.extend(chunk_features)
             
-            # Combine features
-            features = [
-                row['amount'],  # Raw amount
-                hour_sin, hour_cos,  # Cyclical hour encoding
-                day_sin, day_cos,    # Cyclical day encoding
-                row['timestamp'].timestamp()  # Absolute timestamp
-            ]
-            transaction_features.append(features)
         transaction_features = torch.tensor(transaction_features, dtype=torch.float)
         
         # Create merchant node features (using aggregated statistics)
@@ -379,7 +396,10 @@ class TransactionDataModule(pl.LightningDataModule):
             dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0,  # Use single process for MPS compatibility
+            num_workers=self.num_workers,  # Use multiple workers on AWS G6.4xlarge
+            pin_memory=True,  # Speed up data transfer to GPU
+            persistent_workers=True if self.num_workers > 0 else False,  # Keep workers alive between batches
+            prefetch_factor=2 if self.num_workers > 0 else None,  # Prefetch batches for improved throughput
             collate_fn=self._collate_fn
         )
     
@@ -398,7 +418,10 @@ class TransactionDataModule(pl.LightningDataModule):
             dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=0,  # Use single process for MPS compatibility
+            num_workers=self.num_workers,  # Use multiple workers on AWS G6.4xlarge
+            pin_memory=True,  # Speed up data transfer to GPU
+            persistent_workers=True if self.num_workers > 0 else False,  # Keep workers alive between batches
+            prefetch_factor=2 if self.num_workers > 0 else None,  # Prefetch batches for improved throughput
             collate_fn=self._collate_fn
         )
     
@@ -417,7 +440,10 @@ class TransactionDataModule(pl.LightningDataModule):
             dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=0,  # Use single process for MPS compatibility
+            num_workers=self.num_workers,  # Use multiple workers on AWS G6.4xlarge
+            pin_memory=True,  # Speed up data transfer to GPU
+            persistent_workers=True if self.num_workers > 0 else False,  # Keep workers alive between batches
+            prefetch_factor=2 if self.num_workers > 0 else None,  # Prefetch batches for improved throughput
             collate_fn=self._collate_fn
         )
     
@@ -437,31 +463,58 @@ class TransactionDataModule(pl.LightningDataModule):
         edge_indices = {}
         edge_attrs = {}
         
-        # Process temporal edges
+        # Process temporal edges - optimized to limit edges per node
         temporal_edges = []
         temporal_attrs = []
+        max_temporal_edges_per_node = min(5, len(batch_indices) - 1)  # Limit number of temporal edges per node
+        
         for i, idx in enumerate(batch_indices):
+            tx_time = self.transactions_df.iloc[idx]['timestamp']
+            time_diffs = []
+            
             for j, other_idx in enumerate(batch_indices):
                 if i != j:
-                    time_diff = abs((self.transactions_df.iloc[idx]['timestamp'] - 
-                                   self.transactions_df.iloc[other_idx]['timestamp']).total_seconds())
+                    time_diff = abs((tx_time - self.transactions_df.iloc[other_idx]['timestamp']).total_seconds())
                     if time_diff <= 86400:  # Within 24 hours
-                        temporal_edges.extend([[i, j]])
-                        temporal_attrs.extend([[time_diff]])
+                        time_diffs.append((j, time_diff))
+            
+            # Sort by time difference and keep only closest transactions
+            time_diffs.sort(key=lambda x: x[1])
+            for j, diff in time_diffs[:max_temporal_edges_per_node]:
+                temporal_edges.append([i, j])
+                temporal_attrs.append([diff])
+                
         if temporal_edges:
             edge_indices[('transaction', 'temporal', 'transaction')] = torch.tensor(temporal_edges, dtype=torch.long).t()
             edge_attrs[('transaction', 'temporal', 'transaction')] = torch.tensor(temporal_attrs, dtype=torch.float)
         
-        # Process similar amount edges
+        # Process similar amount edges - optimized with vectorized operations
         similar_amount_edges = []
         similar_amount_attrs = []
         amounts = node_features['transaction'][:, 0]  # First column is amount
+        
+        # Use vectorized operations for faster processing
+        max_similar_edges = min(self.graph_neighbors['similar_amount'], len(batch_indices) - 1)
+        
+        # Compute pairwise differences - more efficient than nested loops
+        amount_matrix = amounts.unsqueeze(1) - amounts.unsqueeze(0)
+        amount_matrix = torch.abs(amount_matrix)
+        
+        # Zero out diagonal (same transaction)
+        mask = torch.ones_like(amount_matrix, dtype=torch.bool)
+        mask.fill_diagonal_(False)
+        amount_matrix = amount_matrix * mask
+        
+        # For each transaction, find the k nearest by amount
         for i in range(len(amounts)):
-            diffs = torch.abs(amounts - amounts[i])
-            k_nearest = torch.argsort(diffs)[1:self.graph_neighbors['similar_amount'] + 1]
+            # Get the indices of the k smallest differences (excluding self)
+            diffs = amount_matrix[i]
+            k_nearest = torch.topk(diffs, max_similar_edges, largest=False).indices
+            
             for j in k_nearest:
-                similar_amount_edges.extend([[i, j]])
-                similar_amount_attrs.extend([[diffs[j].item()]])
+                similar_amount_edges.append([i, j])
+                similar_amount_attrs.append([diffs[j].item()])
+                
         if similar_amount_edges:
             edge_indices[('transaction', 'similar_amount', 'transaction')] = torch.tensor(similar_amount_edges, dtype=torch.long).t()
             edge_attrs[('transaction', 'similar_amount', 'transaction')] = torch.tensor(similar_amount_attrs, dtype=torch.float)

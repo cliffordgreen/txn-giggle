@@ -1,17 +1,34 @@
 import os
 import pandas as pd
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, ProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
 from models.transaction_classifier import TransactionClassifier, ModelConfig
 from data.data_module import TransactionDataModule
 from typing import Dict, Optional
 import torch
+import gc
+import psutil
+
+def memory_status():
+    """Print memory usage statistics."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    process = psutil.Process(os.getpid())
+    print(f"RAM Memory: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+    
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"GPU {i} Memory: {torch.cuda.memory_allocated(i) / (1024 * 1024):.2f} MB / "
+                  f"{torch.cuda.memory_reserved(i) / (1024 * 1024):.2f} MB")
 
 def load_data(data_path: str) -> pd.DataFrame:
     """Load and preprocess transaction data."""
+    print(f"Loading data from {data_path}")
     # Load data
     df = pd.read_csv(data_path)
+    print(f"Loaded {len(df)} transactions")
     
     # Convert timestamp to datetime
     df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -51,10 +68,19 @@ def train(
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
+    # Memory status before loading
+    print("Memory status before loading data:")
+    memory_status()
+    
     # Load data
     df = load_data(data_path)
     
+    # Memory status after loading
+    print("Memory status after loading data:")
+    memory_status()
+    
     # Create data module
+    print("Creating data module...")
     data_module = TransactionDataModule(
         transactions_df=df,
         batch_size=batch_size,
@@ -67,7 +93,12 @@ def train(
         test_ratio=test_ratio
     )
     
+    # Memory status after data module creation
+    print("Memory status after data module creation:")
+    memory_status()
+    
     # Create model
+    print("Creating model...")
     model = TransactionClassifier(
         num_classes=df['category_id'].nunique(),
         gnn_hidden_channels=256,
@@ -83,6 +114,7 @@ def train(
     )
     
     # Create callbacks
+    print("Setting up training...")
     callbacks = [
         ModelCheckpoint(
             dirpath=output_dir,
@@ -95,7 +127,9 @@ def train(
             monitor='val_loss',
             patience=10,
             mode='min'
-        )
+        ),
+        LearningRateMonitor(logging_interval='step'),
+        ProgressBar(refresh_rate=10)
     ]
     
     # Create logger
@@ -105,16 +139,45 @@ def train(
     )
     
     # Create trainer
+    if torch.cuda.is_available():
+        accelerator = 'cuda'
+        devices = [0, 1] if torch.cuda.device_count() > 1 else 1
+        strategy = "ddp" if torch.cuda.device_count() > 1 else "auto"
+        precision = "16-mixed"
+    elif torch.backends.mps.is_available():
+        accelerator = 'mps'
+        devices = 1
+        strategy = "auto"
+        precision = "32"  # MPS doesn't fully support mixed precision yet
+    else:
+        accelerator = 'cpu'
+        devices = 1
+        strategy = "auto"
+        precision = "32"
+        
     trainer = pl.Trainer(
         max_epochs=max_epochs,
-        accelerator='mps' if torch.backends.mps.is_available() else 'cpu',
-        devices=1,
+        accelerator=accelerator,
+        devices=devices,
+        precision=precision,
+        strategy=strategy,
         callbacks=callbacks,
-        logger=logger
+        logger=logger,
+        gradient_clip_val=1.0,  # Add gradient clipping to prevent instability
+        log_every_n_steps=10,   # Log more frequently to monitor progress
     )
     
+    # Memory status before training
+    print("Memory status before training:")
+    memory_status()
+    
     # Train model
+    print("Starting training...")
     trainer.fit(model, data_module)
+    
+    # Memory status after training
+    print("Memory status after training:")
+    memory_status()
     
     # Test model
     test_results = trainer.test(model, data_module)
@@ -150,6 +213,58 @@ def train(
         pred_df = pd.DataFrame(test_predictions)
         if len(pred_df) > 0:
             pred_df.to_csv(os.path.join(output_dir, 'test_predictions.csv'), index=False)
+            
+            # Create confusion matrix
+            try:
+                import numpy as np
+                from sklearn.metrics import confusion_matrix, classification_report
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                
+                # Extract true and predicted labels
+                y_true = pred_df['true_category'].values
+                y_pred = pred_df['predicted_category'].values
+                
+                # Get unique categories
+                categories = np.unique(np.concatenate([y_true, y_pred]))
+                
+                # Create confusion matrix
+                cm = confusion_matrix(y_true, y_pred, labels=categories)
+                
+                # Create classification report
+                report = classification_report(y_true, y_pred, labels=categories, output_dict=True)
+                report_df = pd.DataFrame(report).transpose()
+                report_df.to_csv(os.path.join(output_dir, 'classification_report.csv'))
+                
+                # Plot confusion matrix
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                           xticklabels=categories, yticklabels=categories)
+                plt.xlabel('Predicted')
+                plt.ylabel('True')
+                plt.title('Confusion Matrix')
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'))
+                plt.close()
+                
+                # Calculate and save modality weights
+                modality_weights = {
+                    'graph': test_results[0]['test_weight_graph'],
+                    'sequence': test_results[0]['test_weight_sequence'],
+                    'text': test_results[0]['test_weight_text']
+                }
+                
+                # Plot modality weights
+                plt.figure(figsize=(8, 6))
+                plt.bar(modality_weights.keys(), modality_weights.values())
+                plt.title('Modality Weights in Fusion')
+                plt.ylabel('Weight')
+                plt.ylim(0, 1)
+                plt.savefig(os.path.join(output_dir, 'modality_weights.png'))
+                plt.close()
+                
+            except ImportError:
+                print("Skipping confusion matrix. Required packages not installed.")
 
 if __name__ == '__main__':
     import argparse
