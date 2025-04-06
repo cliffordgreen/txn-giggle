@@ -150,13 +150,13 @@ class MultiFieldTextEncoder(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
-        
-    def forward(self, text_fields: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, text_fields: Dict[str, Dict[str, torch.Tensor]]) -> torch.Tensor:
         """
         Forward pass of the text encoder.
         
         Args:
-            text_fields: Dictionary of text fields, each with shape [batch_size, max_length]
+            text_fields: Dictionary of field names mapping to token dicts
+                        {'field_name': {'input_ids': tensor, 'attention_mask': tensor}}
             
         Returns:
             Text embeddings [batch_size, hidden_dim]
@@ -165,17 +165,21 @@ class MultiFieldTextEncoder(nn.Module):
         field_embeddings = []
         field_weights = []
         
-        for field_name, field_tokens in text_fields.items():
+        for field_name, field_tokens_dict in text_fields.items():
             # Skip empty fields
-            if field_tokens is None:
+            if field_tokens_dict is None:
                 continue
                 
-            # Move tokens to device
-            field_tokens = field_tokens.to(device)
+            # Extract input_ids and attention_mask from the dictionary
+            input_ids = field_tokens_dict['input_ids'].to(device)
+            attention_mask = field_tokens_dict['attention_mask'].to(device)
             
             # Get BERT embeddings
             with torch.no_grad():
-                outputs = self.model(field_tokens)
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
                 embeddings = outputs.last_hidden_state[:, 0]  # Use [CLS] token
             
             # Project to hidden dim
@@ -188,9 +192,15 @@ class MultiFieldTextEncoder(nn.Module):
             
         # Return zero tensor if no valid fields
         if not field_embeddings:
-            return torch.zeros(text_fields[list(text_fields.keys())[0]].size(0), self.hidden_dim, device=device)
+            # Get batch size from the first field (if available)
+            sample_field = list(text_fields.values())[0]
+            batch_size = sample_field['input_ids'].size(0)
             
-        # Stack field embeddings
+            # Use projection output dim for consistency
+            hidden_dim = self.projection[0].out_features
+            return torch.zeros(batch_size, hidden_dim, device=device)
+                
+        # Stack field embeddings - rest of the method is unchanged
         field_embeddings = torch.stack(field_embeddings, dim=1)  # [batch_size, num_fields, hidden_dim]
         field_weights = torch.tensor(field_weights, device=device).view(1, -1, 1)  # [1, num_fields, 1]
         
@@ -199,4 +209,53 @@ class MultiFieldTextEncoder(nn.Module):
         attention_weights = F.softmax(attention_scores * field_weights, dim=1)  # [batch_size, num_fields, 1]
         attended_embeddings = torch.sum(attention_weights * field_embeddings, dim=1)  # [batch_size, hidden_dim]
         
-        return attended_embeddings 
+        return attended_embeddings   
+    # def forward(self, text_fields: Dict[str, torch.Tensor]) -> torch.Tensor:
+    #     """
+    #     Forward pass of the text encoder.
+        
+    #     Args:
+    #         text_fields: Dictionary of text fields, each with shape [batch_size, max_length]
+            
+    #     Returns:
+    #         Text embeddings [batch_size, hidden_dim]
+    #     """
+    #     device = next(self.parameters()).device
+    #     field_embeddings = []
+    #     field_weights = []
+        
+    #     for field_name, field_tokens in text_fields.items():
+    #         # Skip empty fields
+    #         if field_tokens is None:
+    #             continue
+                
+    #         # Move tokens to device
+    #         field_tokens = field_tokens.to(device)
+            
+    #         # Get BERT embeddings
+    #         with torch.no_grad():
+    #             outputs = self.model(field_tokens)
+    #             embeddings = outputs.last_hidden_state[:, 0]  # Use [CLS] token
+            
+    #         # Project to hidden dim
+    #         embeddings = self.projection(embeddings)
+    #         field_embeddings.append(embeddings)
+            
+    #         # Get field weight
+    #         weight = self.field_weights.get(field_name, 1.0)
+    #         field_weights.append(weight)
+            
+    #     # Return zero tensor if no valid fields
+    #     if not field_embeddings:
+    #         return torch.zeros(text_fields[list(text_fields.keys())[0]].size(0), self.hidden_dim, device=device)
+            
+    #     # Stack field embeddings
+    #     field_embeddings = torch.stack(field_embeddings, dim=1)  # [batch_size, num_fields, hidden_dim]
+    #     field_weights = torch.tensor(field_weights, device=device).view(1, -1, 1)  # [1, num_fields, 1]
+        
+    #     # Apply field attention with weights
+    #     attention_scores = self.field_attention(field_embeddings)  # [batch_size, num_fields, 1]
+    #     attention_weights = F.softmax(attention_scores * field_weights, dim=1)  # [batch_size, num_fields, 1]
+    #     attended_embeddings = torch.sum(attention_weights * field_embeddings, dim=1)  # [batch_size, hidden_dim]
+        
+    #     return attended_embeddings 

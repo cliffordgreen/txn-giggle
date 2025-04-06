@@ -11,7 +11,8 @@ def load_data(data_path: str) -> pd.DataFrame:
         df = pd.read_parquet(data_path)
     else:
         df = pd.read_csv(data_path)
-    
+
+    #df = df.head(1000)
     # Use posted_date as timestamp if available
     if 'posted_date' in df.columns:
         df['timestamp'] = df['posted_date']
@@ -51,16 +52,18 @@ def extract_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
+
 def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
     """Extract features from transaction amount."""
-    # Log transform amount
+    # Log transform amount - Check if 'amount' can be < 0. log1p handles 0 but not <= -1.
+    # Consider adding: df['amount'] = df['amount'].clip(lower=0) if negative amounts are possible errors
     df['amount_log'] = np.log1p(df['amount'])
-    
+
     # Amount statistics per user
     user_amount_stats = df.groupby('user_id')['amount'].agg([
         'mean', 'std', 'min', 'max', 'count'
     ]).reset_index()
-    
+
     # Rename columns
     user_amount_stats.columns = [
         'user_id',
@@ -70,18 +73,66 @@ def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
         'user_amount_max',
         'user_transaction_count'
     ]
-    
+
+    # IMPORTANT: Fill NaN std (from users with 1 transaction) with 0.
+    # If std is 0, the relative_std feature doesn't make much sense,
+    # but filling with 0 prevents NaN propagation here. We'll handle division by 0 next.
+    user_amount_stats['user_amount_std'] = user_amount_stats['user_amount_std'].fillna(0)
+
     # Merge with original dataframe
     df = df.merge(user_amount_stats, on='user_id', how='left')
-    
-    # Amount relative to user statistics
-    df['amount_relative_to_mean'] = df['amount'] / df['user_amount_mean']
-    df['amount_relative_to_std'] = (df['amount'] - df['user_amount_mean']) / df['user_amount_std']
-    
+
+    # Amount relative to user statistics - **SAFER DIVISION**
+    # Replace 0s in divisors with NaN temporarily to avoid inf. Resulting NaNs will be handled later.
+    mean_divisor = df['user_amount_mean'].replace(0, np.nan)
+    std_divisor = df['user_amount_std'].replace(0, np.nan)
+
+    df['amount_relative_to_mean'] = df['amount'] / mean_divisor
+    df['amount_relative_to_std'] = (df['amount'] - df['user_amount_mean']) / std_divisor
+
     # Amount percentiles
-    df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
-        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop')
-    )
+    # Wrap qcut in try-except as it can fail on groups with non-unique edges
+    try:
+        df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
+            lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') if x.nunique() > 1 else 0 # Assign 0 or NaN if only one unique value
+        )
+    except Exception as e:
+        print(f"Warning: Could not compute amount_percentile for some groups: {e}")
+        df['amount_percentile'] = np.nan # Assign NaN if qcut fails
+
+
+    return df    
+# def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
+#     """Extract features from transaction amount."""
+#     # Log transform amount
+#     df['amount_log'] = np.log1p(df['amount'])
+    
+#     # Amount statistics per user
+#     user_amount_stats = df.groupby('user_id')['amount'].agg([
+#         'mean', 'std', 'min', 'max', 'count'
+#     ]).reset_index()
+    
+#     # Rename columns
+#     user_amount_stats.columns = [
+#         'user_id',
+#         'user_amount_mean',
+#         'user_amount_std',
+#         'user_amount_min',
+#         'user_amount_max',
+#         'user_transaction_count'
+#     ]
+    
+#     # Merge with original dataframe
+#     df = df.merge(user_amount_stats, on='user_id', how='left')
+    
+#     # Amount relative to user statistics
+#     df['amount_relative_to_mean'] = df['amount'] / df['user_amount_mean']
+#     df['amount_relative_to_std'] = (df['amount'] - df['user_amount_mean']) / df['user_amount_std']
+    
+#     # Amount percentiles
+#     df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
+#         lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop')
+#     )
     
     return df
 

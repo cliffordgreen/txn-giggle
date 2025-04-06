@@ -37,6 +37,44 @@ class AttentionFusion(nn.Module):
             nn.Dropout(dropout)
         )
         
+    # def forward(
+    #     self,
+    #     embeddings: Dict[str, torch.Tensor],
+    #     mask: Optional[Dict[str, torch.Tensor]] = None
+    # ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    #     """
+    #     Forward pass of the attention fusion.
+        
+    #     Args:
+    #         embeddings: Dictionary mapping modality names to their embeddings
+    #         mask: Optional dictionary mapping modality names to attention masks
+            
+    #     Returns:
+    #         Tuple of:
+    #         - Fused embedding [batch_size, hidden_dim]
+    #         - Attention weights [batch_size, num_modalities]
+    #     """
+    #     # Project each modality
+    #     projected = {}
+    #     for name, emb in embeddings.items():
+    #         projected[name] = self.projections[name](emb)
+        
+    #     # Concatenate all projected embeddings
+    #     concat = torch.cat(list(projected.values()), dim=-1)
+        
+    #     # Compute attention weights
+    #     attn_weights = self.attention(concat)
+        
+    #     # Weighted sum
+    #     fused = torch.zeros_like(projected[list(projected.keys())[0]])
+    #     for i, (name, emb) in enumerate(projected.items()):
+    #         fused = fused + attn_weights[:, i].unsqueeze(-1) * emb
+        
+    #     # Final projection
+    #     fused = self.final_proj(fused)
+        
+    #     return fused, attn_weights
+
     def forward(
         self,
         embeddings: Dict[str, torch.Tensor],
@@ -44,20 +82,24 @@ class AttentionFusion(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Forward pass of the attention fusion.
-        
-        Args:
-            embeddings: Dictionary mapping modality names to their embeddings
-            mask: Optional dictionary mapping modality names to attention masks
-            
-        Returns:
-            Tuple of:
-            - Fused embedding [batch_size, hidden_dim]
-            - Attention weights [batch_size, num_modalities]
         """
+        # ADDED: Verify all embeddings have the same batch size
+        batch_sizes = {name: emb.shape[0] for name, emb in embeddings.items()}
+        if len(set(batch_sizes.values())) > 1:
+            # We have inconsistent batch sizes - fix them
+            min_batch = min(batch_sizes.values())
+            print(f"WARNING: Inconsistent batch sizes in fusion: {batch_sizes}, truncating to {min_batch}")
+            
+            # Truncate all embeddings to smallest batch size
+            embeddings = {name: emb[:min_batch] for name, emb in embeddings.items()}
+        
         # Project each modality
         projected = {}
         for name, emb in embeddings.items():
             projected[name] = self.projections[name](emb)
+        
+        # Print shapes for debugging
+        print(f"Projected shapes: {[p.shape for p in projected.values()]}")
         
         # Concatenate all projected embeddings
         concat = torch.cat(list(projected.values()), dim=-1)
