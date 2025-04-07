@@ -62,12 +62,12 @@ class TemporalAttention(nn.Module):
 class SequenceEncoder(nn.Module):
     """
     LSTM-based sequence encoder for transaction history.
-    Processes sequences with features [amount, weekday, hour, time_delta].
+    Processes sequences with features like [amount, time_sin/cos, time_delta].
     Uses TemporalAttention for pooling.
     """
     def __init__(
         self,
-        input_dim: int, # Should be 4 from DataModule
+        input_dim: int, # Should match DataModule output (e.g., 6)
         hidden_dim: int,
         num_layers: int = 2,
         dropout: float = 0.2,
@@ -79,27 +79,13 @@ class SequenceEncoder(nn.Module):
         self.num_layers = num_layers
         self.bidirectional = bidirectional
 
-        # Validate input_dim expectation from DataModule
-        expected_input_dim = 4
-        if input_dim != expected_input_dim:
-            # This warning helps catch mismatches during model initialization
-            print(
-                f"[WARN] SequenceEncoder initialized with input_dim={input_dim}, "
-                f"but expected {expected_input_dim} ([amount, weekday, hour, time_delta]). "
-                f"Ensure this matches DataModule output and TransactionClassifier parameters."
-            )
-            # Depending on severity, you might raise an error instead:
-            # raise ValueError(f"SequenceEncoder expected input_dim={expected_input_dim}, got {input_dim}")
-
-        # Normalize the 'amount' feature (index 0)
+        # Normalize the 'amount' feature (assuming it's index 0)
         self.amount_norm = nn.LayerNorm(1)
 
-        # Optional: Normalize other features?
-        # self.other_feature_norm = nn.LayerNorm(input_dim - 1) # Example if normalizing others
-
         # Define the actual input size fed into the LSTM
-        # In this version, we use the normalized amount + original other features
-        self.lstm_input_size = input_dim # Stays 4 if only normalizing amount
+        # Assumes only amount is normalized, other features used as is.
+        # If other features were normalized/processed, adjust this.
+        self.lstm_input_size = input_dim 
 
         self.lstm = nn.LSTM(
             input_size=self.lstm_input_size,
@@ -112,20 +98,21 @@ class SequenceEncoder(nn.Module):
 
         # Calculate LSTM output dimension (accounts for bidirectionality)
         lstm_output_dim = hidden_dim * (2 if bidirectional else 1)
+        self.lstm_output_dim = lstm_output_dim
 
         # Layer normalization for the LSTM output sequence
-        self.layer_norm = nn.LayerNorm(lstm_output_dim)
+        self.layer_norm = nn.LayerNorm(self.lstm_output_dim)
 
         # Dropout applied to the final sequence representation before attention/output
         self.dropout = nn.Dropout(dropout)
 
         # Attention mechanism for weighted pooling over the output sequence
-        self.attention = TemporalAttention(lstm_output_dim)
+        self.attention = TemporalAttention(self.lstm_output_dim)
 
 
     def forward(
         self,
-        x: torch.Tensor, # Expects shape [batch_size, seq_len, input_dim=4]
+        x: torch.Tensor, # Expects shape [batch_size, seq_len, input_dim]
         lengths: Optional[torch.Tensor] = None, # Original lengths before padding [batch_size]
         hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None # Initial hidden state
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
@@ -133,7 +120,7 @@ class SequenceEncoder(nn.Module):
         Forward pass of the sequence encoder.
 
         Args:
-            x: Input sequence tensor [batch_size, seq_len, input_dim=4]
+            x: Input sequence tensor [batch_size, seq_len, input_dim]
                Feature order: [amount, weekday, hour, time_delta]
             lengths: Optional tensor of original sequence lengths [batch_size]
             hidden: Optional initial hidden state for the LSTM
@@ -145,6 +132,9 @@ class SequenceEncoder(nn.Module):
             - attn_context: Attention-weighted context vector [batch_size, hidden_dim * num_directions]
         """
         batch_size, seq_len, input_dim_actual = x.shape
+
+        # <<< DEBUG: Check Input >>>
+        print(f"DEBUG SeqEnc Input x: Shape={x.shape}, HasNaN={torch.isnan(x).any().item()}, Min={torch.min(x).item() if x.numel() > 0 else 'N/A':.4f}, Max={torch.max(x).item() if x.numel() > 0 else 'N/A':.4f}")
 
         # --- Input Validation ---
         if input_dim_actual != self.input_dim:
@@ -173,13 +163,14 @@ class SequenceEncoder(nn.Module):
                 lengths = lengths.clamp(max=seq_len)
 
         # --- Feature Processing ---
-        # Separate features based on expected DataModule output order
         amount = x[..., 0:1]            # Shape: [batch_size, seq_len, 1]
         # Other features (weekday, hour, time_delta)
         other_features = x[..., 1:]     # Shape: [batch_size, seq_len, input_dim-1]
 
         # Normalize the amount feature
         normed_amount = self.amount_norm(amount)
+        # <<< DEBUG: Check Normed Amount >>>
+        print(f"DEBUG SeqEnc Normed Amount: HasNaN={torch.isnan(normed_amount).any().item()}, Min={torch.min(normed_amount).item() if normed_amount.numel() > 0 else 'N/A':.4f}, Max={torch.max(normed_amount).item() if normed_amount.numel() > 0 else 'N/A':.4f}")
 
         # Optional: Normalize other features if needed
         # normed_other_features = self.other_feature_norm(other_features)
@@ -187,6 +178,8 @@ class SequenceEncoder(nn.Module):
 
         # Use original other features for now
         processed_x = torch.cat([normed_amount, other_features], dim=-1)
+        # <<< DEBUG: Check Processed Input to LSTM >>>
+        print(f"DEBUG SeqEnc Processed x: HasNaN={torch.isnan(processed_x).any().item()}, Min={torch.min(processed_x).item() if processed_x.numel() > 0 else 'N/A':.4f}, Max={torch.max(processed_x).item() if processed_x.numel() > 0 else 'N/A':.4f}")
 
         # Verify processed shape
         if processed_x.shape[-1] != self.lstm_input_size:
@@ -225,27 +218,39 @@ class SequenceEncoder(nn.Module):
         lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
             packed_output, batch_first=True, total_length=seq_len
         )
+        # <<< DEBUG: Check LSTM Output >>>
+        print(f"DEBUG SeqEnc LSTM Output: HasNaN={torch.isnan(lstm_out).any().item()}, Min={torch.min(lstm_out).item() if lstm_out.numel() > 0 else 'N/A':.4f}, Max={torch.max(lstm_out).item() if lstm_out.numel() > 0 else 'N/A':.4f}")
 
         # --- Post-processing ---
         # Apply Layer Normalization to the LSTM output sequence
         lstm_out_norm = self.layer_norm(lstm_out)
+        # <<< DEBUG: Check LSTM Norm Output >>>
+        print(f"DEBUG SeqEnc LSTM Norm Output: HasNaN={torch.isnan(lstm_out_norm).any().item()}, Min={torch.min(lstm_out_norm).item() if lstm_out_norm.numel() > 0 else 'N/A':.4f}, Max={torch.max(lstm_out_norm).item() if lstm_out_norm.numel() > 0 else 'N/A':.4f}")
 
         # Apply Dropout
         lstm_out_drop = self.dropout(lstm_out_norm)
 
         # --- Attention Pooling ---
-        # Create boolean mask for attention based on original lengths
-        # Shape: [batch_size, seq_len]. True for valid steps, False for padding.
-        #attention_mask = torch.arange(seq_len, device=x.device).expand(batch_size, seq_len) < lengths.unsqueeze(1)
-        print(f"DEBUG (SequenceEncoder): lstm_out shape: {lstm_out_drop.shape}, mask shape: {attention_mask.shape}")
-        if lstm_out_drop.shape[:2] != attention_mask.shape:
-             print(f"CRITICAL WARNING: Mismatch between lstm_out seq len {lstm_out_drop.shape[1]} and mask seq len {attention_mask.shape[1]} before attention!")
-             # Recreate mask based on lstm_out shape if mismatch occurs (investigate root cause)
-             attention_mask = torch.arange(lstm_out_drop.shape[1], device=x.device).expand(lstm_out_drop.shape[0], lstm_out_drop.shape[1]) < lengths.unsqueeze(1) # Use original lengths here
-             print(f"Recreated mask with shape: {attention_mask.shape}")
-        # Apply attention mechanism using the dropout-applied LSTM output and the mask
-        # attn_context shape: [batch_size, hidden_dim * num_directions]
-        attn_context = self.attention(lstm_out_drop, mask=attention_mask)
+        attn_context = torch.zeros(batch_size, self.lstm_output_dim, device=x.device) # Initialize output
+        
+        # Identify sequences that have at least one valid element (length > 0)
+        valid_seq_mask = torch.any(attention_mask, dim=1) # Shape: [batch_size]
+
+        # Process only sequences with actual content
+        if torch.any(valid_seq_mask):
+            # Filter inputs for sequences with length > 0
+            valid_lstm_out_drop = lstm_out_drop[valid_seq_mask]
+            valid_attention_mask = attention_mask[valid_seq_mask]
+
+            # Apply attention mechanism only to valid sequences
+            valid_attn_context = self.attention(valid_lstm_out_drop, mask=valid_attention_mask)
+            
+            # Place the computed contexts back into the output tensor
+            attn_context[valid_seq_mask] = valid_attn_context
+        # Else: All sequences had length 0, attn_context remains zeros, which is correct.
+
+        # <<< DEBUG: Check Attention Context >>>
+        print(f"DEBUG SeqEnc Attention Context: HasNaN={torch.isnan(attn_context).any().item()}, Min={torch.min(attn_context).item() if attn_context.numel() > 0 else 'N/A':.4f}, Max={torch.max(attn_context).item() if attn_context.numel() > 0 else 'N/A':.4f}")
 
         # Return the normalized LSTM output sequence (useful for some downstream tasks),
         # the final hidden/cell states, and the attention context vector.

@@ -122,29 +122,54 @@ class TransactionDataModule(pl.LightningDataModule):
         self.transactions_df['hour'] = self.transactions_df['hour'].astype(int)
         self.transactions_df['weekday'] = self.transactions_df['weekday'].astype(int)
 
-
-        # Ensure category IDs are integers if they exist
+        # --- Category ID Handling ---
+        self.category_id_map = None
         if 'category_id' in self.transactions_df.columns:
-             # Fill NaNs before converting to int (e.g., with -1 or a specific 'unknown' category ID)
-             if self.transactions_df['category_id'].isnull().any():
-                  print(f"[WARN] 'category_id' contains NaNs. Filling with -1.")
-                  self.transactions_df['category_id'] = self.transactions_df['category_id'].fillna(-1)
-             try:
-                 self.transactions_df['category_id'] = self.transactions_df['category_id'].astype(int)
-             except ValueError as e:
-                 print(f"[ERROR] Could not convert 'category_id' to int after fillna: {e}")
-                 # Handle this case - maybe raise error or assign default?
-                 raise e
+            # Fill NaNs before checking type or factorizing
+            if self.transactions_df['category_id'].isnull().any():
+                print(f"[WARN] 'category_id' contains NaNs. Filling with 'UNKNOWN_CAT'.")
+                self.transactions_df['category_id'] = self.transactions_df['category_id'].fillna('UNKNOWN_CAT')
+            
+            # Check if column seems to contain strings (like 'CATxxxx')
+            if self.transactions_df['category_id'].dtype == 'object':
+                print("'category_id' column contains strings. Factorizing...")
+                # Factorize converts strings to integers (0, 1, 2...)
+                # It returns the integer codes and the unique category strings
+                codes, uniques = pd.factorize(self.transactions_df['category_id'], sort=True)
+                self.transactions_df['category_id'] = codes # Assign integer codes back to the column
+                self.category_id_map = {code: unique_val for code, unique_val in enumerate(uniques)}
+                print(f"Factorized 'category_id' into {len(uniques)} unique integer IDs.")
+                # print(f"Category ID Mapping (first 5): {list(self.category_id_map.items())[:5]}")
+            else:
+                # If not object type, attempt conversion to int (original logic)
+                try:
+                    self.transactions_df['category_id'] = self.transactions_df['category_id'].astype(int)
+                except ValueError as e:
+                    print(f"[ERROR] Could not convert 'category_id' to int: {e}")
+                    raise e
+        else:
+            print("[WARN] 'category_id' column not found.")
 
+        # --- User Category ID Handling (similar logic) ---
+        self.user_category_id_map = None
         if 'user_category_id' in self.transactions_df.columns:
             if self.transactions_df['user_category_id'].isnull().any():
-                print(f"[WARN] 'user_category_id' contains NaNs. Filling with -1.")
-                self.transactions_df['user_category_id'] = self.transactions_df['user_category_id'].fillna(-1)
-            try:
-                 self.transactions_df['user_category_id'] = self.transactions_df['user_category_id'].astype(int)
-            except ValueError as e:
-                 print(f"[ERROR] Could not convert 'user_category_id' to int after fillna: {e}")
-                 raise e
+                print(f"[WARN] 'user_category_id' contains NaNs. Filling with 'UNKNOWN_USER_CAT'.")
+                self.transactions_df['user_category_id'] = self.transactions_df['user_category_id'].fillna('UNKNOWN_USER_CAT')
+            
+            if self.transactions_df['user_category_id'].dtype == 'object':
+                print("'user_category_id' column contains strings. Factorizing...")
+                codes, uniques = pd.factorize(self.transactions_df['user_category_id'], sort=True)
+                self.transactions_df['user_category_id'] = codes
+                self.user_category_id_map = {code: unique_val for code, unique_val in enumerate(uniques)}
+                print(f"Factorized 'user_category_id' into {len(uniques)} unique integer IDs.")
+            else:
+                try:
+                    self.transactions_df['user_category_id'] = self.transactions_df['user_category_id'].astype(int)
+                except ValueError as e:
+                    print(f"[ERROR] Could not convert 'user_category_id' to int: {e}")
+                    raise e
+        # else: user_category_id might be optional
 
         # Ensure user_id exists for splitting and sequence building
         if 'user_id' not in self.transactions_df.columns:
@@ -178,7 +203,7 @@ class TransactionDataModule(pl.LightningDataModule):
         # --- Build Graph & Calculate Raw Features ---
         # Avoid rebuilding if already done (check if graph_data exists)
         if self.graph_data is None:
-            print("Calculating raw node features...")
+            print("Calculating raw node features (vectorized)...")
             start_time = time.time()
             raw_features = self._calculate_raw_features()
             print(f"Raw node features calculated in {time.time() - start_time:.2f}s")
@@ -248,90 +273,75 @@ class TransactionDataModule(pl.LightningDataModule):
         """Calculates raw numerical features BEFORE scaling for nodes."""
         df = self.transactions_df
         raw_features_dict = {}
-        print("Calculating raw transaction features...")
-        # --- Transaction Features ---
-        # ** CRITICAL CHANGE: Remove raw timestamp. Rely on cyclical features.**
-        self.tx_feat_cols_to_scale = ['amount'] # Only scale amount now
+        print("Calculating raw transaction features (vectorized)...")
+
+        # --- Transaction Features (Vectorized - Already Done) ---
+        self.tx_feat_cols_to_scale = ['amount']
         self.tx_feat_cols_no_scale = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
-        num_tx_features = len(self.tx_feat_cols_to_scale) + len(self.tx_feat_cols_no_scale)
+        hour = df['hour'].fillna(0).astype(int)
+        day = df['weekday'].fillna(0).astype(int)
+        amount = df['amount'].fillna(0.0)
+        hour_sin = np.sin(2 * np.pi * hour / 24)
+        hour_cos = np.cos(2 * np.pi * hour / 24)
+        day_sin = np.sin(2 * np.pi * day / 7)
+        day_cos = np.cos(2 * np.pi * day / 7)
+        tx_features_array = np.column_stack([
+            amount, hour_sin, hour_cos, day_sin, day_cos
+        ])
+        raw_features_dict['transaction'] = tx_features_array.astype(np.float64)
+        print(f"  Raw transaction features calculated. Shape: {raw_features_dict['transaction'].shape}")
 
-        tx_features_list = []
-        for _, row in df.iterrows():
-            # Calculate cyclical features (handle potential NaNs if timestamp was NaT)
-            hour = row['hour']
-            day = row['weekday']
-            hour_sin = np.sin(2 * np.pi * hour / 24) if pd.notna(hour) else 0.0
-            hour_cos = np.cos(2 * np.pi * hour / 24) if pd.notna(hour) else 1.0 # Cos(0)=1
-            day_sin = np.sin(2 * np.pi * day / 7) if pd.notna(day) else 0.0
-            day_cos = np.cos(2 * np.pi * day / 7) if pd.notna(day) else 1.0 # Cos(0)=1
+        # Define aggregations with explicit output names
+        agg_funcs_named = {
+            'amount_mean': ('amount', 'mean'),
+            'amount_std': ('amount', lambda x: x.std(ddof=0)),
+            'amount_max': ('amount', 'max'),
+            'amount_min': ('amount', 'min'),
+            'amount_count': ('amount', 'count'),
+            'amount_median': ('amount', 'median'),
+            'amount_q25': ('amount', lambda x: x.quantile(0.25)),
+            'amount_q75': ('amount', lambda x: x.quantile(0.75))
+        }
 
-            # Handle potential NaN amount
-            amount = row['amount'] if pd.notna(row['amount']) else 0.0
-
-            features_to_scale = [amount]
-            features_no_scale = [hour_sin, hour_cos, day_sin, day_cos]
-            tx_features_list.append(features_to_scale + features_no_scale)
-
-        raw_features_dict['transaction'] = np.array(tx_features_list, dtype=np.float64)
-
-        print("Calculating raw merchant features...")
-        # --- Merchant Features ---
-        # Use float64 for intermediate calculations to avoid precision loss with pandas/numpy agg
-        merchant_features_list = []
+        # --- Merchant Features (Vectorized with Named Aggregation) ---
+        print("Calculating raw merchant features (vectorized)...")
         merchant_ids = df['merchant_name'].dropna().unique()
         merchant_map = {name: i for i, name in enumerate(merchant_ids)}
         num_merchants = len(merchant_map)
 
         if num_merchants > 0:
-             # Group by merchant name - ensure it exists and is not NaN
-             grouped = df[pd.notna(df['merchant_name'])].groupby('merchant_name')
-             merchant_stats_list = [np.zeros(8, dtype=np.float64) for _ in range(num_merchants)]
-
-             for name, group in grouped:
-                  if name in merchant_map:
-                       idx = merchant_map[name]
-                       # Calculate stats safely, handle empty groups or NaNs in amounts
-                       amounts = group['amount'].dropna()
-                       if not amounts.empty:
-                            std = amounts.std(ddof=0)
-                            stats = [
-                                amounts.mean(), std if pd.notna(std) else 0.0, amounts.max(), amounts.min(),
-                                len(amounts), amounts.median(), amounts.quantile(0.25), amounts.quantile(0.75)
-                            ]
-                            merchant_stats_list[idx] = [s if pd.notna(s) else 0.0 for s in stats]
-             raw_features_dict['merchant'] = np.array(merchant_stats_list, dtype=np.float64)
+            # Use named aggregations directly
+            merchant_stats = df[pd.notna(df['merchant_name'])].groupby('merchant_name').agg(**agg_funcs_named)
+            # Columns already have the desired names (e.g., 'amount_mean', 'amount_std')
+            merchant_stats = merchant_stats.fillna(0) # Fill any NaNs 
+            merchant_stats = merchant_stats.reindex(merchant_ids, fill_value=0) # Ensure order and all merchants
+            # Get column names in the desired order
+            final_merchant_cols = list(agg_funcs_named.keys())
+            raw_features_dict['merchant'] = merchant_stats[final_merchant_cols].values.astype(np.float64)
         else:
              print("No valid merchants found. Creating empty merchant features.")
              raw_features_dict['merchant'] = np.zeros((0, 8), dtype=np.float64)
+        print(f"  Raw merchant features calculated. Shape: {raw_features_dict['merchant'].shape}")
 
-
-        print("Calculating raw category features...")
-        # --- Category Features ---
-        # Ensure category_id column is present and handle potential non-numeric values gracefully if necessary
+        # --- Category Features (Vectorized with Named Aggregation) ---
+        print("Calculating raw category features (vectorized)...")
         valid_categories = df['category_id'].dropna().unique()
-        # Filter out potential non-integer if conversion failed earlier (-1 was used for NaN)
         valid_categories = [c for c in valid_categories if isinstance(c, (int, np.integer)) and c != -1]
-        category_map = {cat_id: i for i, cat_id in enumerate(valid_categories)}
-        num_categories = len(category_map)
+        # No need for category_map here as we use category_id directly for groupby/reindex
+        num_categories = len(valid_categories)
 
         if num_categories > 0:
-             grouped = df[df['category_id'].isin(valid_categories)].groupby('category_id')
-             category_stats_list = [np.zeros(8, dtype=np.float64) for _ in range(num_categories)]
-             for cat_id, group in grouped:
-                  if cat_id in category_map: # Should always be true now
-                       idx = category_map[cat_id]
-                       amounts = group['amount'].dropna()
-                       if not amounts.empty:
-                            std = amounts.std(ddof=0)
-                            stats = [
-                                amounts.mean(), std if pd.notna(std) else 0.0, amounts.max(), amounts.min(),
-                                len(amounts), amounts.median(), amounts.quantile(0.25), amounts.quantile(0.75)
-                            ]
-                            category_stats_list[idx] = [s if pd.notna(s) else 0.0 for s in stats]
-             raw_features_dict['category'] = np.array(category_stats_list, dtype=np.float64)
+            # Use named aggregations directly
+            category_stats = df[df['category_id'].isin(valid_categories)].groupby('category_id').agg(**agg_funcs_named)
+            category_stats = category_stats.fillna(0) # Fill NaNs
+            category_stats = category_stats.reindex(valid_categories, fill_value=0) # Ensure order and all categories
+            # Get column names in the desired order
+            final_category_cols = list(agg_funcs_named.keys())
+            raw_features_dict['category'] = category_stats[final_category_cols].values.astype(np.float64)
         else:
             print("No valid categories found. Creating empty category features.")
             raw_features_dict['category'] = np.zeros((0, 8), dtype=np.float64)
+        print(f"  Raw category features calculated. Shape: {raw_features_dict['category'].shape}")
 
         return raw_features_dict
 
@@ -346,16 +356,15 @@ class TransactionDataModule(pl.LightningDataModule):
             if features.size > 0 and features.shape[0] > 0:
                 if node_type == 'transaction':
                     # Scale only the designated columns (e.g., 'amount')
-                    pass
-                    # num_cols_to_scale = len(self.tx_feat_cols_to_scale)
-                    # if features.shape[1] >= num_cols_to_scale and num_cols_to_scale > 0:
-                    #      scaler = StandardScaler()
-                    #      # Fit only on the columns to be scaled
-                    #      scaler.fit(features[:, :num_cols_to_scale])
-                    #      self.scalers[node_type] = scaler
-                    #      print(f"  Fitted scaler for 'transaction' features (first {num_cols_to_scale} cols). Mean: {scaler.mean_}, Scale: {scaler.scale_}")
-                    # else:
-                    #      print(f"  [WARN] Not enough columns in transaction features to scale or no columns designated.")
+                    num_cols_to_scale = len(self.tx_feat_cols_to_scale)
+                    if features.shape[1] >= num_cols_to_scale and num_cols_to_scale > 0:
+                         scaler = StandardScaler()
+                         # Fit only on the columns to be scaled
+                         scaler.fit(features[:, :num_cols_to_scale])
+                         self.scalers[node_type] = scaler
+                         print(f"  Fitted scaler for 'transaction' features (first {num_cols_to_scale} cols). Mean: {scaler.mean_}, Scale: {scaler.scale_}")
+                    else:
+                         print(f"  [WARN] Not enough columns in transaction features to scale or no columns designated.")
                 else: # Scale all features for merchant/category
                     scaler = StandardScaler()
                     scaler.fit(features)
@@ -426,11 +435,13 @@ class TransactionDataModule(pl.LightningDataModule):
                     if node_type == 'transaction':
                          # Scale designated columns and concatenate
                          num_cols_to_scale = len(self.tx_feat_cols_to_scale)
-                         scaled_part = scaler.transform(raw_feat_array[:, :num_cols_to_scale])
+                         # Add epsilon here for stability
+                         scaled_part = (raw_feat_array[:, :num_cols_to_scale] - scaler.mean_) / (scaler.scale_ + 1e-8)
                          non_scaled_part = raw_feat_array[:, num_cols_to_scale:]
                          final_features = np.concatenate([scaled_part, non_scaled_part], axis=1)
                     else:
-                         final_features = scaler.transform(raw_feat_array)
+                         # Add epsilon here for stability
+                         final_features = (raw_feat_array - scaler.mean_) / (scaler.scale_ + 1e-8)
 
                     data[node_type].x = torch.tensor(final_features, dtype=torch.float)
                     self.node_feature_dims[node_type] = data[node_type].x.shape[1]
@@ -468,7 +479,7 @@ class TransactionDataModule(pl.LightningDataModule):
                 merchant_node_idx = merchant_map[row['merchant_name']]
                 edge_list.append([tx_node_idx, merchant_node_idx])
                 stats = merchant_stats.loc[row['merchant_name']]
-                amount_zscore = (row['amount'] - stats['mean']) / (stats['std'] + 1e-6)
+                amount_zscore = (row['amount'] - stats['mean']) / (stats['std'] + 1e-8) # Added epsilon here too
                 attr_list.append([amount_zscore]) # Keep as list for consistent shape
         if edge_list:
             edge_index_dict[('transaction', 'belongs_to', 'merchant')] = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -559,7 +570,7 @@ class TransactionDataModule(pl.LightningDataModule):
                          # Ratio uses raw amounts
                          amount_i = raw_tx_amounts[i]
                          amount_j = raw_tx_amounts[j]
-                         amount_ratio = min(amount_i, amount_j) / (max(amount_i, amount_j) + 1e-6) if max(amount_i, amount_j) > 1e-6 else 1.0
+                         amount_ratio = min(amount_i, amount_j) / (max(amount_i, amount_j) + 1e-8) if max(amount_i, amount_j) > 1e-8 else 1.0 # Added epsilon
                          amount_ratio_list.extend([amount_ratio, amount_ratio])
                          direction_list.extend([1.0, 0.0]) # Direction bit
 
@@ -570,8 +581,9 @@ class TransactionDataModule(pl.LightningDataModule):
             # Scale the collected distances using the fitted scaler (if available)
             if 'amount_dist' in self.edge_scalers and self.edge_scalers['amount_dist'] is not None:
                 scaler = self.edge_scalers['amount_dist']
-                # Ensure input is float64 for transform if scaler was fit on float64
-                scaled_dist = scaler.transform(np.array(raw_dist_list, dtype=np.float64).reshape(-1, 1)).flatten()
+                raw_dist_array = np.array(raw_dist_list, dtype=np.float64).reshape(-1, 1)
+                # Add epsilon here for stability
+                scaled_dist = ((raw_dist_array - scaler.mean_) / (scaler.scale_ + 1e-8)).flatten()
                 print(f"  Applied scaler to 'amount_dist' edge feature.")
             else:
                 print(f"  [WARN] Scaler for 'amount_dist' not found. Using raw distances.")
@@ -598,7 +610,7 @@ class TransactionDataModule(pl.LightningDataModule):
 
 
     def _prepare_and_add_sequences(self):
-        """Prepare sequence data (features of previous transactions) using SCALED features."""
+        """Prepare sequence data (features of previous transactions) using SCALED features and cyclical time encodings."""
         if self.graph_data is None: raise RuntimeError("Graph data not built.")
         print("Preparing sequence features...")
         df_sorted = self.transactions_df.sort_values(['user_id', 'timestamp'])
@@ -607,9 +619,10 @@ class TransactionDataModule(pl.LightningDataModule):
         all_seq_features = []
         all_seq_lengths = []
         # Define raw feature columns needed from DataFrame for sequence items
-        self.seq_raw_feature_cols = ['amount', 'weekday', 'hour']
+        # self.seq_raw_feature_cols = ['amount', 'weekday', 'hour'] # Old
         # Define the final dimension after processing/scaling
-        self.sequence_feature_dim = 4 # Scaled Amount, Weekday, Hour, Scaled/Transformed TimeDelta
+        # OLD: self.sequence_feature_dim = 4 # Scaled Amount, Weekday, Hour, Scaled/Transformed TimeDelta
+        self.sequence_feature_dim = 6 # Scaled Amount, day_sin, day_cos, hour_sin, hour_cos, Scaled_TimeDelta
 
         original_to_sorted_pos = {idx: i for i, idx in enumerate(df_sorted.index)}
 
@@ -668,22 +681,29 @@ class TransactionDataModule(pl.LightningDataModule):
                     # Scale Amount
                     amount = prev_row['amount'] if pd.notna(prev_row['amount']) else 0.0
                     if 'amount' in self.seq_scalers:
-                        amount = self.seq_scalers['amount'].transform(np.array([[amount]]))[0, 0]
+                        scaler_a = self.seq_scalers['amount']
+                        # Add epsilon here for stability
+                        amount = (amount - scaler_a.mean_[0]) / (scaler_a.scale_[0] + 1e-8)
 
                     # Scale Time Delta
                     time_delta_val = time_delta
                     if 'time_delta' in self.seq_scalers and self.seq_scalers['time_delta'] is not None:
+                         scaler_td = self.seq_scalers['time_delta']
                          # Apply same potential transform (log) if used in fitting
                          # time_delta_log = np.log1p(time_delta)
-                         # time_delta_val = self.seq_scalers['time_delta'].transform(np.array([[time_delta_log]]))[0, 0]
-                         time_delta_val = self.seq_scalers['time_delta'].transform(np.array([[time_delta]]))[0, 0]
+                         # Add epsilon here for stability
+                         time_delta_val = (time_delta - scaler_td.mean_[0]) / (scaler_td.scale_[0] + 1e-8)
 
-                    # Use raw weekday/hour for now (could be encoded/scaled too)
-                    weekday = prev_row['weekday'] if pd.notna(prev_row['weekday']) else 0
+                    # Use CYCLICAL weekday/hour features
                     hour = prev_row['hour'] if pd.notna(prev_row['hour']) else 0
+                    day = prev_row['weekday'] if pd.notna(prev_row['weekday']) else 0
+                    hour_sin = np.sin(2 * np.pi * hour / 24) if pd.notna(hour) else 0.0
+                    hour_cos = np.cos(2 * np.pi * hour / 24) if pd.notna(hour) else 1.0 # Cos(0)=1
+                    day_sin = np.sin(2 * np.pi * day / 7) if pd.notna(day) else 0.0
+                    day_cos = np.cos(2 * np.pi * day / 7) if pd.notna(day) else 1.0 # Cos(0)=1
 
-                    # Order: Amount, Weekday, Hour, TimeDelta
-                    scaled_feat = [amount, weekday, hour, time_delta_val]
+                    # Order: Amount, day_sin, day_cos, hour_sin, hour_cos, TimeDelta
+                    scaled_feat = [amount, day_sin, day_cos, hour_sin, hour_cos, time_delta_val]
                     seq_features_for_tx.append(scaled_feat)
 
             # Convert to tensor
@@ -692,12 +712,19 @@ class TransactionDataModule(pl.LightningDataModule):
                 seq_len = len(seq_tensor)
             else:
                 # Handle case with no previous transactions
-                # Use sequence feature dim calculated earlier
+                # Use sequence feature dim calculated earlier (now 6)
                 seq_tensor = torch.zeros((0, self.sequence_feature_dim), dtype=torch.float)
                 seq_len = 0
 
             all_seq_features.append(seq_tensor)
             all_seq_lengths.append(seq_len)
+
+        # --- Add check for zero-length sequences ---
+        num_zero_length = sum(1 for length in all_seq_lengths if length == 0)
+        total_sequences = len(all_seq_lengths)
+        if total_sequences > 0:
+             print(f"  [INFO] Generated {num_zero_length} zero-length sequences out of {total_sequences} ({num_zero_length/total_sequences:.2%}).")
+        # ---------------------------------------------
 
         # Pad sequences
         if not all_seq_features:
@@ -709,7 +736,7 @@ class TransactionDataModule(pl.LightningDataModule):
         # Add to graph data object
         self.graph_data['transaction'].seq_features = padded_sequences
         self.graph_data['transaction'].seq_lengths = torch.tensor(all_seq_lengths, dtype=torch.long)
-        print(f"Added sequence features to graph. Padded shape: {padded_sequences.shape}")
+        print(f"Added sequence features to graph. Padded shape: {padded_sequences.shape}, Expected Dim: {self.sequence_feature_dim}")
 
 
     def _prepare_and_add_text(self):
@@ -717,7 +744,7 @@ class TransactionDataModule(pl.LightningDataModule):
         if self.graph_data is None or self.tokenizer is None:
             raise RuntimeError("Graph data or tokenizer not initialized.")
         print("Tokenizing text fields...")
-        text_fields_to_process = ['description', 'memo', 'merchant_name']
+        text_fields_to_process = ['raw_description', 'memo', 'merchant_name']
         processed_tokens = {}
         start_time_text = time.time()
         for field in text_fields_to_process:
@@ -875,13 +902,16 @@ class TransactionDataModule(pl.LightningDataModule):
             return None
 
         input_nodes = ('transaction', mask)
-        # Handle num_workers > num_seed_nodes / batch_size edge case? Usually okay.
-        actual_num_workers = min(self.num_workers, num_seed_nodes // self.batch_size) if num_seed_nodes > self.batch_size else 0
-        if actual_num_workers != self.num_workers:
-             # print(f"[INFO] Reduced num_workers from {self.num_workers} to {actual_num_workers} for loader due to small dataset size.")
-             # Note: PyTorch DataLoader might handle this automatically, TBD. Setting to 0 if dataset is tiny.
-             actual_num_workers = self.num_workers # Keep original for now, let DataLoader handle it.
-
+        
+        # Reverted: NeighborLoader should handle feature propagation automatically.
+        # Explicitly listing features caused TypeError.
+        # node_attrs = [
+        #     'x', 'y_global', 'y_user', 'seq_features', 'seq_lengths',
+        #     'raw_description_input_ids', 'raw_description_attention_mask',
+        #     'memo_input_ids', 'memo_attention_mask',
+        #     'merchant_name_input_ids', 'merchant_name_attention_mask'
+        # ]
+        # edge_attrs = ['edge_attr']
 
         loader = NeighborLoader(
             self.graph_data,
@@ -889,10 +919,9 @@ class TransactionDataModule(pl.LightningDataModule):
             shuffle=shuffle,
             batch_size=self.batch_size,
             input_nodes=input_nodes,
+            # Removed node_features and edge_features arguments
             num_workers=self.num_workers, # Use original request
             persistent_workers=(self.num_workers > 0),
-            # Potentially add prefetch_factor if I/O bound
-            # prefetch_factor=2 if self.num_workers > 0 else None
         )
         print(f"Created NeighborLoader with {num_seed_nodes} seed nodes.")
         return loader

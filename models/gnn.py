@@ -4,11 +4,12 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, SAGEConv, HeteroConv
 from torch_geometric.nn.conv import MessagePassing
 from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
 
 class HeteroGNNLayer(torch.nn.Module):
     """Heterogeneous GNN layer with attention and edge feature handling."""
     
-    def __init__(self, in_channels: Dict[str, int], out_channels: int, edge_types: List[Tuple[str, str, str]], heads: int = 4):
+    def __init__(self, in_channels: Dict[str, int], out_channels: int, edge_types: List[Tuple[str, str, str]], edge_input_dims: Dict[Tuple[str, str, str], int], heads: int = 4):
         super().__init__()
         self.edge_types = edge_types
         self.heads = heads
@@ -29,10 +30,17 @@ class HeteroGNNLayer(torch.nn.Module):
         })
         
         # Edge feature projections for each edge type
-        self.edge_proj = torch.nn.ModuleDict({
-            str(edge_type): torch.nn.Linear(1, out_channels)  # Edge features are 1-dimensional
-            for edge_type in edge_types
-        })
+        self.edge_proj = torch.nn.ModuleDict()
+        for edge_type in edge_types:
+            edge_key = str(edge_type)
+            # Use the provided dimension for this edge type, default to 1 if not found (shouldn't happen)
+            in_dim = edge_input_dims.get(edge_type, 1) 
+            if in_dim <= 0:
+                print(f"[WARN] HeteroGNNLayer: Edge type {edge_type} has input dim {in_dim}. Skipping projection.")
+                # Optionally, create a dummy projection or handle differently
+                self.edge_proj[edge_key] = nn.Identity() # Example: Pass through if dim is 0 or less
+            else:
+                self.edge_proj[edge_key] = torch.nn.Linear(in_dim, out_channels)
         
         # Attention layers for each edge type
         self.attention = torch.nn.ModuleDict({
@@ -128,21 +136,27 @@ class HeteroGNNLayer(torch.nn.Module):
 class HeteroGNNEncoder(torch.nn.Module):
     """Heterogeneous GNN encoder with multiple layers."""
     
-    def __init__(self, in_channels: Dict[str, int], hidden_channels: int, out_channels: int,
+    def __init__(self, in_channels: Dict[str, int],
+                 edge_input_dims: Dict[Tuple[str, str, str], int],
+                 hidden_channels: int, out_channels: int,
                  edge_types: List[Tuple[str, str, str]], num_layers: int = 3, heads: int = 4):
         super().__init__()
         self.num_layers = num_layers
         
+        # Extract unique node types from in_channels keys for projections
+        node_types = list(in_channels.keys())
+
         # Input projections
         self.input_proj = torch.nn.ModuleDict({
             node_type: torch.nn.Linear(in_channels[node_type], hidden_channels)
-            for node_type in in_channels
+            for node_type in node_types
         })
         
         # GNN layers
         self.layers = torch.nn.ModuleList([
             HeteroGNNLayer(
-                in_channels={node_type: hidden_channels for node_type in in_channels},
+                in_channels={node_type: hidden_channels for node_type in node_types},
+                edge_input_dims=edge_input_dims,
                 out_channels=hidden_channels,
                 edge_types=edge_types,
                 heads=heads
@@ -153,7 +167,7 @@ class HeteroGNNEncoder(torch.nn.Module):
         # Output projection
         self.out_proj = torch.nn.ModuleDict({
             node_type: torch.nn.Linear(hidden_channels, out_channels)
-            for node_type in in_channels
+            for node_type in node_types
         })
         
     def forward(self, x_dict: Dict[str, torch.Tensor], edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor],

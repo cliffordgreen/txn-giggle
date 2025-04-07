@@ -12,6 +12,8 @@ from typing import Dict, Optional
 import torch
 import sys
 
+print("Script Started")
+
 torch.set_float32_matmul_precision('medium')  # Use 'medium' if you encounter numerical instability
 
 # Enable CUDA benchmarking to optimize kernels for your specific model
@@ -73,11 +75,12 @@ def load_data(data_path: str) -> pd.DataFrame:
     df['unix_timestamp'] = df['timestamp'].apply(safe_timestamp)
     
     # Handle missing values in other columns
-    df['description'] = df['description'].fillna('')
+    df['raw_description'] = df['raw_description'].fillna('')
     df['memo'] = df['memo'].fillna('')
     df['merchant_name'] = df['merchant_name'].fillna('')
 
     print(f"Data loaded: {len(df)} records")
+    print("Data Loaded")
     return df
     
 def train(
@@ -98,6 +101,7 @@ def train(
     seed: int = 42
 ):
     """Train the transaction classifier."""
+    print("Train function started")
     # Set random seed
     pl.seed_everything(seed)
     
@@ -107,6 +111,7 @@ def train(
     # Load data
     df = load_data(data_path)
     
+    print("Creating DataModule")
     # Create data module
     data_module = TransactionDataModule(
         transactions_df=df,
@@ -121,8 +126,20 @@ def train(
         test_ratio=test_ratio,
         perform_overfit_test=False
     )
+    print("Running DataModule setup")
     data_module.setup('fit')    
     node_dims = data_module.node_feature_dims
+    # Get sequence dimension AFTER setup
+    sequence_dim = data_module.sequence_feature_dim 
+    if sequence_dim is None:
+        raise ValueError("DataModule sequence_feature_dim is None after setup.")
+    # Get edge dimensions AFTER setup
+    edge_dims = data_module.edge_feature_dims
+    # Get the full graph data object AFTER setup
+    full_graph_data = data_module.graph_data
+    if full_graph_data is None:
+        raise ValueError("DataModule graph_data is None after setup.")
+    print("DataModule setup complete")
 
     try:
         # Get node types from the keys of the calculated feature dimensions
@@ -315,23 +332,31 @@ def train(
     
     print("--- End First Batch Check --- \nStarting training...")
     
+    print("Creating Model")
     # Create model
+    print(f"\n--- Creating Model ---")
+    print(f"  Using Sequence Input Dim: {sequence_dim}") # Add print
+    print(f"  Using Edge Input Dims: {edge_dims}") # Add print
     model = TransactionClassifier(
         num_classes=df['category_id'].nunique(),
         gnn_hidden_channels=256,
         gnn_out_channels = 256,
         gnn_node_input_dims = node_dims,
+        gnn_edge_input_dims = edge_dims, # Pass edge dimensions
         gnn_num_layers=2,
         gnn_heads=4,
+        seq_input_dim=sequence_dim, # Pass the correct dimension
         seq_hidden_size=256,
         seq_num_layers=2,
         text_model_name=text_model_name,
         text_max_length=text_max_length,
         learning_rate=learning_rate,
         weight_decay=weight_decay
-        ,gnn_only_test_mode=args.gnn_only
-        ,gnn_metadata=gnn_metadata
+        ,gnn_only_test_mode=args.gnn_only # Make sure args.gnn_only is defined
+        ,gnn_metadata=gnn_metadata,
+        full_graph_data_ref=full_graph_data # Pass reference to full graph
     )
+    print("Model Created")
     
     # Create callbacks
     callbacks = [
@@ -354,8 +379,11 @@ def train(
         save_dir=output_dir,
         name='logs'
     )
+    
+    print("Creating Trainer")
     trainer = pl.Trainer(
         max_epochs=1000,
+        # Restore original logic: Use CUDA if available, otherwise CPU
         accelerator='cuda' if torch.cuda.is_available() else 'cpu',
         devices=1,
         callbacks=callbacks,
@@ -366,18 +394,35 @@ def train(
         precision='32',
         min_epochs=100,
        # num_sanity_val_steps=1 ,
-        gradient_clip_val=1 , 
-        strategy='ddp_find_unused_parameters_true'
-
+        gradient_clip_val=1 
     )
+    print("Trainer Created")
     
-    
+    print("Starting Trainer.fit()")
     # Train model
-    trainer.fit(model, data_module)
+    try:
+        trainer.fit(model, data_module)
+        print("Trainer.fit() finished")
+    except Exception as e_fit:
+        print(f"\n!!! ERROR during trainer.fit(): {type(e_fit).__name__}: {e_fit}")
+        import traceback
+        traceback.print_exc()
+        # Optionally re-raise or exit
+        # raise e_fit 
+        sys.exit(1) # Exit if fit fails
     
+    print("Starting Trainer.test()")
     # Test model
-    test_results = trainer.test(model, data_module)
-    
+    test_results = None # Initialize
+    try:
+        test_results = trainer.test(model, data_module)
+        print("Trainer.test() finished")
+    except Exception as e_test:
+        print(f"\n!!! ERROR during trainer.test(): {type(e_test).__name__}: {e_test}")
+        import traceback
+        traceback.print_exc()
+        # Continue to saving part if possible, or exit
+
     # Save test results
     if test_results and len(test_results) > 0:
         # Convert test results to DataFrame
@@ -512,7 +557,10 @@ def train(
         if len(pred_df) > 0:
             pred_df.to_csv(os.path.join(output_dir, 'test_predictions.csv'), index=False)
 
+    print("Script Finished")
+
 if __name__ == '__main__':
+    print("Running __main__ block")
     import argparse
     
     parser = argparse.ArgumentParser(description='Train transaction classifier')
@@ -522,9 +570,9 @@ if __name__ == '__main__':
                       help='Path to transaction data CSV file')
     parser.add_argument('--output_dir', type=str, required=True,
                       help='Directory to save model checkpoints and logs')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=8,
                       help='Batch size for training')
-    parser.add_argument('--num_workers', type=int, default=4,
+    parser.add_argument('--num_workers', type=int, default=0,
                       help='Number of data loading workers')
     parser.add_argument('--max_epochs', type=int, default=100,
                       help='Maximum number of training epochs')

@@ -48,7 +48,7 @@ class TransactionClassifier(pl.LightningModule):
          num_classes: int,
          # --- GNN Params ---
          gnn_node_input_dims: Dict[str, int],
-         # gnn_edge_input_dims: Optional[Dict[Tuple[str, str, str], int]] = None, # Might not be needed if GNN handles internally
+         gnn_edge_input_dims: Dict[Tuple[str, str, str], int],
          gnn_hidden_channels: int = 256,
          gnn_out_channels: int = 256, # Output dim of GNN
          gnn_num_layers: int = 2,
@@ -72,9 +72,19 @@ class TransactionClassifier(pl.LightningModule):
          scheduler_pct_start: float = 0.1,
          class_weights: Optional[List[float]] = None,
          # --- Debug Flag ---
-         gnn_only_test_mode: bool = False # Flag to run only GNN + Classifier
+         gnn_only_test_mode: bool = False, # Flag to run only GNN + Classifier
+         # --- Reference to Full Data (for label lookup) ---
+         full_graph_data_ref: Optional[HeteroData] = None # <<< ADDED
      ):
          super().__init__()
+         self.save_hyperparameters(ignore=['class_weights', 'full_graph_data_ref']) # Ignore ref
+
+         # Store the reference to the full graph data
+         # DO NOT use this for model parameters, only for label lookup if needed
+         self._full_graph_data = full_graph_data_ref
+         if self._full_graph_data is None:
+             print("[WARN] TransactionClassifier initialized without full_graph_data_ref. Label lookup fallback might fail.")
+
          # Save hyperparameters for logging and access via self.hparams
          # If you need class_weights later from hparams, remove 'class_weights' from ignore list.
          self.save_hyperparameters(ignore=['class_weights'])
@@ -105,30 +115,29 @@ class TransactionClassifier(pl.LightningModule):
              print("[INFO] TransactionClassifier running in GNN-ONLY TEST MODE.")
 
          # --- Initialize Encoders ---
-         node_types_list = list(self.hparams.gnn_node_input_dims.keys())
+         if self.hparams.gnn_metadata is None or len(self.hparams.gnn_metadata) != 2:
+             raise ValueError("gnn_metadata must be a tuple containing (node_types, edge_types)")
+         gnn_edge_types = self.hparams.gnn_metadata[1] # Extract edge types
 
          self.gnn_encoder = HeteroGNNEncoder(
-             node_types=node_types_list,
-             metadata=self.hparams.gnn_metadata, # Pass metadata tuple (node_types, edge_types)
+             edge_types=gnn_edge_types,
              in_channels=self.hparams.gnn_node_input_dims,
+             edge_input_dims=self.hparams.gnn_edge_input_dims,
              hidden_channels=self.hparams.gnn_hidden_channels,
              out_channels=self.hparams.gnn_out_channels,
              num_layers=self.hparams.gnn_num_layers,
              heads=self.hparams.gnn_heads,
-             # dropout=... # Pass GNN dropout if applicable
          )
 
          self.seq_encoder = SequenceEncoder(
              input_dim=self.hparams.seq_input_dim,
              hidden_dim=self.hparams.seq_hidden_size,
              num_layers=self.hparams.seq_num_layers,
-             # dropout=... # Pass Sequence dropout if applicable
          )
 
          self.text_encoder = MultiFieldTextEncoder(
              model_name=self.hparams.text_model_name,
              max_length=self.hparams.text_max_length,
-             # output_dim=self.hparams.text_out_dim # Assuming handled internally
          )
          # Use defined text_out_dim for consistency downstream
          text_hidden_size = self.hparams.text_out_dim # This assumes MultiFieldTextEncoder outputs this dim
@@ -173,8 +182,6 @@ class TransactionClassifier(pl.LightningModule):
          self.gnn_direct_classifier = Linear(self.hparams.gnn_out_channels, self.hparams.num_classes)
          print(f"[INFO] Initialized gnn_direct_classifier: Linear({self.hparams.gnn_out_channels}, {self.hparams.num_classes})")
 
-         # --- The second redundant criterion initialization block has been removed ---
-
      # ----------------------------------------------------
      # Forward Pass (Handles both GNN-only and Full mode)
      # ----------------------------------------------------
@@ -203,8 +210,6 @@ class TransactionClassifier(pl.LightningModule):
                      edge_attr_input_from_batch = None
 
              edge_attr_to_pass_to_gnn = edge_attr_input_from_batch # Default: pass what we got
-
-
 
              # --- START ADDITION: Debug Print Before GNN Call ---
              print("\n--- DEBUG: Edge Attrs Dict Being Passed to GNN Encoder ---")
@@ -236,13 +241,13 @@ class TransactionClassifier(pl.LightningModule):
                   num_seed_nodes = gnn_out_dict['transaction'].shape[0] # Avoid index error
 
              gnn_features = gnn_out_dict['transaction'][:num_seed_nodes]
-
+             # <<< DEBUG PRINT GNN >>>
+             print(f"DEBUG Forward: GNN Features Shape: {gnn_features.shape}, HasNaN: {torch.isnan(gnn_features).any().item()}, Min: {torch.min(gnn_features).item() if gnn_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(gnn_features).item() if gnn_features.numel() > 0 else 'N/A':.4f}")
 
          except Exception as e:
              print(f"\n!!! ERROR during GNN processing in forward pass: {e}")
              traceback.print_exc() # Print full traceback for GNN errors
              raise e
-
 
          # --- Conditional Path ---
          if self.gnn_only_test_mode:
@@ -254,6 +259,8 @@ class TransactionClassifier(pl.LightningModule):
                      raise AttributeError("self.gnn_direct_classifier not found. Ensure it's defined in __init__.")
 
                  global_logits = self.gnn_direct_classifier(gnn_features)
+                 # <<< DEBUG PRINT GNN ONLY LOGITS >>>
+                 print(f"DEBUG Forward (GNN Only): Global Logits Shape: {global_logits.shape}, HasNaN: {torch.isnan(global_logits).any().item()}")
                  user_logits = None # No user classification in this mode
                  fusion_weights = None # No fusion happening
              except Exception as e_clf:
@@ -299,31 +306,13 @@ class TransactionClassifier(pl.LightningModule):
                 # Pass the CORRECTED lengths (0 preserved, negatives are 0) to the encoder
                 # The SequenceEncoder should now handle length 0 correctly via pack_padded_sequence
                 _, _, seq_features = self.seq_encoder(seq_input, lengths=seq_lens)
+                # <<< DEBUG PRINT SEQUENCE >>>
+                print(f"DEBUG Forward: Seq Features Shape: {seq_features.shape}, HasNaN: {torch.isnan(seq_features).any().item()}, Min: {torch.min(seq_features).item() if seq_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(seq_features).item() if seq_features.numel() > 0 else 'N/A':.4f}")
 
              except Exception as e:
                 print(f"\n!!! ERROR during Sequence processing: {e}")
                 traceback.print_exc()
                 raise e
-             # try:
-             #     # Ensure slicing uses the potentially adjusted num_seed_nodes
-             #     seq_input = batch['transaction'].seq_features[:num_seed_nodes]
-             #     seq_lens = getattr(batch['transaction'], 'seq_lengths', None)
-             #     if seq_lens is not None:
-             #         seq_lens = seq_lens[:num_seed_nodes]
-
-             #         invalid_len_mask = seq_lens < 0
-
-                     
-             #         if (seq_lens <= 0).any():
-             #             # This warning persists, needs fix in DataModule
-             #             print(f"[WARN] Forward: Found {(seq_lens <= 0).sum().item()} sequences with length <= 0. Clamping to 1.")
-             #             seq_lens = torch.clamp(seq_lens, min=1)
-
-             #     _, _, seq_features = self.seq_encoder(seq_input, lengths=seq_lens)
-             # except Exception as e:
-             #     print(f"\n!!! ERROR during Sequence processing: {e}")
-             #     traceback.print_exc()
-             #     raise e
 
              # 3. Text Processing
              try:
@@ -344,6 +333,8 @@ class TransactionClassifier(pl.LightningModule):
                          }
                  if not text_features_dict: raise ValueError("No text features found/constructed.")
                  text_features = self.text_encoder(text_features_dict)
+                 # <<< DEBUG PRINT TEXT >>>
+                 print(f"DEBUG Forward: Text Features Shape: {text_features.shape}, HasNaN: {torch.isnan(text_features).any().item()}, Min: {torch.min(text_features).item() if text_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(text_features).item() if text_features.numel() > 0 else 'N/A':.4f}")
              except Exception as e:
                  print(f"\n!!! ERROR during Text processing: {e}")
                  traceback.print_exc()
@@ -362,25 +353,29 @@ class TransactionClassifier(pl.LightningModule):
                  elif self._fusion_type in ['attention', 'gating']:
                      # Attention/Gating return fused embed + weights, needs separate classifiers
                      fused_embeddings, fusion_weights = self.fusion_module(embeddings)
+                     # <<< DEBUG PRINT FUSION >>>
+                     print(f"DEBUG Forward ({self._fusion_type}): Fused Embed Shape: {fused_embeddings.shape}, HasNaN: {torch.isnan(fused_embeddings).any().item()}, Min: {torch.min(fused_embeddings).item() if fused_embeddings.numel() > 0 else 'N/A':.4f}, Max: {torch.max(fused_embeddings).item() if fused_embeddings.numel() > 0 else 'N/A':.4f}")
                      if self.global_classifier:
                          global_logits = self.global_classifier(fused_embeddings)
+                         # <<< DEBUG PRINT FINAL LOGITS >>>
+                         print(f"DEBUG Forward ({self._fusion_type}): Global Logits Shape: {global_logits.shape}, HasNaN: {torch.isnan(global_logits).any().item()}")
                      else: # Should have been caught in __init__, but safety check
                          raise AttributeError(f"Fusion type '{self._fusion_type}' requires self.global_classifier, but it is None.")
                      if self.user_classifier: # Only calculate if classifier exists
                          user_logits = self.user_classifier(fused_embeddings)
+                         # <<< DEBUG PRINT FINAL LOGITS >>>
+                         print(f"DEBUG Forward ({self._fusion_type}): User Logits Shape: {user_logits.shape}, HasNaN: {torch.isnan(user_logits).any().item()}")
                  # else: # Already checked in __init__
              except Exception as e:
                  print(f"\n!!! ERROR during Fusion/Classification processing: {e}")
                  traceback.print_exc()
                  raise e
 
-
          # --- Return ---
          if global_logits is None:
              raise RuntimeError("Forward pass logic error: global_logits was not assigned.")
 
          return global_logits, user_logits, fusion_weights
-
 
      def training_step(self, batch: HeteroData, batch_idx: int) -> Dict[str, torch.Tensor]:
          # training_step MUST return a dictionary containing at least the 'loss' key
@@ -457,7 +452,6 @@ class TransactionClassifier(pl.LightningModule):
                  param_count = sum(p.numel() for p in group['params'])
                  print(f"  - Group '{group.get('name', 'Unnamed')}': {len(group['params'])} tensors, {param_count} total parameters, LR={group['lr']}")
 
-
          # Create optimizer (as before)
          optimizer = torch.optim.AdamW(param_groups, weight_decay=self.hparams.weight_decay)
 
@@ -494,104 +488,208 @@ class TransactionClassifier(pl.LightningModule):
      # Common Step for Loss / Metrics
      # ----------------------------------------------------
      def _common_step(self, batch: HeteroData, batch_idx: int, stage: str) -> Dict[str, torch.Tensor]:
-         """ Common logic for training, validation, and test steps. """
-         # Get model predictions
-         global_logits, user_logits, fusion_weights = self(batch)
-
-         # --- Loss Calculation ---
-         if not hasattr(batch['transaction'], 'y_global'):
-             print(f"[ERROR] Stage {stage}, Batch {batch_idx}: Batch object missing 'transaction.y_global' for labels!")
-             raise KeyError("Batch object missing 'transaction.y_global' for labels.")
-
-         # Get labels for seed nodes (Ensure slicing matches forward pass)
-         num_seed_nodes = batch['transaction'].batch_size # Assuming this is correct count
-         # Add safety check similar to forward pass if needed
-         if num_seed_nodes > global_logits.shape[0]:
-              print(f"[WARN] _common_step: num_seed_nodes ({num_seed_nodes}) > global_logits ({global_logits.shape[0]}). Mismatch likely.")
-              # Decide how to handle: maybe slice labels to match logits?
-              # num_seed_nodes = global_logits.shape[0] # Risky if labels don't align
-
-         labels_global = batch['transaction'].y_global[:num_seed_nodes] # Slice labels
-         labels_global = labels_global.long() # Ensure Long type for CrossEntropyLoss
-
-         # --- START DEBUGGING Loss Inputs (for overfitting test) ---
-         is_gnn_only_train = (stage == 'train' and getattr(self.hparams, 'gnn_only_test_mode', False))
-         if is_gnn_only_train and batch_idx % 10 == 0: # Print occasionally
-             print(f"\n--- Overfit Test Loss Input Check (Batch {batch_idx}, Global Step {self.trainer.global_step if hasattr(self,'trainer') else 'N/A'}) ---")
-             print(f"  Logits (Input to Loss): shape={global_logits.shape}, dtype={global_logits.dtype}, device={global_logits.device}, "
-                   f"min={global_logits.min().item():.4f}, max={global_logits.max().item():.4f}, mean={global_logits.mean().item():.4f}, "
-                   f"hasNaN={torch.isnan(global_logits).any().item()}, hasInf={torch.isinf(global_logits).any().item()}")
-             print(f"  Labels (Input to Loss): shape={labels_global.shape}, dtype={labels_global.dtype}, device={labels_global.device}, "
-                   f"min={labels_global.min().item()}, max={labels_global.max().item()}")
+         """
+         Common logic for training, validation, and test steps.
+         Handles forward pass, loss calculation, and metric logging.
+         Ensures labels match logits especially for val/test with NeighborLoader.
+         """
+         # --- Debug: Print batch attributes ---
+         if batch_idx == 0: 
+             print(f"--- Attributes of batch object (stage={stage}, batch_idx={batch_idx}) ---")
              try:
-                 unique_labels, counts = torch.unique(labels_global, return_counts=True)
-                 print(f"  Unique Labels in Batch: {unique_labels.cpu().tolist()}")
-                 print(f"  Label Counts in Batch: {counts.cpu().tolist()}")
-             except Exception as e_unique:
-                 print(f"  Error getting unique labels: {e_unique}")
-             print(f"--- End Overfit Check ---")
-         # --- END DEBUGGING ---
+                 # print(dir(batch))
+                 # Also print node stores if they exist
+                 if hasattr(batch, 'node_stores'):
+                     print("Inspecting batch.node_stores:")
+                     for i, store in enumerate(batch.node_stores):
+                         store_key = getattr(store, '_key', '[NO _key]') # Safely get key
+                         print(f"  Store {i}: type={type(store)}, key={store_key}")
+                         # print(f"    Attributes: {dir(store)}") # Optional: print all attrs again
+             except Exception as e_dir:
+                 print(f"Error printing batch dir: {e_dir}")
+             print("---------------------------------------------------------------------")
+         # --- End Debug ---
 
-
-         # Validate label range BEFORE passing to loss
-         num_classes = global_logits.size(1)
-         invalid_mask = (labels_global < 0) | (labels_global >= num_classes)
-         if invalid_mask.any():
-             num_invalid = invalid_mask.sum().item()
-             print(f"[WARN] Stage {stage}, Batch {batch_idx}: Found {num_invalid} invalid labels outside range [0, {num_classes-1}]. Clamping to 0.")
-             # Clamp invalid labels to 0 (or another valid index)
-             labels_global = torch.where(invalid_mask, torch.zeros_like(labels_global), labels_global)
-
-
-         # Calculate global loss
+         # --- Forward Pass ---
          try:
-             # Ensure criterion is initialized
-             if self.criterion is None:
-                 raise RuntimeError("self.criterion was not initialized in __init__.")
-             global_loss = self.criterion(global_logits, labels_global)
-             if torch.isnan(global_loss) or torch.isinf(global_loss):
-                 print(f"[ERROR] Stage {stage}, Batch {batch_idx}: Calculated global_loss is NaN or Inf! Check inputs/model weights.")
-                 # Optionally raise error or return dummy loss if needed
-                 # raise ValueError("NaN/Inf loss detected")
-                 return {'loss': global_loss} # Return the NaN/Inf loss to potentially stop training
-         except Exception as e_loss:
-             print(f"[ERROR] Stage {stage}, Batch {batch_idx}: Error during loss calculation: {e_loss}")
-             traceback.print_exc()
-             raise e_loss
+             global_logits, user_logits, fusion_weights = self.forward(batch)
+         except Exception as e:
+             print(f"[ERROR] Exception during {stage} forward pass (batch {batch_idx}): {e}")
+             dummy_loss = torch.tensor(0.0, device=self.device, requires_grad=True if stage=='train' else False)
+             return {'loss': dummy_loss} if stage == 'train' else {}
 
+         # --- Prepare Labels using input_id and full graph lookup --- 
+         labels_global, labels_user = None, None
+         num_seed_nodes = None
+         if global_logits is not None:
+             num_seed_nodes = global_logits.shape[0]
+         elif user_logits is not None:
+             num_seed_nodes = user_logits.shape[0]
 
-         # --- User-Specific Loss (Optional - Currently Inactive) ---
-         user_loss = torch.tensor(0.0, device=self.device) # Default zero loss
-         # if not self.gnn_only_test_mode and user_logits is not None and hasattr(batch['transaction'], 'y_user'):
-         #     labels_user = batch['transaction'].y_user[:num_seed_nodes].long() # Slice labels
-         #     # Add validation for user labels similar to global labels if needed
-         #     user_loss = self.criterion(user_logits, labels_user) # Use same criterion or different one?
-         #     self.log(f'{stage}_user_loss', user_loss, on_step=(stage=='train'), on_epoch=True, batch_size=num_seed_nodes, logger=True)
-         #     # Log user accuracy etc.
-         #     user_preds = user_logits.argmax(dim=-1)
-         #     user_acc = (user_preds == labels_user).float().mean()
-         #     self.log(f'{stage}_user_accuracy', user_acc, on_step=False, on_epoch=True, batch_size=num_seed_nodes, logger=True)
+         seed_node_original_indices = None
+         transaction_store = None
+         # CORRECTED WAY: Iterate through node_stores to find the right one
+         if hasattr(batch, 'node_stores'):
+             for store in batch.node_stores:
+                 # Check if the store object itself has the _key attribute
+                 if hasattr(store, '_key') and store._key == 'transaction':
+                     transaction_store = store
+                     break # Found the transaction store
+         
+         # Now check the found store for input_id
+         if transaction_store is not None and hasattr(transaction_store, 'input_id'):
+             seed_node_original_indices = transaction_store.input_id
+             # Verify length matches num_seed_nodes if possible
+             if num_seed_nodes is not None and len(seed_node_original_indices) != num_seed_nodes:
+                 print(f"[WARN] {stage} step (batch {batch_idx}): transaction_store.input_id length ({len(seed_node_original_indices)}) != num_seed_nodes ({num_seed_nodes}). Using first N.")
+                 seed_node_original_indices = seed_node_original_indices[:num_seed_nodes]
+             elif num_seed_nodes is None: 
+                  print(f"[WARN] {stage} step (batch {batch_idx}): num_seed_nodes is None despite logits existing?")
+         # Handle cases where lookup failed
+         elif transaction_store is None:
+             print(f"[WARN] {stage} step (batch {batch_idx}): Could not find 'transaction' node store in batch.node_stores.")
+         else: # transaction_store found, but no input_id
+             print(f"[WARN] {stage} step (batch {batch_idx}): Found 'transaction' store but it's missing 'input_id'. Cannot map seed nodes.")
 
+         # --- Fetch Labels from Full Graph using Original Indices --- 
+         if seed_node_original_indices is not None and self._full_graph_data is not None:
+             try:
+                 original_indices_cpu = seed_node_original_indices.cpu().long()
+                 
+                 if hasattr(self._full_graph_data['transaction'], 'y_global'):
+                      labels_global = self._full_graph_data['transaction'].y_global[original_indices_cpu]
+                      if global_logits is not None:
+                           labels_global = labels_global.to(global_logits.device)
+                 else:
+                      print(f"[WARN] {stage} step (batch {batch_idx}): _full_graph_data['transaction'] has no y_global.")
 
-         # --- Total Loss ---
-         # This is the loss value that will be used for backpropagation
-         total_loss = global_loss # + user_loss # Add user_loss if active
+                 if hasattr(self._full_graph_data['transaction'], 'y_user'):
+                      labels_user = self._full_graph_data['transaction'].y_user[original_indices_cpu]
+                      if user_logits is not None:
+                           labels_user = labels_user.to(user_logits.device)
+                  
+             except IndexError as e:
+                  print(f"[ERROR] {stage} step (batch {batch_idx}): IndexError during label lookup from full graph: {e}. Original indices might be invalid.")
+                  labels_global, labels_user = None, None 
+             except Exception as e:
+                  print(f"[ERROR] {stage} step (batch {batch_idx}): Unexpected error during label lookup: {e}")
+                  labels_global, labels_user = None, None
+         else:
+              # This warning is now expected if input_id couldn't be found above
+              if seed_node_original_indices is None:
+                  print(f"[WARN] {stage} step (batch {batch_idx}): Cannot perform label lookup because seed node original indices (input_id) were not found in the batch.")
+              elif self._full_graph_data is None:
+                   print(f"[WARN] {stage} step (batch {batch_idx}): Cannot perform label lookup because _full_graph_data reference is missing.")
 
+         # Verify final label shapes match logits shapes (keep this check)
+         if labels_global is not None and global_logits is not None and labels_global.shape[0] != global_logits.shape[0]:
+              print(f"[ERROR] {stage} step (batch {batch_idx}): Final labels_global shape {labels_global.shape} != global_logits shape {global_logits.shape}. Resetting labels.")
+              labels_global = None
+         if labels_user is not None and user_logits is not None and labels_user.shape[0] != user_logits.shape[0]:
+              print(f"[ERROR] {stage} step (batch {batch_idx}): Final labels_user shape {labels_user.shape} != user_logits shape {user_logits.shape}. Resetting labels.")
+              labels_user = None
+
+         # --- Loss and Metric Calculation ---
+         loss = torch.tensor(0.0, device=self.device)
+         log_dict = {}
+
+         # Global Task
+         if global_logits is not None and labels_global is not None:
+             # Check for shape mismatch before calculating loss/metrics
+             if global_logits.shape[0] == labels_global.shape[0]:
+                 try:
+                     loss_global = self.criterion(global_logits, labels_global)
+                     if torch.isnan(loss_global).any() or torch.isinf(loss_global).any():
+                          print(f"[WARN] {stage} step (batch {batch_idx}): NaN/Inf detected in global loss. Logits min/max: {global_logits.min():.2f}/{global_logits.max():.2f}")
+                          # Handle NaN loss - maybe skip update or use a default value?
+                          # For now, add 0 to total loss if NaN/Inf occurs
+                          loss_global_val = 0.0
+                     else:
+                          loss_global_val = loss_global.item() # Get scalar value for adding if not NaN/Inf
+                          loss = loss + loss_global # Add tensor loss for backprop if training
+
+                     # Use num_seed_nodes for logging batch size if available
+                     log_batch_size = num_seed_nodes if num_seed_nodes is not None else global_logits.shape[0]
+
+                     log_dict[f'{stage}_loss_global'] = loss_global_val
+                     # Calculate accuracy
+                     with torch.no_grad(): # Ensure accuracy calc doesn't affect gradients
+                         preds_global = torch.argmax(global_logits, dim=1)
+                         # Ensure labels are long type for comparison
+                         labels_global_long = labels_global.long()
+                         correct_global = (preds_global == labels_global_long).float()
+                         acc_global_val = correct_global.mean().item()
+                     log_dict[f'{stage}_acc_global'] = acc_global_val
+                 except Exception as e:
+                      print(f"[ERROR] Exception during {stage} global loss/metric calculation (batch {batch_idx}): {e}")
+             else:
+                 print(f"[WARN] {stage} step (batch {batch_idx}): Mismatch! global_logits shape {global_logits.shape} != labels_global shape {labels_global.shape}. Skipping global loss/acc.")
+         elif global_logits is not None and labels_global is None:
+              print(f"[WARN] {stage} step (batch {batch_idx}): Skipping global loss/metrics because labels_global is None after lookup attempt.")
+
+         # User Task (Optional - only if user_logits and corresponding labels exist)
+         if user_logits is not None and labels_user is not None:
+             # Check for shape mismatch
+             if user_logits.shape[0] == labels_user.shape[0]:
+                 try:
+                     # Assuming same criterion, create separate if needed
+                     loss_user = self.criterion(user_logits, labels_user)
+                     if torch.isnan(loss_user).any() or torch.isinf(loss_user).any():
+                          print(f"[WARN] {stage} step (batch {batch_idx}): NaN/Inf detected in user loss. Logits min/max: {user_logits.min():.2f}/{user_logits.max():.2f}")
+                          loss_user_val = 0.0
+                     else:
+                          loss_user_val = loss_user.item()
+                          loss = loss + loss_user # Add tensor loss if training
+
+                     log_batch_size = num_seed_nodes if num_seed_nodes is not None else user_logits.shape[0]
+                     log_dict[f'{stage}_loss_user'] = loss_user_val
+
+                     with torch.no_grad():
+                         preds_user = torch.argmax(user_logits, dim=1)
+                         # Ensure labels are long type for comparison
+                         labels_user_long = labels_user.long()
+                         correct_user = (preds_user == labels_user_long).float()
+                         acc_user_val = correct_user.mean().item()
+                     log_dict[f'{stage}_acc_user'] = acc_user_val
+                 except Exception as e:
+                      print(f"[ERROR] Exception during {stage} user loss/metric calculation (batch {batch_idx}): {e}")
+             else:
+                  print(f"[WARN] {stage} step (batch {batch_idx}): Mismatch! user_logits shape {user_logits.shape} != labels_user shape {labels_user.shape}. Skipping user loss/acc.")
+         elif user_logits is not None and labels_user is None:
+              # This might be expected if user task is optional or failed lookup
+              pass
+
+         # Log the combined loss (scalar value)
+         # If loss tensor contains NaNs from calculation, log 0.0 or a placeholder
+         if torch.isnan(loss).any() or torch.isinf(loss).any():
+              print(f"[WARN] {stage} step (batch {batch_idx}): Combined loss tensor is NaN/Inf. Logging 0.0.")
+              log_dict[f'{stage}_loss'] = 0.0 # Log scalar 0.0
+              # If training, we need to return a valid loss tensor. Re-create 0.0 tensor.
+              loss = torch.tensor(0.0, device=self.device, requires_grad=True if stage=='train' else False)
+         else:
+              log_dict[f'{stage}_loss'] = loss.item() # Log the scalar value of combined loss
 
          # --- Logging ---
-         batch_size = num_seed_nodes # Use the actual number of nodes used for loss calculation
-         self.log(f'{stage}_loss', total_loss, on_step=(stage=='train'), on_epoch=True, batch_size=batch_size, prog_bar=(stage=='train'), logger=True)
-         if user_loss > 0: # Log constituent losses if needed
-             self.log(f'{stage}_global_loss_contrib', global_loss, on_step=(stage=='train'), on_epoch=True, batch_size=batch_size, logger=True)
-             self.log(f'{stage}_user_loss_contrib', user_loss, on_step=(stage=='train'), on_epoch=True, batch_size=batch_size, logger=True)
-         # Log accuracy etc.
-         global_preds = global_logits.argmax(dim=-1)
-         global_acc = (global_preds == labels_global).float().mean()
-         self.log(f'{stage}_global_accuracy', global_acc, on_step=False, on_epoch=True, batch_size=batch_size, prog_bar=True, logger=True)
+         # Use log_dict for cleaner logging
+         # Use num_seed_nodes if available, otherwise fallback to logits shape[0] or 1
+         log_batch_size_fallback = 1
+         if global_logits is not None:
+             log_batch_size_fallback = global_logits.shape[0]
+         elif user_logits is not None: # If global is None, try user
+             log_batch_size_fallback = user_logits.shape[0]
 
-         # Return dictionary - MUST contain 'loss' key for training
-         output_dict = {'loss': total_loss}
-         # Optionally add other items needed by hooks or callbacks
-         # output_dict['logits'] = global_logits.detach()
-         # output_dict['labels'] = labels_global.detach()
-         return output_dict
+         log_batch_size_final = num_seed_nodes if num_seed_nodes is not None else log_batch_size_fallback
+         
+         self.log_dict(log_dict, on_step=(stage=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=log_batch_size_final, sync_dist=True)
+
+         # Add debug print before returning
+         print(f"--- {stage} step finished for batch {batch_idx}. Loss: {loss.item() if isinstance(loss, torch.Tensor) and loss.requires_grad else 'N/A'} --- ") 
+
+         # --- Return Value ---
+         # training_step requires a dict containing 'loss' key with the loss tensor
+         if stage == 'train':
+             # Ensure we return the loss *tensor* for backpropagation
+             return {'loss': loss}
+         else:
+             # validation_step and test_step don't strictly need a return value if logging is done
+             return {} # Return empty dict

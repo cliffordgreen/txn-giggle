@@ -102,39 +102,7 @@ def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
     return df    
-# def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
-#     """Extract features from transaction amount."""
-#     # Log transform amount
-#     df['amount_log'] = np.log1p(df['amount'])
-    
-#     # Amount statistics per user
-#     user_amount_stats = df.groupby('user_id')['amount'].agg([
-#         'mean', 'std', 'min', 'max', 'count'
-#     ]).reset_index()
-    
-#     # Rename columns
-#     user_amount_stats.columns = [
-#         'user_id',
-#         'user_amount_mean',
-#         'user_amount_std',
-#         'user_amount_min',
-#         'user_amount_max',
-#         'user_transaction_count'
-#     ]
-    
-#     # Merge with original dataframe
-#     df = df.merge(user_amount_stats, on='user_id', how='left')
-    
-#     # Amount relative to user statistics
-#     df['amount_relative_to_mean'] = df['amount'] / df['user_amount_mean']
-#     df['amount_relative_to_std'] = (df['amount'] - df['user_amount_mean']) / df['user_amount_std']
-    
-#     # Amount percentiles
-#     df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
-#         lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop')
-#     )
-    
-    return df
+
 
 def extract_merchant_features(df: pd.DataFrame) -> pd.DataFrame:
     """Extract features from merchant information."""
