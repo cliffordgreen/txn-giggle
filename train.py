@@ -31,6 +31,7 @@ def load_data(data_path: str) -> pd.DataFrame:
     try:
         # Convert to datetime with lenient parsing
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        df['timestamp'] = pd.to_datetime(df['books_create_timestamp'], errors='coerce')
         
         # Check for NaT values after conversion
         nat_count = df['timestamp'].isna().sum()
@@ -71,6 +72,8 @@ def load_data(data_path: str) -> pd.DataFrame:
         except (ValueError, AttributeError):
             return None  # or a default value
     
+
+    df = df.dropna(subset=['category_id', 'user_category_id'])
     # Apply the safe function if you need Unix timestamps
     df['unix_timestamp'] = df['timestamp'].apply(safe_timestamp)
     

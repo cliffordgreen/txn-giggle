@@ -83,19 +83,19 @@ class TransactionClassifier(pl.LightningModule):
          full_graph_data_ref: Optional[HeteroData] = None
      ):
          super().__init__()
-         # <<< Call save_hyperparameters FIRST, without ignoring module configs yet >>>
-         # This makes args available via self.hparams for module initialization.
-         # We will ignore/delete problematic ones before logging later.
-         self.save_hyperparameters(ignore=['class_weights', 'full_graph_data_ref']) 
-
-         # Store the reference to the full graph data (not logged)
+         # Store complex parameters as instance attributes first
+         self._gnn_metadata = gnn_metadata
+         self._gnn_node_input_dims = gnn_node_input_dims
+         self._gnn_edge_input_dims = gnn_edge_input_dims
          self._full_graph_data = full_graph_data_ref
+         
+         # <<< Call save_hyperparameters with ignoring complex parameters >>>
+         # This makes simple args available via self.hparams for later use
+         self.save_hyperparameters(ignore=['class_weights', 'full_graph_data_ref', 'gnn_node_input_dims', 'gnn_edge_input_dims', 'gnn_metadata']) 
+
+         # No need to store the reference again as we've stored it above
          if self._full_graph_data is None:
              print("[WARN] TransactionClassifier initialized without full_graph_data_ref. Label lookup fallback might fail.")
-
-         # Save hyperparameters for logging and access via self.hparams
-         # If you need class_weights later from hparams, remove 'class_weights' from ignore list.
-         self.save_hyperparameters(ignore=['class_weights'])
 
          # Store the GNN-only mode flag
          self.gnn_only_test_mode = self.hparams.gnn_only_test_mode
@@ -122,16 +122,16 @@ class TransactionClassifier(pl.LightningModule):
              self.criterion = nn.CrossEntropyLoss() # Default unweighted
          # --- End Cleaned-up Loss Function Initialization ---
 
-         # --- Initialize Encoders Conditionally (using self.hparams) ---
+         # --- Initialize Encoders Conditionally (using self.hparams and instance attributes) ---
          self.gnn_encoder = None
          if self.hparams.use_gnn_encoder:
-             if self.hparams.gnn_metadata is None or len(self.hparams.gnn_metadata) != 2:
+             if self._gnn_metadata is None or len(self._gnn_metadata) != 2:
                  raise ValueError("gnn_metadata must be provided if use_gnn_encoder is True")
-             gnn_edge_types = self.hparams.gnn_metadata[1] # Now works
+             gnn_edge_types = self._gnn_metadata[1] # Use the instance attribute instead of self.hparams
              self.gnn_encoder = HeteroGNNEncoder(
                  edge_types=gnn_edge_types, 
-                 in_channels=self.hparams.gnn_node_input_dims, # Now works
-                 edge_input_dims=self.hparams.gnn_edge_input_dims, # Now works
+                 in_channels=self._gnn_node_input_dims, # Use the instance attribute instead of self.hparams
+                 edge_input_dims=self._gnn_edge_input_dims, # Use the instance attribute instead of self.hparams
                  hidden_channels=self.hparams.gnn_hidden_channels,
                  out_channels=self.hparams.gnn_out_channels,
                  num_layers=self.hparams.gnn_num_layers,
@@ -214,9 +214,10 @@ class TransactionClassifier(pl.LightningModule):
          
          # <<< REMOVE problematic hparams before automatic logging happens >>>
          # These complex types cause issues with OmegaConf/YAML saving.
-         if 'gnn_node_input_dims' in self.hparams: del self.hparams['gnn_node_input_dims']
-         if 'gnn_edge_input_dims' in self.hparams: del self.hparams['gnn_edge_input_dims']
-         if 'gnn_metadata' in self.hparams: del self.hparams['gnn_metadata']
+         # --- NO LONGER NEEDED as they are ignored during save_hyperparameters ---
+         # if 'gnn_node_input_dims' in self.hparams: del self.hparams['gnn_node_input_dims']
+         # if 'gnn_edge_input_dims' in self.hparams: del self.hparams['gnn_edge_input_dims']
+         # if 'gnn_metadata' in self.hparams: del self.hparams['gnn_metadata']
          # Note: class_weights and full_graph_data_ref were already ignored initially.
 
      # ----------------------------------------------------
