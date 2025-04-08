@@ -80,13 +80,15 @@ class TransactionClassifier(pl.LightningModule):
          # --- Debug Flag ---
          gnn_only_test_mode: bool = False,
          # --- Reference to Full Data (for label lookup) ---
-         full_graph_data_ref: Optional[HeteroData] = None # <<< ADDED
+         full_graph_data_ref: Optional[HeteroData] = None
      ):
          super().__init__()
-         self.save_hyperparameters(ignore=['class_weights', 'full_graph_data_ref']) # Ignore ref
+         # <<< Call save_hyperparameters FIRST, without ignoring module configs yet >>>
+         # This makes args available via self.hparams for module initialization.
+         # We will ignore/delete problematic ones before logging later.
+         self.save_hyperparameters(ignore=['class_weights', 'full_graph_data_ref']) 
 
-         # Store the reference to the full graph data
-         # DO NOT use this for model parameters, only for label lookup if needed
+         # Store the reference to the full graph data (not logged)
          self._full_graph_data = full_graph_data_ref
          if self._full_graph_data is None:
              print("[WARN] TransactionClassifier initialized without full_graph_data_ref. Label lookup fallback might fail.")
@@ -94,6 +96,11 @@ class TransactionClassifier(pl.LightningModule):
          # Save hyperparameters for logging and access via self.hparams
          # If you need class_weights later from hparams, remove 'class_weights' from ignore list.
          self.save_hyperparameters(ignore=['class_weights'])
+
+         # Store the GNN-only mode flag
+         self.gnn_only_test_mode = self.hparams.gnn_only_test_mode
+         if self.gnn_only_test_mode:
+             print("[INFO] TransactionClassifier running in GNN-ONLY TEST MODE.")
 
          # --- Cleaned-up Loss Function Initialization ---
          self.criterion = None # Initialize placeholder
@@ -115,21 +122,16 @@ class TransactionClassifier(pl.LightningModule):
              self.criterion = nn.CrossEntropyLoss() # Default unweighted
          # --- End Cleaned-up Loss Function Initialization ---
 
-         # Store the GNN-only mode flag
-         self.gnn_only_test_mode = self.hparams.gnn_only_test_mode
-         if self.gnn_only_test_mode:
-             print("[INFO] TransactionClassifier running in GNN-ONLY TEST MODE.")
-
-         # --- Initialize Encoders Conditionally ---
+         # --- Initialize Encoders Conditionally (using self.hparams) ---
          self.gnn_encoder = None
          if self.hparams.use_gnn_encoder:
              if self.hparams.gnn_metadata is None or len(self.hparams.gnn_metadata) != 2:
                  raise ValueError("gnn_metadata must be provided if use_gnn_encoder is True")
-             gnn_edge_types = self.hparams.gnn_metadata[1]
+             gnn_edge_types = self.hparams.gnn_metadata[1] # Now works
              self.gnn_encoder = HeteroGNNEncoder(
                  edge_types=gnn_edge_types, 
-                 in_channels=self.hparams.gnn_node_input_dims,
-                 edge_input_dims=self.hparams.gnn_edge_input_dims, 
+                 in_channels=self.hparams.gnn_node_input_dims, # Now works
+                 edge_input_dims=self.hparams.gnn_edge_input_dims, # Now works
                  hidden_channels=self.hparams.gnn_hidden_channels,
                  out_channels=self.hparams.gnn_out_channels,
                  num_layers=self.hparams.gnn_num_layers,
@@ -163,7 +165,7 @@ class TransactionClassifier(pl.LightningModule):
              print("[INFO] Text Encoder Disabled.")
              text_hidden_size = 0 # No text contribution
          
-         # --- Initialize Fusion Module and Classifiers ---
+         # --- Initialize Fusion Module and Classifiers (using self.hparams) ---
          # Dynamically determine modality dimensions based on enabled encoders
          self.modality_dims = {}
          if self.gnn_encoder:
@@ -207,9 +209,15 @@ class TransactionClassifier(pl.LightningModule):
              raise ValueError(f"Unsupported fusion_type: {self._fusion_type}")
 
          # --- Define Separate Classifier for GNN-Only Mode ---
-         # Takes GNN output directly. Initialized unconditionally.
          self.gnn_direct_classifier = Linear(self.hparams.gnn_out_channels, self.hparams.num_global_classes)
          print(f"[INFO] Initialized gnn_direct_classifier: Linear({self.hparams.gnn_out_channels}, {self.hparams.num_global_classes})")
+         
+         # <<< REMOVE problematic hparams before automatic logging happens >>>
+         # These complex types cause issues with OmegaConf/YAML saving.
+         if 'gnn_node_input_dims' in self.hparams: del self.hparams['gnn_node_input_dims']
+         if 'gnn_edge_input_dims' in self.hparams: del self.hparams['gnn_edge_input_dims']
+         if 'gnn_metadata' in self.hparams: del self.hparams['gnn_metadata']
+         # Note: class_weights and full_graph_data_ref were already ignored initially.
 
      # ----------------------------------------------------
      # Forward Pass (Handles both GNN-only and Full mode)
@@ -609,17 +617,28 @@ class TransactionClassifier(pl.LightningModule):
              try:
                  original_indices_cpu = seed_node_original_indices.cpu().long()
                  
+                 # Fetch Global Labels
                  if hasattr(self._full_graph_data['transaction'], 'y_global'):
                       labels_global = self._full_graph_data['transaction'].y_global[original_indices_cpu]
                       if global_logits is not None:
                            labels_global = labels_global.to(global_logits.device)
+                           # <<< CLAMP IMMEDIATELY >>>
+                           num_global_classes_expected = self.hparams.num_global_classes
+                           labels_global = torch.clamp(labels_global, 0, num_global_classes_expected - 1)
                  else:
                       print(f"[WARN] {stage} step (batch {batch_idx}): _full_graph_data['transaction'] has no y_global.")
+                      labels_global = None # Ensure it's None if not found
 
+                 # Fetch User Labels
                  if hasattr(self._full_graph_data['transaction'], 'y_user'):
                       labels_user = self._full_graph_data['transaction'].y_user[original_indices_cpu]
                       if user_logits is not None:
                            labels_user = labels_user.to(user_logits.device)
+                           # <<< CLAMP IMMEDIATELY >>>
+                           num_user_classes_expected = self.hparams.num_user_classes
+                           labels_user = torch.clamp(labels_user, 0, num_user_classes_expected - 1)
+                 else:
+                      labels_user = None # Ensure it's None if not found
                   
              except IndexError as e:
                   print(f"[ERROR] {stage} step (batch {batch_idx}): IndexError during label lookup from full graph: {e}. Original indices might be invalid.")
@@ -646,15 +665,11 @@ class TransactionClassifier(pl.LightningModule):
          loss = torch.tensor(0.0, device=self.device)
          log_dict = {}
 
-         # Global Task
+         # Global Task (Now uses the already clamped labels_global)
          if global_logits is not None and labels_global is not None:
              if global_logits.shape[0] == labels_global.shape[0]:
                  try:
-                     # <<< CLAMP LABELS before loss >>>
-                     num_global_classes_expected = self.hparams.num_global_classes
-                     labels_global_clamped = torch.clamp(labels_global, 0, num_global_classes_expected - 1)
-                     # Calculate loss with clamped labels
-                     loss_global = self.criterion(global_logits, labels_global_clamped)
+                     loss_global = self.criterion(global_logits, labels_global) 
                      if torch.isnan(loss_global).any() or torch.isinf(loss_global).any():
                           print(f"[WARN] {stage} step (batch {batch_idx}): NaN/Inf detected in global loss. Logits min/max: {global_logits.min():.2f}/{global_logits.max():.2f}")
                           # Handle NaN loss - maybe skip update or use a default value?
@@ -683,26 +698,20 @@ class TransactionClassifier(pl.LightningModule):
          elif global_logits is not None and labels_global is None:
               print(f"[WARN] {stage} step (batch {batch_idx}): Skipping global loss/metrics because labels_global is None after lookup attempt.")
 
-         # User Task 
+         # User Task (Now uses the already clamped labels_user)
          if user_logits is not None and labels_user is not None:
              if user_logits.shape[0] == labels_user.shape[0]:
                  try:
-                     # <<< DEBUG: Check user label range >>>
+                     # Debug print now uses clamped labels 
                      user_label_min = labels_user.min().item()
                      user_label_max = labels_user.max().item()
                      num_user_classes_expected = self.hparams.num_user_classes
                      print(f"DEBUG User Labels (batch {batch_idx}): min={user_label_min}, max={user_label_max}, num_classes={num_user_classes_expected}")
+                     # This error check is now less critical as clamping already happened, but keep for info
                      if user_label_min < 0 or user_label_max >= num_user_classes_expected:
-                         print(f"[!!!ERROR!!!] User labels out of range [0, {num_user_classes_expected - 1}]!")
-                         # Optional: raise error or clamp labels for debugging
-                         # labels_user = torch.clamp(labels_user, 0, num_user_classes_expected - 1)
-                     # <<< END DEBUG >>>
-                     
-                     # <<< CLAMP LABELS before loss >>>
-                     num_user_classes_expected = self.hparams.num_user_classes
-                     labels_user_clamped = torch.clamp(labels_user, 0, num_user_classes_expected - 1)
-                     # Calculate loss with clamped labels
-                     loss_user = self.criterion(user_logits, labels_user_clamped)
+                         print(f"[!!!WARN!!!] User labels were out of range [0, {num_user_classes_expected - 1}] before clamping!")
+
+                     loss_user = self.criterion(user_logits, labels_user)
                      if torch.isnan(loss_user).any() or torch.isinf(loss_user).any():
                           print(f"[WARN] {stage} step (batch {batch_idx}): NaN/Inf detected in user loss. Logits min/max: {user_logits.min():.2f}/{user_logits.max():.2f}")
                           loss_user_val = 0.0
