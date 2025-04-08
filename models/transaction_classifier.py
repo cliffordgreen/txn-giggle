@@ -45,7 +45,8 @@ class ModelConfig:
 class TransactionClassifier(pl.LightningModule):
      def __init__(
          self,
-         num_classes: int,
+         num_global_classes: int,
+         num_user_classes: int,
          # --- GNN Params ---
          gnn_node_input_dims: Dict[str, int],
          gnn_edge_input_dims: Dict[Tuple[str, str, str], int],
@@ -55,7 +56,7 @@ class TransactionClassifier(pl.LightningModule):
          gnn_heads: int = 4, # Ensure hidden_channels % heads == 0
          gnn_metadata: Optional[Tuple[List[str], List[Tuple[str, str, str]]]] = None, # Pass metadata for refactored GNN
          # --- Sequence Params ---
-         seq_input_dim: int = 4, # Check if this matches DataModule sequence_feature_dim
+         seq_input_dim: int = 6, # Default to 6 now based on DataModule
          seq_hidden_size: int = 256,
          seq_num_layers: int = 2,
          # --- Text Params ---
@@ -187,26 +188,26 @@ class TransactionClassifier(pl.LightningModule):
                  hidden_dim=self.hparams.fusion_hidden_dim,
                  dropout=self.hparams.fusion_dropout
              )
-             # Classifier takes output of fusion module
-             self.global_classifier = Linear(self.hparams.fusion_hidden_dim, self.hparams.num_classes)
-             self.user_classifier = Linear(self.hparams.fusion_hidden_dim, self.hparams.num_classes) # Assuming same num_classes
+             # Use correct class counts for classifiers
+             self.global_classifier = Linear(self.hparams.fusion_hidden_dim, self.hparams.num_global_classes)
+             self.user_classifier = Linear(self.hparams.fusion_hidden_dim, self.hparams.num_user_classes) 
 
          elif self._fusion_type == 'multi_task':
              self.fusion_module = MultiTaskFusion(
                  input_dims=self.modality_dims,
                  hidden_dim=self.hparams.fusion_hidden_dim,
-                 num_global_classes=self.hparams.num_classes,
-                 num_user_classes=self.hparams.num_classes, # Assuming same num_classes
+                 # Pass correct class counts here too
+                 num_global_classes=self.hparams.num_global_classes,
+                 num_user_classes=self.hparams.num_user_classes,
                  dropout=self.hparams.fusion_dropout
              )
-             # Classifiers are internal to MultiTaskFusion, set main ones to None
          else:
              raise ValueError(f"Unsupported fusion_type: {self._fusion_type}")
 
          # --- Define Separate Classifier for GNN-Only Mode ---
          # Takes GNN output directly. Initialized unconditionally.
-         self.gnn_direct_classifier = Linear(self.hparams.gnn_out_channels, self.hparams.num_classes)
-         print(f"[INFO] Initialized gnn_direct_classifier: Linear({self.hparams.gnn_out_channels}, {self.hparams.num_classes})")
+         self.gnn_direct_classifier = Linear(self.hparams.gnn_out_channels, self.hparams.num_global_classes)
+         print(f"[INFO] Initialized gnn_direct_classifier: Linear({self.hparams.gnn_out_channels}, {self.hparams.num_global_classes})")
 
      # ----------------------------------------------------
      # Forward Pass (Handles both GNN-only and Full mode)

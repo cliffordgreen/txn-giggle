@@ -122,27 +122,33 @@ def train(
         num_workers=num_workers,
         max_seq_length=max_seq_length,
         num_neighbors=[15,10],
-        #graph_neighbors=graph_neighbors,
         text_model_name=text_model_name,
         text_max_length=text_max_length,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
-        perform_overfit_test=False
+        perform_overfit_test=False,
+        use_sequence_encoder=use_sequence_encoder,
+        use_text_encoder=use_text_encoder,
+        use_gnn_encoder=use_gnn_encoder
     )
-    # print("Running DataModule setup")
+    print("Running DataModule setup")
     data_module.setup('fit')    
+    # Get dims AFTER setup (they might be 0 if modality is disabled)
     node_dims = data_module.node_feature_dims
-    # Get sequence dimension AFTER setup
-    sequence_dim = data_module.sequence_feature_dim 
-    if sequence_dim is None:
-        raise ValueError("DataModule sequence_feature_dim is None after setup.")
-    # Get edge dimensions AFTER setup
+    sequence_dim = data_module.sequence_feature_dim
     edge_dims = data_module.edge_feature_dims
     # Get the full graph data object AFTER setup
     full_graph_data = data_module.graph_data
     if full_graph_data is None:
         raise ValueError("DataModule graph_data is None after setup.")
-    # print("DataModule setup complete")
+    # Sequence dim check needs to account for it being disabled
+    if use_sequence_encoder and sequence_dim is None:
+        raise ValueError("Sequence encoder enabled but DataModule sequence_feature_dim is None after setup.")
+    elif not use_sequence_encoder and sequence_dim != 0:
+        print(f"[WARN] Sequence encoder disabled but sequence_feature_dim is {sequence_dim}. Should be 0.")
+        sequence_dim = 0 # Force sequence dim to 0 if encoder is off
+    
+    print("DataModule setup complete")
 
     try:
         # Get node types from the keys of the calculated feature dimensions
@@ -340,8 +346,21 @@ def train(
     # print(f"\n--- Creating Model ---")
     # print(f"  Using Sequence Input Dim: {sequence_dim}") # Add print
     # print(f"  Using Edge Input Dims: {edge_dims}") # Add print
+    # Calculate number of classes AFTER data is loaded and factorized
+    num_global_classes = df['category_id'].nunique()
+    # Check if user_category_id exists and calculate its unique count
+    if 'user_category_id' in df:
+        num_user_classes = df['user_category_id'].nunique()
+    else:
+        # Fallback or error if user categories are expected but column is missing
+        print("[WARN] 'user_category_id' column not found in DataFrame. User classifier might not function correctly.")
+        num_user_classes = num_global_classes # Or set to 0 or raise error?
+    print(f"Number of Global Classes: {num_global_classes}")
+    print(f"Number of User Classes: {num_user_classes}")
+
     model = TransactionClassifier(
-        num_classes=df['category_id'].nunique(),
+        num_global_classes=num_global_classes, # Renamed & passed
+        num_user_classes=num_user_classes,   # Added & passed
         gnn_hidden_channels=256,
         gnn_out_channels = 256,
         gnn_node_input_dims = node_dims,

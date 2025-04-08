@@ -61,7 +61,11 @@ class TransactionDataModule(pl.LightningDataModule):
         # Data split params
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
-        perform_overfit_test: bool = False
+        perform_overfit_test: bool = False,
+        # Modality control
+        use_sequence_encoder: bool = True,
+        use_text_encoder: bool = True,
+        use_gnn_encoder: bool = True # Assume GNN is usually needed
     ):
         super().__init__()
         # --- Store initial configuration ---
@@ -76,6 +80,11 @@ class TransactionDataModule(pl.LightningDataModule):
         self.num_neighbors = num_neighbors
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
+        # Store modality flags
+        self.use_sequence_encoder = use_sequence_encoder
+        self.use_text_encoder = use_text_encoder
+        self.use_gnn_encoder = use_gnn_encoder
+        print(f"  Modality Flags: GNN={self.use_gnn_encoder}, Sequence={self.use_sequence_encoder}, Text={self.use_text_encoder}")
 
         # --- Placeholders for processed data ---
         self.tokenizer = None
@@ -203,42 +212,54 @@ class TransactionDataModule(pl.LightningDataModule):
         # --- Build Graph & Calculate Raw Features ---
         # Avoid rebuilding if already done (check if graph_data exists)
         if self.graph_data is None:
-            print("Calculating raw node features (vectorized)...")
-            start_time = time.time()
-            raw_features = self._calculate_raw_features()
-            print(f"Raw node features calculated in {time.time() - start_time:.2f}s")
+            # --- GNN related processing (Assume needed unless flag specifically disables it) ---
+            if self.use_gnn_encoder:
+                print("Calculating raw node features (vectorized)...")
+                start_time = time.time()
+                raw_features = self._calculate_raw_features()
+                print(f"Raw node features calculated in {time.time() - start_time:.2f}s")
 
-            # --- Fit Scalers ---
-            # NOTE: Fitting on the entire dataset here for simplicity.
-            # For strictness, fit only on the training portion AFTER splitting.
-            # This requires passing the train_mask or train indices to _fit_scalers.
-            print("Fitting scalers on all calculated raw features...")
-            start_time = time.time()
-            self._fit_scalers(raw_features)
-            print(f"Scalers fitted in {time.time() - start_time:.2f}s")
+                print("Fitting scalers on all calculated raw features...")
+                start_time = time.time()
+                self._fit_scalers(raw_features)
+                print(f"Scalers fitted in {time.time() - start_time:.2f}s")
 
-            # --- Build Graph with Scaled Features ---
-            print("Building graph structure with scaled features...")
-            start_time = time.time()
-            # Pass raw features so _build_graph can apply the fitted scalers
-            self._build_graph_and_edges(raw_features)
-            print(f"Graph structure and scaled features built in {time.time() - start_time:.2f}s")
+                print("Building graph structure with scaled features...")
+                start_time = time.time()
+                self._build_graph_and_edges(raw_features)
+                print(f"Graph structure and scaled features built in {time.time() - start_time:.2f}s")
+            else:
+                # If GNN is disabled, we still need a basic HeteroData object
+                # but likely without GNN-specific features/edges.
+                # This part might need refinement depending on downstream use cases without GNN.
+                print("[WARN] GNN encoder is disabled, graph building skipped. Creating minimal graph data.")
+                self.graph_data = HeteroData() 
+                # Potentially add minimal node info like original_index if needed by other modalities
+                # df = self.transactions_df
+                # tx_map = {idx: i for i, idx in enumerate(df.index)}
+                # self.graph_data['transaction'].original_index = torch.tensor(list(tx_map.keys()), dtype=torch.long)
 
-            # --- Prepare and Add Sequences (with scaling) ---
-            print("Preparing sequence data (including scaling)...")
-            start_time = time.time()
-            self._prepare_and_add_sequences()
-            print(f"Sequence data prepared in {time.time() - start_time:.2f}s")
+            # --- Prepare and Add Sequences (Conditionally) ---
+            if self.use_sequence_encoder:
+                print("Preparing sequence data (including scaling)...")
+                start_time = time.time()
+                self._prepare_and_add_sequences()
+                print(f"Sequence data prepared in {time.time() - start_time:.2f}s")
+            else:
+                print("[INFO] Skipping sequence data preparation.")
+                self.sequence_feature_dim = 0 # Set dim to 0 if not used
 
-            # --- Prepare and Add Text Data ---
-            print("Preparing text data...")
-            start_time = time.time()
-            self._prepare_and_add_text()
-            print(f"Text data prepared in {time.time() - start_time:.2f}s")
+            # --- Prepare and Add Text Data (Conditionally) ---
+            if self.use_text_encoder:
+                print("Preparing text data...")
+                start_time = time.time()
+                self._prepare_and_add_text()
+                print(f"Text data prepared in {time.time() - start_time:.2f}s")
+            else:
+                print("[INFO] Skipping text data preparation.")
 
-            # --- Split Data and Add Masks ---
-            # Splitting needs to happen before fitting scalers ideally,
-            # but we fit on all data for now. Add masks after graph is built.
+            # --- Split Data and Add Masks (Always needed?) ---
+            # Assuming split is always needed for train/val/test partitioning, even if only one modality active.
             print("Splitting data by user and adding masks...")
             start_time = time.time()
             self._split_data_and_add_masks()

@@ -31,12 +31,10 @@ class TemporalAttention(nn.Module):
         Returns:
             Attention-weighted context vector [batch_size, hidden_dim]
         """
-        # Compute attention scores (unnormalized)
-        # x shape: [batch_size, seq_len, hidden_dim]
-        # scores shape: [batch_size, seq_len, 1]
         scores = self.attention_net(x)
+        # <<< DEBUG Check scores PRE-MASK >>>
+        print(f"DEBUG Attention Scores (Pre-mask): HasNaN={torch.isnan(scores).any().item()}")
 
-        # Apply mask if provided to prevent attention on padding
         if mask is not None:
             # Ensure mask has the expected shape [batch_size, seq_len]
             if mask.shape != scores.shape[:-1]:
@@ -46,10 +44,18 @@ class TemporalAttention(nn.Module):
             # Mask out padding positions by setting scores to negative infinity
             # Unsqueeze mask to match scores shape for broadcasting: [batch_size, seq_len, 1]
             scores = scores.masked_fill(mask.unsqueeze(-1) == 0, float('-inf')) # Mask value 0 means padding
+            # <<< DEBUG Check scores POST-MASK >>>
+            print(f"DEBUG Attention Scores (Post-mask): HasNaN={torch.isnan(scores).any().item()}")
+            # Check if ALL scores became -inf for any sample
+            all_inf = torch.all(scores == float('-inf'), dim=1)
+            if torch.any(all_inf):
+                print(f"[WARN] Attention: Mask resulted in all -inf scores for {all_inf.sum().item()}/{scores.shape[0]} samples.")
 
         # Compute attention weights (softmax over sequence length dimension)
         # attn_weights shape: [batch_size, seq_len, 1]
         attn_weights = F.softmax(scores, dim=1)
+        # <<< DEBUG Check weights >>>
+        print(f"DEBUG Attention Weights: HasNaN={torch.isnan(attn_weights).any().item()}")
 
         # Compute weighted sum context vector
         # attn_weights * x: [batch_size, seq_len, hidden_dim]
