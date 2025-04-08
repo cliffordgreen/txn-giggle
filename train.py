@@ -91,7 +91,7 @@ def train(
     max_epochs: int = 100,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-5,
-    warmup_steps: int = 50,
+    warmup_steps: int = 1000,
     max_seq_length: int = 50,
     graph_neighbors: Optional[Dict[str, int]] = None,
     text_model_name: str = 'bert-base-uncased',
@@ -102,7 +102,10 @@ def train(
     use_sequence_encoder: bool = True,
     use_text_encoder: bool = True,
     use_gnn_encoder: bool = True,
-    gnn_only_test_mode: bool = False
+    gnn_only_test_mode: bool = False,
+    gnn_dropout: float = 0.1,
+    gnn_num_layers: int = 2,
+    gnn_heads: int = 4
 ):
     """Train the transaction classifier."""
     # print("Train function started")
@@ -365,8 +368,9 @@ def train(
         gnn_out_channels = 256,
         gnn_node_input_dims = node_dims,
         gnn_edge_input_dims = edge_dims, # Pass edge dimensions
-        gnn_num_layers=2,
-        gnn_heads=4,
+        gnn_num_layers=gnn_num_layers,
+        gnn_heads=gnn_heads,
+        gnn_dropout=gnn_dropout,
         seq_input_dim=sequence_dim, # Pass the correct dimension
         seq_hidden_size=256,
         seq_num_layers=2,
@@ -625,6 +629,12 @@ if __name__ == '__main__':
                         help='Disable the text encoder modality.')
     parser.add_argument('--no_gnn', action='store_true',
                         help='Disable the GNN encoder modality.')
+    parser.add_argument('--gnn_dropout', type=float, default=0.1,
+                      help='Dropout rate for GNN layers')
+    parser.add_argument('--gnn_num_layers', type=int, default=2,
+                      help='Number of GNN layers')
+    parser.add_argument('--gnn_heads', type=int, default=4,
+                      help='Number of attention heads in GNN layers')
     
     args = parser.parse_args()
     
@@ -646,5 +656,8 @@ if __name__ == '__main__':
         use_sequence_encoder=not args.no_sequence,
         use_text_encoder=not args.no_text,
         use_gnn_encoder=not args.no_gnn,
-        gnn_only_test_mode=args.gnn_only
+        gnn_only_test_mode=args.gnn_only,
+        gnn_dropout=args.gnn_dropout,
+        gnn_num_layers=args.gnn_num_layers,
+        gnn_heads=args.gnn_heads
     ) 

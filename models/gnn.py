@@ -1,243 +1,106 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, SAGEConv, HeteroConv
-from torch_geometric.nn.conv import MessagePassing
+# Use standard PyG layers
+from torch_geometric.nn import HeteroConv, GATv2Conv, Linear
+from torch_geometric.nn import LayerNorm # Use PyG LayerNorm for graph data
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
-class HeteroGNNLayer(torch.nn.Module):
-    """Heterogeneous GNN layer with attention and edge feature handling."""
-    
-    def __init__(self, in_channels: Dict[str, int], out_channels: int, edge_types: List[Tuple[str, str, str]], edge_input_dims: Dict[Tuple[str, str, str], int], heads: int = 4):
-        super().__init__()
-        self.edge_types = edge_types
-        self.heads = heads
-        
-        # Extract unique node types from edge types
-        node_types = set()
-        for src_type, _, dst_type in edge_types:
-            node_types.add(src_type)
-            node_types.add(dst_type)
-        
-        # Dimension per head
-        dim_per_head = out_channels // heads
-        
-        # Input projections for each node type
-        self.node_proj = torch.nn.ModuleDict({
-            node_type: torch.nn.Linear(in_channels[node_type], out_channels)
-            for node_type in node_types
-        })
-        
-        # Edge feature projections for each edge type
-        self.edge_proj = torch.nn.ModuleDict()
-        for edge_type in edge_types:
-            edge_key = str(edge_type)
-            # Use the provided dimension for this edge type, default to 1 if not found (shouldn't happen)
-            in_dim = edge_input_dims.get(edge_type, 1) 
-            if in_dim <= 0:
-                print(f"[WARN] HeteroGNNLayer: Edge type {edge_type} has input dim {in_dim}. Skipping projection.")
-                # Optionally, create a dummy projection or handle differently
-                self.edge_proj[edge_key] = nn.Identity() # Example: Pass through if dim is 0 or less
-            else:
-                self.edge_proj[edge_key] = torch.nn.Linear(in_dim, out_channels)
-        
-        # Attention layers for each edge type
-        self.attention = torch.nn.ModuleDict({
-            str(edge_type): torch.nn.MultiheadAttention(embed_dim=dim_per_head, num_heads=heads, batch_first=True)
-            for edge_type in edge_types
-        })
-        
-        # Output projections for each node type
-        self.out_proj = torch.nn.ModuleDict({
-            node_type: torch.nn.Linear(out_channels, out_channels)
-            for node_type in node_types
-        })
-        
-        # Layer normalization
-        self.norm = torch.nn.LayerNorm(out_channels)
-        
-    def forward(self, x_dict: Dict[str, torch.Tensor], edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor],
-                edge_attr_dict: Dict[Tuple[str, str, str], torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Forward pass with attention and edge features."""
-        out_dict = {}
-        
-        # Initialize output for each node type
-        for node_type in x_dict:
-            out_dict[node_type] = torch.zeros_like(x_dict[node_type])
-        
-        # Project node features
-        x_proj = {
-            node_type: self.node_proj[node_type](x)
-            for node_type, x in x_dict.items()
-        }
-        
-        # Process each edge type
-        for edge_type in self.edge_types:
-            if edge_type not in edge_index_dict or edge_type not in edge_attr_dict:
-                continue  # Skip missing edge types
-                
-            src_type, edge_name, dst_type = edge_type
-            edge_key = str(edge_type)
-            edge_index = edge_index_dict[edge_type]
-            edge_attr = edge_attr_dict[edge_type]
-            
-            # Project edge features
-            edge_proj = self.edge_proj[edge_key](edge_attr)
-            
-            # Get source and target node features
-            src = x_proj[src_type][edge_index[0]]
-            dst = x_proj[dst_type][edge_index[1]]
-            
-            # Reshape for attention: [num_edges, heads, dim_per_head]
-            dim_per_head = src.size(1) // self.heads
-            src_reshaped = src.reshape(-1, self.heads, dim_per_head)
-            dst_reshaped = dst.reshape(-1, self.heads, dim_per_head)
-            edge_reshaped = edge_proj.reshape(-1, self.heads, dim_per_head)
-            
-            # Apply attention separately for each edge
-            messages = []
-            for i in range(src_reshaped.size(0)):
-                # Add batch dimension [1, heads, dim_per_head]
-                s = src_reshaped[i:i+1]
-                d = dst_reshaped[i:i+1]
-                e = edge_reshaped[i:i+1]
-                
-                # Compute attention
-                attn_output, _ = self.attention[edge_key](
-                    query=d,
-                    key=s,
-                    value=e
-                )
-                messages.append(attn_output)
-                
-            if messages:
-                # Combine messages and reshape back
-                messages = torch.cat(messages, dim=0)
-                messages = messages.reshape(-1, src.size(1))
-                
-                # Aggregate messages
-                for i, j in enumerate(edge_index[1]):
-                    out_dict[dst_type][j] += messages[i]
-        
-        # Apply self-loops for node types without messages
-        for node_type, x in x_dict.items():
-            if torch.all(out_dict[node_type] == 0):
-                out_dict[node_type] = x_proj[node_type]
-        
-        # Project outputs and apply normalization
-        out_dict = {
-            node_type: self.norm(self.out_proj[node_type](out))
-            for node_type, out in out_dict.items()
-        }
-        
-        return out_dict
-
 class HeteroGNNEncoder(torch.nn.Module):
-    """Heterogeneous GNN encoder with multiple layers."""
+    """Heterogeneous GNN encoder using HeteroConv and GATv2Conv layers."""
     
-    def __init__(self, in_channels: Dict[str, int],
-                 edge_input_dims: Dict[Tuple[str, str, str], int],
-                 hidden_channels: int, out_channels: int,
-                 edge_types: List[Tuple[str, str, str]], num_layers: int = 3, heads: int = 4):
+    def __init__(self, 
+                 in_channels: Dict[str, int], 
+                 edge_input_dims: Dict[Tuple[str, str, str], int], 
+                 hidden_channels: int, 
+                 out_channels: int,
+                 edge_types: List[Tuple[str, str, str]], 
+                 num_layers: int = 2, # Reduced default depth slightly
+                 heads: int = 4, 
+                 dropout: float = 0.1): # Added dropout argument
         super().__init__()
         self.num_layers = num_layers
-        
-        # Extract unique node types from in_channels keys for projections
+        self.dropout = dropout
+
         node_types = list(in_channels.keys())
 
-        # Input projections
-        self.input_proj = torch.nn.ModuleDict({
-            node_type: torch.nn.Linear(in_channels[node_type], hidden_channels)
-            for node_type in node_types
-        })
-        
-        # GNN layers
-        self.layers = torch.nn.ModuleList([
-            HeteroGNNLayer(
-                in_channels={node_type: hidden_channels for node_type in node_types},
-                edge_input_dims=edge_input_dims,
-                out_channels=hidden_channels,
-                edge_types=edge_types,
-                heads=heads
-            )
-            for _ in range(num_layers)
-        ])
-        
-        # Output projection
-        self.out_proj = torch.nn.ModuleDict({
-            node_type: torch.nn.Linear(hidden_channels, out_channels)
-            for node_type in node_types
-        })
-        
-    def forward(self, x_dict: Dict[str, torch.Tensor], edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor],
-                edge_attr_dict: Dict[Tuple[str, str, str], torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Forward pass through the GNN layers."""
-        # Project input features
-        x_dict = {
-            node_type: self.input_proj[node_type](x)
-            for node_type, x in x_dict.items()
-        }
-        
-        # Process through GNN layers
-        for layer in self.layers:
-            x_dict = layer(x_dict, edge_index_dict, edge_attr_dict)
-        
-        # Project to output channels
-        x_dict = {
-            node_type: self.out_proj[node_type](x)
-            for node_type, x in x_dict.items()
-        }
-        
-        return x_dict
+        # --- Input Projections --- 
+        # Project each node type features to the hidden dimension
+        self.input_proj = nn.ModuleDict()
+        for node_type, in_dim in in_channels.items():
+            self.input_proj[node_type] = Linear(in_dim, hidden_channels)
 
-class GNNPredictor(nn.Module):
-    """GNN-based predictor that can be used for node classification."""
-    def __init__(
-        self,
-        gnn: HeteroGNNEncoder,
-        num_classes: int,
-        hidden_dim: int,
-        dropout: float = 0.2
-    ):
-        super().__init__()
-        self.gnn = gnn
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes)
-        )
+        # --- HeteroConv Layers --- 
+        self.convs = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList() # LayerNorm for each layer's output
+        for i in range(num_layers):
+            # Determine input channels for this layer
+            current_in_channels = hidden_channels
+            is_last_layer = (i == num_layers - 1)
+            concat_heads = not is_last_layer
+            # Determine output channels for this layer's GATv2Convs
+            # If concatenating heads, output per head is hidden_channels // heads
+            # If not concatenating (last layer), output is the final out_channels
+            current_out_channels_per_head = hidden_channels // heads if concat_heads else out_channels
+
+            conv_dict = {}
+            for edge_type in edge_types:
+                src_type, _, dst_type = edge_type
+                edge_dim = edge_input_dims.get(edge_type, -1) # Get edge dim, -1 if no features
+                
+                # Input for GATv2Conv can be tuple or single int
+                gat_in_channels = (current_in_channels, current_in_channels) # Assuming hidden_dim for both src/dst
+                
+                conv_dict[edge_type] = GATv2Conv(
+                    in_channels=gat_in_channels,
+                    out_channels=current_out_channels_per_head, # Corrected output dim per head 
+                    heads=heads,
+                    concat=concat_heads, 
+                    dropout=dropout,
+                    edge_dim=edge_dim if edge_dim > 0 else None, # Pass edge_dim only if features exist
+                    add_self_loops=False # Often handled by specific edge types or globally
+                )
+
+            # Create HeteroConv layer for this depth
+            # Use sum aggregation by default
+            self.convs.append(HeteroConv(conv_dict, aggr='sum'))
+            # LayerNorm dimension matches the output dim of the HeteroConv layer
+            norm_dim = hidden_channels if concat_heads else out_channels
+            self.norms.append(LayerNorm(norm_dim)) 
+
+        # Note: No explicit output projection needed if last layer outputs `out_channels` directly
+        # self.out_proj = nn.ModuleDict({nt: Linear(...) for nt in node_types}) if needed
         
-    def forward(
-        self,
-        x_dict: Dict[str, torch.Tensor],
-        edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor],
-        edge_attr_dict: Dict[Tuple[str, str, str], torch.Tensor],
-        return_embeddings: bool = False
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Forward pass of the GNN predictor.
+    def forward(self, x_dict: Dict[str, torch.Tensor], 
+                edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor],
+                edge_attr_dict: Optional[Dict[Tuple[str, str, str], torch.Tensor]] = None
+               ) -> Dict[str, torch.Tensor]:
         
-        Args:
-            x_dict: Dictionary mapping node types to node feature matrices
-            edge_index_dict: Dictionary mapping edge types to edge indices
-            edge_attr_dict: Dictionary mapping edge types to edge attributes
-            return_embeddings: Whether to return embeddings along with logits
+        # 1. Apply initial projections
+        for node_type, x in x_dict.items():
+            x_dict[node_type] = self.input_proj[node_type](x).relu()
+            x_dict[node_type] = F.dropout(x_dict[node_type], p=self.dropout, training=self.training)
+
+        # 2. Apply HeteroConv layers
+        for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
+            # Prepare edge features for this layer
+            current_edge_attr_dict = {}
+            if edge_attr_dict:
+                 for edge_type, layer in conv.convs.items():
+                      if hasattr(layer, 'edge_dim') and layer.edge_dim is not None and edge_type in edge_attr_dict:
+                           current_edge_attr_dict[edge_type] = edge_attr_dict[edge_type]
             
-        Returns:
-            If return_embeddings is True:
-                Tuple of (embeddings [num_nodes, hidden_dim], logits [num_nodes, num_classes])
-            Otherwise:
-                Class logits [num_nodes, num_classes]
-        """
-        # Get node embeddings from GNN
-        h_dict = self.gnn(x_dict, edge_index_dict, edge_attr_dict)
+            # Apply convolution
+            # Residual connection might be tricky with changing dims/concat, skip for now
+            x_dict_update = conv(x_dict, edge_index_dict, edge_attr_dict=current_edge_attr_dict)
+            
+            # Apply LayerNorm and Activation
+            for node_type, x_update in x_dict_update.items():
+                x_dict[node_type] = norm(x_update) 
+                if i < self.num_layers - 1: # Apply activation for all but last layer
+                   x_dict[node_type] = x_dict[node_type].relu()
+                x_dict[node_type] = F.dropout(x_dict[node_type], p=self.dropout, training=self.training)
         
-        # Only use transaction node embeddings for classification
-        h = h_dict['transaction']
-        logits = self.classifier(h)
-        
-        if return_embeddings:
-            return h, logits
-        return logits 
+        # 3. Final Output (already projected if last layer had concat=False)
+        return x_dict 

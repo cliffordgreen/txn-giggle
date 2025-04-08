@@ -55,6 +55,7 @@ class TransactionClassifier(pl.LightningModule):
          gnn_num_layers: int = 2,
          gnn_heads: int = 4, # Ensure hidden_channels % heads == 0
          gnn_metadata: Optional[Tuple[List[str], List[Tuple[str, str, str]]]] = None, # Pass metadata for refactored GNN
+         gnn_dropout: float = 0.1, # <<< ADDED parameter 
          # --- Sequence Params ---
          seq_input_dim: int = 6, # Default to 6 now based on DataModule
          seq_hidden_size: int = 256,
@@ -133,6 +134,7 @@ class TransactionClassifier(pl.LightningModule):
                  out_channels=self.hparams.gnn_out_channels,
                  num_layers=self.hparams.gnn_num_layers,
                  heads=self.hparams.gnn_heads,
+                 dropout=self.hparams.gnn_dropout
              )
              print("[INFO] GNN Encoder Initialized.")
          else:
@@ -564,7 +566,7 @@ class TransactionClassifier(pl.LightningModule):
              dummy_loss = torch.tensor(0.0, device=self.device, requires_grad=True if stage=='train' else False)
              return {'loss': dummy_loss} if stage == 'train' else {}
 
-         # --- Prepare Labels using input_id and full graph lookup --- 
+         # --- Prepare Labels using input_id and full graph lookup (Third time's the charm?) --- 
          labels_global, labels_user = None, None
          num_seed_nodes = None
          if global_logits is not None:
@@ -574,15 +576,16 @@ class TransactionClassifier(pl.LightningModule):
 
          seed_node_original_indices = None
          transaction_store = None
-         # CORRECTED WAY: Iterate through node_stores to find the right one
+
+         # Iterate through node stores to find the 'transaction' store
          if hasattr(batch, 'node_stores'):
              for store in batch.node_stores:
-                 # Check if the store object itself has the _key attribute
+                 # Check the _key attribute exists and equals 'transaction'
                  if hasattr(store, '_key') and store._key == 'transaction':
                      transaction_store = store
-                     break # Found the transaction store
+                     break # Stop after finding the store
          
-         # Now check the found store for input_id
+         # Check if we found the store and if it has input_id
          if transaction_store is not None and hasattr(transaction_store, 'input_id'):
              seed_node_original_indices = transaction_store.input_id
              # Verify length matches num_seed_nodes if possible
@@ -590,12 +593,16 @@ class TransactionClassifier(pl.LightningModule):
                  print(f"[WARN] {stage} step (batch {batch_idx}): transaction_store.input_id length ({len(seed_node_original_indices)}) != num_seed_nodes ({num_seed_nodes}). Using first N.")
                  seed_node_original_indices = seed_node_original_indices[:num_seed_nodes]
              elif num_seed_nodes is None: 
-                  print(f"[WARN] {stage} step (batch {batch_idx}): num_seed_nodes is None despite logits existing?")
+                 print(f"[WARN] {stage} step (batch {batch_idx}): num_seed_nodes is None despite logits existing?")
+         
          # Handle cases where lookup failed
-         elif transaction_store is None:
-             print(f"[WARN] {stage} step (batch {batch_idx}): Could not find 'transaction' node store in batch.node_stores.")
-         else: # transaction_store found, but no input_id
-             print(f"[WARN] {stage} step (batch {batch_idx}): Found 'transaction' store but it's missing 'input_id'. Cannot map seed nodes.")
+         else: # Covers transaction_store is None OR transaction_store lacks input_id
+             if transaction_store is None:
+                 print(f"[WARN] {stage} step (batch {batch_idx}): Did not find 'transaction' node store in batch.node_stores list.")
+             else: # transaction_store exists but no input_id
+                 print(f"[WARN] {stage} step (batch {batch_idx}): Found 'transaction' store but it's missing 'input_id'.")
+             print(f"[WARN] {stage} step (batch {batch_idx}): Cannot map seed nodes for label lookup.")
+             seed_node_original_indices = None # Ensure it's None if lookup failed
 
          # --- Fetch Labels from Full Graph using Original Indices --- 
          if seed_node_original_indices is not None and self._full_graph_data is not None:
@@ -621,11 +628,11 @@ class TransactionClassifier(pl.LightningModule):
                   print(f"[ERROR] {stage} step (batch {batch_idx}): Unexpected error during label lookup: {e}")
                   labels_global, labels_user = None, None
          else:
-              # This warning is now expected if input_id couldn't be found above
-              if seed_node_original_indices is None:
-                  print(f"[WARN] {stage} step (batch {batch_idx}): Cannot perform label lookup because seed node original indices (input_id) were not found in the batch.")
-              elif self._full_graph_data is None:
-                   print(f"[WARN] {stage} step (batch {batch_idx}): Cannot perform label lookup because _full_graph_data reference is missing.")
+             # Print more specific warnings
+             if seed_node_original_indices is None:
+                  print(f"[WARN] {stage} step (batch {batch_idx}): Cannot perform label lookup because seed node original indices (input_id) were not found.")
+             if self._full_graph_data is None:
+                  print(f"[WARN] {stage} step (batch {batch_idx}): Cannot perform label lookup because _full_graph_data reference is missing.")
 
          # Verify final label shapes match logits shapes (keep this check)
          if labels_global is not None and global_logits is not None and labels_global.shape[0] != global_logits.shape[0]:
@@ -641,10 +648,13 @@ class TransactionClassifier(pl.LightningModule):
 
          # Global Task
          if global_logits is not None and labels_global is not None:
-             # Check for shape mismatch before calculating loss/metrics
              if global_logits.shape[0] == labels_global.shape[0]:
                  try:
-                     loss_global = self.criterion(global_logits, labels_global)
+                     # <<< CLAMP LABELS before loss >>>
+                     num_global_classes_expected = self.hparams.num_global_classes
+                     labels_global_clamped = torch.clamp(labels_global, 0, num_global_classes_expected - 1)
+                     # Calculate loss with clamped labels
+                     loss_global = self.criterion(global_logits, labels_global_clamped)
                      if torch.isnan(loss_global).any() or torch.isinf(loss_global).any():
                           print(f"[WARN] {stage} step (batch {batch_idx}): NaN/Inf detected in global loss. Logits min/max: {global_logits.min():.2f}/{global_logits.max():.2f}")
                           # Handle NaN loss - maybe skip update or use a default value?
@@ -673,13 +683,26 @@ class TransactionClassifier(pl.LightningModule):
          elif global_logits is not None and labels_global is None:
               print(f"[WARN] {stage} step (batch {batch_idx}): Skipping global loss/metrics because labels_global is None after lookup attempt.")
 
-         # User Task (Optional - only if user_logits and corresponding labels exist)
+         # User Task 
          if user_logits is not None and labels_user is not None:
-             # Check for shape mismatch
              if user_logits.shape[0] == labels_user.shape[0]:
                  try:
-                     # Assuming same criterion, create separate if needed
-                     loss_user = self.criterion(user_logits, labels_user)
+                     # <<< DEBUG: Check user label range >>>
+                     user_label_min = labels_user.min().item()
+                     user_label_max = labels_user.max().item()
+                     num_user_classes_expected = self.hparams.num_user_classes
+                     print(f"DEBUG User Labels (batch {batch_idx}): min={user_label_min}, max={user_label_max}, num_classes={num_user_classes_expected}")
+                     if user_label_min < 0 or user_label_max >= num_user_classes_expected:
+                         print(f"[!!!ERROR!!!] User labels out of range [0, {num_user_classes_expected - 1}]!")
+                         # Optional: raise error or clamp labels for debugging
+                         # labels_user = torch.clamp(labels_user, 0, num_user_classes_expected - 1)
+                     # <<< END DEBUG >>>
+                     
+                     # <<< CLAMP LABELS before loss >>>
+                     num_user_classes_expected = self.hparams.num_user_classes
+                     labels_user_clamped = torch.clamp(labels_user, 0, num_user_classes_expected - 1)
+                     # Calculate loss with clamped labels
+                     loss_user = self.criterion(user_logits, labels_user_clamped)
                      if torch.isnan(loss_user).any() or torch.isinf(loss_user).any():
                           print(f"[WARN] {stage} step (batch {batch_idx}): NaN/Inf detected in user loss. Logits min/max: {user_logits.min():.2f}/{user_logits.max():.2f}")
                           loss_user_val = 0.0
