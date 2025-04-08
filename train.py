@@ -12,7 +12,7 @@ from typing import Dict, Optional
 import torch
 import sys
 
-print("Script Started")
+# print("Script Started")
 
 torch.set_float32_matmul_precision('medium')  # Use 'medium' if you encounter numerical instability
 
@@ -80,7 +80,7 @@ def load_data(data_path: str) -> pd.DataFrame:
     df['merchant_name'] = df['merchant_name'].fillna('')
 
     print(f"Data loaded: {len(df)} records")
-    print("Data Loaded")
+    # print("Data Loaded")
     return df
     
 def train(
@@ -98,11 +98,14 @@ def train(
     text_max_length: int = 128,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
-    seed: int = 42
+    seed: int = 42,
+    use_sequence_encoder: bool = True,
+    use_text_encoder: bool = True,
+    use_gnn_encoder: bool = True,
+    gnn_only_test_mode: bool = False
 ):
     """Train the transaction classifier."""
-    print("Train function started")
-    # Set random seed
+    # print("Train function started")
     pl.seed_everything(seed)
     
     # Create output directory
@@ -111,7 +114,7 @@ def train(
     # Load data
     df = load_data(data_path)
     
-    print("Creating DataModule")
+    # print("Creating DataModule")
     # Create data module
     data_module = TransactionDataModule(
         transactions_df=df,
@@ -126,7 +129,7 @@ def train(
         test_ratio=test_ratio,
         perform_overfit_test=False
     )
-    print("Running DataModule setup")
+    # print("Running DataModule setup")
     data_module.setup('fit')    
     node_dims = data_module.node_feature_dims
     # Get sequence dimension AFTER setup
@@ -139,7 +142,7 @@ def train(
     full_graph_data = data_module.graph_data
     if full_graph_data is None:
         raise ValueError("DataModule graph_data is None after setup.")
-    print("DataModule setup complete")
+    # print("DataModule setup complete")
 
     try:
         # Get node types from the keys of the calculated feature dimensions
@@ -162,13 +165,13 @@ def train(
 
         # Create the metadata tuple
         gnn_metadata = (node_types_list, edge_types_list)
-        print(f"Constructed GNN Metadata: NodeTypes={node_types_list}, EdgeTypes={edge_types_list}") # Debug print
+        # print(f"Constructed GNN Metadata: NodeTypes={node_types_list}, EdgeTypes={edge_types_list}") # Debug print
     
     except Exception as e_meta:
          print(f"[ERROR] Failed to construct GNN metadata from DataModule: {e_meta}")
          raise e_meta # Stop execution if metadata cannot be created
     
-    print("\n--- Checking First Batch Data ---")
+    # print("\n--- Checking First Batch Data ---")
     # 1. Ensure setup has run (it usually runs automatically before dataloaders are needed)
     #    You might need to call it explicitly if running this outside the normal Pytorch Lightning flow.
     if data_module.graph_data is None:
@@ -328,15 +331,15 @@ def train(
         # Optionally re-raise if you want the script to stop on check error
         # raise e
     
-    print("--- End First Batch Check --- \nStarting model creation...")
+    # print("--- End First Batch Check --- \nStarting model creation...")
     
-    print("--- End First Batch Check --- \nStarting training...")
+    # print("--- End First Batch Check --- \nStarting training...")
     
-    print("Creating Model")
+    # print("Creating Model")
     # Create model
-    print(f"\n--- Creating Model ---")
-    print(f"  Using Sequence Input Dim: {sequence_dim}") # Add print
-    print(f"  Using Edge Input Dims: {edge_dims}") # Add print
+    # print(f"\n--- Creating Model ---")
+    # print(f"  Using Sequence Input Dim: {sequence_dim}") # Add print
+    # print(f"  Using Edge Input Dims: {edge_dims}") # Add print
     model = TransactionClassifier(
         num_classes=df['category_id'].nunique(),
         gnn_hidden_channels=256,
@@ -351,12 +354,15 @@ def train(
         text_model_name=text_model_name,
         text_max_length=text_max_length,
         learning_rate=learning_rate,
-        weight_decay=weight_decay
-        ,gnn_only_test_mode=args.gnn_only # Make sure args.gnn_only is defined
-        ,gnn_metadata=gnn_metadata,
+        weight_decay=weight_decay,
+        use_sequence_encoder=use_sequence_encoder,
+        use_text_encoder=use_text_encoder,
+        use_gnn_encoder=use_gnn_encoder,
+        gnn_only_test_mode=gnn_only_test_mode,
+        gnn_metadata=gnn_metadata,
         full_graph_data_ref=full_graph_data # Pass reference to full graph
     )
-    print("Model Created")
+    # print("Model Created")
     
     # Create callbacks
     callbacks = [
@@ -380,7 +386,7 @@ def train(
         name='logs'
     )
     
-    print("Creating Trainer")
+    # print("Creating Trainer")
     trainer = pl.Trainer(
         max_epochs=1000,
         # Restore original logic: Use CUDA if available, otherwise CPU
@@ -396,13 +402,13 @@ def train(
        # num_sanity_val_steps=1 ,
         gradient_clip_val=1 
     )
-    print("Trainer Created")
+    # print("Trainer Created")
     
-    print("Starting Trainer.fit()")
+    # print("Starting Trainer.fit()")
     # Train model
     try:
         trainer.fit(model, data_module)
-        print("Trainer.fit() finished")
+        # print("Trainer.fit() finished")
     except Exception as e_fit:
         print(f"\n!!! ERROR during trainer.fit(): {type(e_fit).__name__}: {e_fit}")
         import traceback
@@ -411,12 +417,12 @@ def train(
         # raise e_fit 
         sys.exit(1) # Exit if fit fails
     
-    print("Starting Trainer.test()")
+    # print("Starting Trainer.test()")
     # Test model
     test_results = None # Initialize
     try:
         test_results = trainer.test(model, data_module)
-        print("Trainer.test() finished")
+        # print("Trainer.test() finished")
     except Exception as e_test:
         print(f"\n!!! ERROR during trainer.test(): {type(e_test).__name__}: {e_test}")
         import traceback
@@ -557,10 +563,10 @@ def train(
         if len(pred_df) > 0:
             pred_df.to_csv(os.path.join(output_dir, 'test_predictions.csv'), index=False)
 
-    print("Script Finished")
+    # print("Script Finished")
 
 if __name__ == '__main__':
-    print("Running __main__ block")
+    # print("Running __main__ block")
     import argparse
     
     parser = argparse.ArgumentParser(description='Train transaction classifier')
@@ -594,6 +600,12 @@ if __name__ == '__main__':
                       help='Ratio of test data')
     parser.add_argument('--seed', type=int, default=42,
                       help='Random seed')
+    parser.add_argument('--no_sequence', action='store_true',
+                        help='Disable the sequence encoder modality.')
+    parser.add_argument('--no_text', action='store_true',
+                        help='Disable the text encoder modality.')
+    parser.add_argument('--no_gnn', action='store_true',
+                        help='Disable the GNN encoder modality.')
     
     args = parser.parse_args()
     
@@ -611,5 +623,9 @@ if __name__ == '__main__':
         text_max_length=args.text_max_length,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
-        seed=args.seed
+        seed=args.seed,
+        use_sequence_encoder=not args.no_sequence,
+        use_text_encoder=not args.no_text,
+        use_gnn_encoder=not args.no_gnn,
+        gnn_only_test_mode=args.gnn_only
     ) 

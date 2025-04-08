@@ -71,8 +71,12 @@ class TransactionClassifier(pl.LightningModule):
          weight_decay: float = 1e-5,
          scheduler_pct_start: float = 0.1,
          class_weights: Optional[List[float]] = None,
+         # --- Modality Control ---
+         use_sequence_encoder: bool = True,
+         use_text_encoder: bool = True,
+         use_gnn_encoder: bool = True,
          # --- Debug Flag ---
-         gnn_only_test_mode: bool = False, # Flag to run only GNN + Classifier
+         gnn_only_test_mode: bool = False,
          # --- Reference to Full Data (for label lookup) ---
          full_graph_data_ref: Optional[HeteroData] = None # <<< ADDED
      ):
@@ -114,41 +118,63 @@ class TransactionClassifier(pl.LightningModule):
          if self.gnn_only_test_mode:
              print("[INFO] TransactionClassifier running in GNN-ONLY TEST MODE.")
 
-         # --- Initialize Encoders ---
-         if self.hparams.gnn_metadata is None or len(self.hparams.gnn_metadata) != 2:
-             raise ValueError("gnn_metadata must be a tuple containing (node_types, edge_types)")
-         gnn_edge_types = self.hparams.gnn_metadata[1] # Extract edge types
+         # --- Initialize Encoders Conditionally ---
+         self.gnn_encoder = None
+         if self.hparams.use_gnn_encoder:
+             if self.hparams.gnn_metadata is None or len(self.hparams.gnn_metadata) != 2:
+                 raise ValueError("gnn_metadata must be provided if use_gnn_encoder is True")
+             gnn_edge_types = self.hparams.gnn_metadata[1]
+             self.gnn_encoder = HeteroGNNEncoder(
+                 edge_types=gnn_edge_types, 
+                 in_channels=self.hparams.gnn_node_input_dims,
+                 edge_input_dims=self.hparams.gnn_edge_input_dims, 
+                 hidden_channels=self.hparams.gnn_hidden_channels,
+                 out_channels=self.hparams.gnn_out_channels,
+                 num_layers=self.hparams.gnn_num_layers,
+                 heads=self.hparams.gnn_heads,
+             )
+             print("[INFO] GNN Encoder Initialized.")
+         else:
+             print("[INFO] GNN Encoder Disabled.")
 
-         self.gnn_encoder = HeteroGNNEncoder(
-             edge_types=gnn_edge_types,
-             in_channels=self.hparams.gnn_node_input_dims,
-             edge_input_dims=self.hparams.gnn_edge_input_dims,
-             hidden_channels=self.hparams.gnn_hidden_channels,
-             out_channels=self.hparams.gnn_out_channels,
-             num_layers=self.hparams.gnn_num_layers,
-             heads=self.hparams.gnn_heads,
-         )
+         self.seq_encoder = None
+         if self.hparams.use_sequence_encoder:
+             self.seq_encoder = SequenceEncoder(
+                 input_dim=self.hparams.seq_input_dim,
+                 hidden_dim=self.hparams.seq_hidden_size,
+                 num_layers=self.hparams.seq_num_layers,
+             )
+             print("[INFO] Sequence Encoder Initialized.")
+         else:
+             print("[INFO] Sequence Encoder Disabled.")
 
-         self.seq_encoder = SequenceEncoder(
-             input_dim=self.hparams.seq_input_dim,
-             hidden_dim=self.hparams.seq_hidden_size,
-             num_layers=self.hparams.seq_num_layers,
-         )
-
-         self.text_encoder = MultiFieldTextEncoder(
-             model_name=self.hparams.text_model_name,
-             max_length=self.hparams.text_max_length,
-         )
-         # Use defined text_out_dim for consistency downstream
-         text_hidden_size = self.hparams.text_out_dim # This assumes MultiFieldTextEncoder outputs this dim
-
+         self.text_encoder = None
+         if self.hparams.use_text_encoder:
+             self.text_encoder = MultiFieldTextEncoder(
+                 model_name=self.hparams.text_model_name,
+                 max_length=self.hparams.text_max_length,
+             )
+             print("[INFO] Text Encoder Initialized.")
+             text_hidden_size = self.hparams.text_out_dim # Assume this comes from text encoder
+         else:
+             print("[INFO] Text Encoder Disabled.")
+             text_hidden_size = 0 # No text contribution
+         
          # --- Initialize Fusion Module and Classifiers ---
-         # Dimensions for input to fusion module
-         self.modality_dims = {
-             'graph': self.hparams.gnn_out_channels,
-             'sequence': self.hparams.seq_hidden_size,
-             'text': text_hidden_size
-         }
+         # Dynamically determine modality dimensions based on enabled encoders
+         self.modality_dims = {}
+         if self.gnn_encoder:
+             self.modality_dims['graph'] = self.hparams.gnn_out_channels
+         if self.seq_encoder:
+             # Seq hidden size determines the output dim used for fusion
+             self.modality_dims['sequence'] = self.hparams.seq_hidden_size 
+         if self.text_encoder:
+             self.modality_dims['text'] = text_hidden_size
+
+         if not self.modality_dims:
+             raise ValueError("At least one encoder (GNN, Sequence, or Text) must be enabled.")
+         print(f"[INFO] Active Modality Dims for Fusion: {self.modality_dims}")
+
          self._fusion_type = self.hparams.fusion_type
          self.fusion_module = None
          self.global_classifier = None # Classifier used after attention/gating fusion
@@ -212,15 +238,15 @@ class TransactionClassifier(pl.LightningModule):
              edge_attr_to_pass_to_gnn = edge_attr_input_from_batch # Default: pass what we got
 
              # --- START ADDITION: Debug Print Before GNN Call ---
-             print("\n--- DEBUG: Edge Attrs Dict Being Passed to GNN Encoder ---")
-             if edge_attr_to_pass_to_gnn is not None:
-                 for et, ea in edge_attr_to_pass_to_gnn.items():
-                     # Print edge type and the shape/dtype of the corresponding tensor
-                     print(f"  Edge Type {et}: Shape={ea.shape if hasattr(ea, 'shape') else 'N/A'}, Dtype={ea.dtype if hasattr(ea, 'dtype') else 'N/A'}")
-             else:
-                 # Print if no edge attributes are being passed
-                 print("  edge_attr_dict passed to GNN Encoder is: None")
-             print("--- END DEBUG ---")
+             # print("\n--- DEBUG: Edge Attrs Dict Being Passed to GNN Encoder ---")
+             # if edge_attr_to_pass_to_gnn is not None:
+             #     for et, ea in edge_attr_to_pass_to_gnn.items():
+             #         # Print edge type and the shape/dtype of the corresponding tensor
+             #         print(f"  Edge Type {et}: Shape={ea.shape if hasattr(ea, 'shape') else 'N/A'}, Dtype={ea.dtype if hasattr(ea, 'dtype') else 'N/A'}")
+             # else:
+             #     # Print if no edge attributes are being passed
+             #     print("  edge_attr_dict passed to GNN Encoder is: None")
+             # print("--- END DEBUG ---")
              # --- END ADDITION ---
 
              # Run GNN Encoder, passing the attributes retrieved from the batch
@@ -242,7 +268,7 @@ class TransactionClassifier(pl.LightningModule):
 
              gnn_features = gnn_out_dict['transaction'][:num_seed_nodes]
              # <<< DEBUG PRINT GNN >>>
-             print(f"DEBUG Forward: GNN Features Shape: {gnn_features.shape}, HasNaN: {torch.isnan(gnn_features).any().item()}, Min: {torch.min(gnn_features).item() if gnn_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(gnn_features).item() if gnn_features.numel() > 0 else 'N/A':.4f}")
+             # print(f"DEBUG Forward: GNN Features Shape: {gnn_features.shape}, HasNaN: {torch.isnan(gnn_features).any().item()}, Min: {torch.min(gnn_features).item() if gnn_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(gnn_features).item() if gnn_features.numel() > 0 else 'N/A':.4f}")
 
          except Exception as e:
              print(f"\n!!! ERROR during GNN processing in forward pass: {e}")
@@ -260,7 +286,7 @@ class TransactionClassifier(pl.LightningModule):
 
                  global_logits = self.gnn_direct_classifier(gnn_features)
                  # <<< DEBUG PRINT GNN ONLY LOGITS >>>
-                 print(f"DEBUG Forward (GNN Only): Global Logits Shape: {global_logits.shape}, HasNaN: {torch.isnan(global_logits).any().item()}")
+                 # print(f"DEBUG Forward (GNN Only): Global Logits Shape: {global_logits.shape}, HasNaN: {torch.isnan(global_logits).any().item()}")
                  user_logits = None # No user classification in this mode
                  fusion_weights = None # No fusion happening
              except Exception as e_clf:
@@ -273,98 +299,117 @@ class TransactionClassifier(pl.LightningModule):
              # print("--- Running FULL forward pass ---") # Optional debug print
 
              # 2. Sequence Processing
-             try:
-                # Ensure slicing uses the potentially adjusted num_seed_nodes
-                seq_input = batch['transaction'].seq_features[:num_seed_nodes]
-                seq_lens = getattr(batch['transaction'], 'seq_lengths', None)
+             seq_features = None
+             if self.seq_encoder:
+                 try:
+                    # Ensure slicing uses the potentially adjusted num_seed_nodes
+                    seq_input = batch['transaction'].seq_features[:num_seed_nodes]
+                    seq_lens = getattr(batch['transaction'], 'seq_lengths', None)
 
-                if seq_lens is not None:
-                    seq_lens = seq_lens[:num_seed_nodes] # Slice sequence lengths
+                    if seq_lens is not None:
+                        seq_lens = seq_lens[:num_seed_nodes] # Slice sequence lengths
 
-                    # --- START: CORRECTED LOGIC ---
-                    # Check ONLY for invalid NEGATIVE lengths
-                    invalid_len_mask = seq_lens < 0
-                    if invalid_len_mask.any():
-                        num_invalid = invalid_len_mask.sum().item()
-                        # Make sure the warning message is accurate!
-                        print(f"[WARN] Forward: Found {num_invalid} sequences with length < 0. Clamping to 0.")
-                        # Clone to avoid modifying original tensor from batch if necessary
-                        seq_lens = seq_lens.clone()
-                        seq_lens[invalid_len_mask] = 0 # Clamp negatives to ZERO
+                        # --- START: CORRECTED LOGIC ---
+                        # Check ONLY for invalid NEGATIVE lengths
+                        invalid_len_mask = seq_lens < 0
+                        if invalid_len_mask.any():
+                            num_invalid = invalid_len_mask.sum().item()
+                            # Make sure the warning message is accurate!
+                            print(f"[WARN] Forward: Found {num_invalid} sequences with length < 0. Clamping to 0.")
+                            # Clone to avoid modifying original tensor from batch if necessary
+                            seq_lens = seq_lens.clone()
+                            seq_lens[invalid_len_mask] = 0 # Clamp negatives to ZERO
 
-                    # Optional, but good practice: Clamp lengths that might exceed the actual dimension
-                    # due to potential batching artifacts (though padding usually handles this)
-                    if seq_input.nelement() > 0: # Check if seq_input is not empty
-                         max_allowed_len = seq_input.shape[1]
-                         too_long_mask = seq_lens > max_allowed_len
-                         if too_long_mask.any():
-                             print(f"[WARN] Forward: Clamping {too_long_mask.sum().item()} seq_lens > {max_allowed_len}")
-                             if not seq_lens.is_contiguous(): seq_lens = seq_lens.contiguous() # Ensure contiguous for inplace op
-                             seq_lens[too_long_mask] = max_allowed_len
-                    # --- END: CORRECTED LOGIC ---
+                        # Optional, but good practice: Clamp lengths that might exceed the actual dimension
+                        # due to potential batching artifacts (though padding usually handles this)
+                        if seq_input.nelement() > 0: # Check if seq_input is not empty
+                             max_allowed_len = seq_input.shape[1]
+                             too_long_mask = seq_lens > max_allowed_len
+                             if too_long_mask.any():
+                                 print(f"[WARN] Forward: Clamping {too_long_mask.sum().item()} seq_lens > {max_allowed_len}")
+                                 if not seq_lens.is_contiguous(): seq_lens = seq_lens.contiguous() # Ensure contiguous for inplace op
+                                 seq_lens[too_long_mask] = max_allowed_len
+                        # --- END: CORRECTED LOGIC ---
 
-                # Pass the CORRECTED lengths (0 preserved, negatives are 0) to the encoder
-                # The SequenceEncoder should now handle length 0 correctly via pack_padded_sequence
-                _, _, seq_features = self.seq_encoder(seq_input, lengths=seq_lens)
-                # <<< DEBUG PRINT SEQUENCE >>>
-                print(f"DEBUG Forward: Seq Features Shape: {seq_features.shape}, HasNaN: {torch.isnan(seq_features).any().item()}, Min: {torch.min(seq_features).item() if seq_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(seq_features).item() if seq_features.numel() > 0 else 'N/A':.4f}")
+                    # Pass the CORRECTED lengths (0 preserved, negatives are 0) to the encoder
+                    # The SequenceEncoder should now handle length 0 correctly via pack_padded_sequence
+                    _, _, seq_features = self.seq_encoder(seq_input, lengths=seq_lens)
+                    # <<< DEBUG PRINT SEQUENCE >>>
+                    # print(f"DEBUG Forward: Seq Features Shape: {seq_features.shape}, HasNaN: {torch.isnan(seq_features).any().item()}, Min: {torch.min(seq_features).item() if seq_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(seq_features).item() if seq_features.numel() > 0 else 'N/A':.4f}")
 
-             except Exception as e:
-                print(f"\n!!! ERROR during Sequence processing: {e}")
-                traceback.print_exc()
-                raise e
+                 except Exception as e:
+                    print(f"\n!!! ERROR during Sequence processing: {e}")
+                    traceback.print_exc()
+                    raise e
+             else: # seq_encoder disabled
+                  # Need a placeholder tensor of correct shape if sequence modality is expected by fusion
+                  # Or ensure fusion module can handle missing modalities
+                  pass # Assuming fusion module handles missing keys
 
              # 3. Text Processing
-             try:
-                 text_features_dict = {}
-                 # Use hparams for consistency if possible, otherwise hardcoded list
-                 fields = getattr(self.hparams, 'text_fields', ['description', 'memo', 'merchant_name'])
-                 for field in fields:
-                     input_ids_key = f'{field}_input_ids'
-                     attn_mask_key = f'{field}_attention_mask'
-                     if hasattr(batch['transaction'], input_ids_key) and hasattr(batch['transaction'], attn_mask_key):
-                         # Move tensors to the model's device within the dict comprehension
-                         # Ensure slicing uses the potentially adjusted num_seed_nodes
-                         input_ids = batch['transaction'][input_ids_key][:num_seed_nodes]
-                         attn_mask = batch['transaction'][attn_mask_key][:num_seed_nodes]
-                         text_features_dict[field] = {
-                             'input_ids': input_ids.to(self.device),
-                             'attention_mask': attn_mask.to(self.device)
-                         }
-                 if not text_features_dict: raise ValueError("No text features found/constructed.")
-                 text_features = self.text_encoder(text_features_dict)
-                 # <<< DEBUG PRINT TEXT >>>
-                 print(f"DEBUG Forward: Text Features Shape: {text_features.shape}, HasNaN: {torch.isnan(text_features).any().item()}, Min: {torch.min(text_features).item() if text_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(text_features).item() if text_features.numel() > 0 else 'N/A':.4f}")
-             except Exception as e:
-                 print(f"\n!!! ERROR during Text processing: {e}")
-                 traceback.print_exc()
-                 raise e
+             text_features = None
+             if self.text_encoder:
+                 try:
+                     text_features_dict = {}
+                     # Use hparams for consistency if possible, otherwise hardcoded list
+                     fields = getattr(self.hparams, 'text_fields', ['description', 'memo', 'merchant_name'])
+                     for field in fields:
+                         input_ids_key = f'{field}_input_ids'
+                         attn_mask_key = f'{field}_attention_mask'
+                         if hasattr(batch['transaction'], input_ids_key) and hasattr(batch['transaction'], attn_mask_key):
+                             # Move tensors to the model's device within the dict comprehension
+                             # Ensure slicing uses the potentially adjusted num_seed_nodes
+                             input_ids = batch['transaction'][input_ids_key][:num_seed_nodes]
+                             attn_mask = batch['transaction'][attn_mask_key][:num_seed_nodes]
+                             text_features_dict[field] = {
+                                 'input_ids': input_ids.to(self.device),
+                                 'attention_mask': attn_mask.to(self.device)
+                             }
+                     if not text_features_dict: raise ValueError("No text features found/constructed.")
+                     text_features = self.text_encoder(text_features_dict)
+                     # <<< DEBUG PRINT TEXT >>>
+                     # print(f"DEBUG Forward: Text Features Shape: {text_features.shape}, HasNaN: {torch.isnan(text_features).any().item()}, Min: {torch.min(text_features).item() if text_features.numel() > 0 else 'N/A':.4f}, Max: {torch.max(text_features).item() if text_features.numel() > 0 else 'N/A':.4f}")
+                 except Exception as e:
+                     print(f"\n!!! ERROR during Text processing: {e}")
+                     traceback.print_exc()
+                     raise e
+             else: # text_encoder disabled
+                  pass # Assuming fusion module handles missing keys
 
              # 4. Fusion
-             embeddings = {
-                 'graph': gnn_features,
-                 'sequence': seq_features,
-                 'text': text_features
-             }
+             # Build embeddings dict only with available features
+             embeddings = {}
+             if gnn_features is not None: # Should always exist if not GNN-only mode
+                 embeddings['graph'] = gnn_features
+             if seq_features is not None:
+                 embeddings['sequence'] = seq_features
+             if text_features is not None:
+                 embeddings['text'] = text_features
+             
+             if not embeddings:
+                  raise RuntimeError("No features available for fusion in forward pass.")
+
              try:
                  if self._fusion_type == 'multi_task':
                      # MultiTaskFusion likely returns logits directly
+                     # Ensure it can handle missing keys in embeddings dict
                      global_logits, user_logits, fusion_weights = self.fusion_module(embeddings)
                  elif self._fusion_type in ['attention', 'gating']:
-                     # Attention/Gating return fused embed + weights, needs separate classifiers
+                     # Attention/Gating return fused embed + weights
+                     # Ensure they can handle missing keys in embeddings dict
                      fused_embeddings, fusion_weights = self.fusion_module(embeddings)
                      # <<< DEBUG PRINT FUSION >>>
-                     print(f"DEBUG Forward ({self._fusion_type}): Fused Embed Shape: {fused_embeddings.shape}, HasNaN: {torch.isnan(fused_embeddings).any().item()}, Min: {torch.min(fused_embeddings).item() if fused_embeddings.numel() > 0 else 'N/A':.4f}, Max: {torch.max(fused_embeddings).item() if fused_embeddings.numel() > 0 else 'N/A':.4f}")
+                     # print(f"DEBUG Forward ({self._fusion_type}): Fused Embed Shape: {fused_embeddings.shape}, HasNaN: {torch.isnan(fused_embeddings).any().item()}, Min: {torch.min(fused_embeddings).item() if fused_embeddings.numel() > 0 else 'N/A':.4f}, Max: {torch.max(fused_embeddings).item() if fused_embeddings.numel() > 0 else 'N/A':.4f}")
                      if self.global_classifier:
                          global_logits = self.global_classifier(fused_embeddings)
                          # <<< DEBUG PRINT FINAL LOGITS >>>
-                         print(f"DEBUG Forward ({self._fusion_type}): Global Logits Shape: {global_logits.shape}, HasNaN: {torch.isnan(global_logits).any().item()}")
+                         # print(f"DEBUG Forward ({self._fusion_type}): Global Logits Shape: {global_logits.shape}, HasNaN: {torch.isnan(global_logits).any().item()}")
                      else: # Should have been caught in __init__, but safety check
                          raise AttributeError(f"Fusion type '{self._fusion_type}' requires self.global_classifier, but it is None.")
                      if self.user_classifier: # Only calculate if classifier exists
                          user_logits = self.user_classifier(fused_embeddings)
                          # <<< DEBUG PRINT FINAL LOGITS >>>
-                         print(f"DEBUG Forward ({self._fusion_type}): User Logits Shape: {user_logits.shape}, HasNaN: {torch.isnan(user_logits).any().item()}")
+                         # print(f"DEBUG Forward ({self._fusion_type}): User Logits Shape: {user_logits.shape}, HasNaN: {torch.isnan(user_logits).any().item()}")
                  # else: # Already checked in __init__
              except Exception as e:
                  print(f"\n!!! ERROR during Fusion/Classification processing: {e}")
@@ -494,20 +539,20 @@ class TransactionClassifier(pl.LightningModule):
          Ensures labels match logits especially for val/test with NeighborLoader.
          """
          # --- Debug: Print batch attributes ---
-         if batch_idx == 0: 
-             print(f"--- Attributes of batch object (stage={stage}, batch_idx={batch_idx}) ---")
-             try:
-                 # print(dir(batch))
-                 # Also print node stores if they exist
-                 if hasattr(batch, 'node_stores'):
-                     print("Inspecting batch.node_stores:")
-                     for i, store in enumerate(batch.node_stores):
-                         store_key = getattr(store, '_key', '[NO _key]') # Safely get key
-                         print(f"  Store {i}: type={type(store)}, key={store_key}")
-                         # print(f"    Attributes: {dir(store)}") # Optional: print all attrs again
-             except Exception as e_dir:
-                 print(f"Error printing batch dir: {e_dir}")
-             print("---------------------------------------------------------------------")
+         # if batch_idx == 0: 
+         #     print(f"--- Attributes of batch object (stage={stage}, batch_idx={batch_idx}) ---")
+         #     try:
+         #         # print(dir(batch))
+         #         # Also print node stores if they exist
+         #         if hasattr(batch, 'node_stores'):
+         #             print("Inspecting batch.node_stores:")
+         #             for i, store in enumerate(batch.node_stores):
+         #                 store_key = getattr(store, '_key', '[NO _key]') # Safely get key
+         #                 print(f"  Store {i}: type={type(store)}, key={store_key}")
+         #                 # print(f"    Attributes: {dir(store)}") # Optional: print all attrs again
+         #     except Exception as e_dir:
+         #         print(f"Error printing batch dir: {e_dir}")
+         #     print("---------------------------------------------------------------------")
          # --- End Debug ---
 
          # --- Forward Pass ---
@@ -683,7 +728,7 @@ class TransactionClassifier(pl.LightningModule):
          self.log_dict(log_dict, on_step=(stage=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=log_batch_size_final, sync_dist=True)
 
          # Add debug print before returning
-         print(f"--- {stage} step finished for batch {batch_idx}. Loss: {loss.item() if isinstance(loss, torch.Tensor) and loss.requires_grad else 'N/A'} --- ") 
+         # print(f"--- {stage} step finished for batch {batch_idx}. Loss: {loss.item() if isinstance(loss, torch.Tensor) and loss.requires_grad else 'N/A'} --- ") 
 
          # --- Return Value ---
          # training_step requires a dict containing 'loss' key with the loss tensor

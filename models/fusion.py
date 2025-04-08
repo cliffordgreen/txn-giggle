@@ -4,118 +4,88 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 
 class AttentionFusion(nn.Module):
-    """Attention-based fusion of multiple modalities."""
-    def __init__(
-        self,
-        input_dims: Dict[str, int],
-        hidden_dim: int,
-        dropout: float = 0.2
-    ):
+    """Attention-based fusion mechanism for multiple modalities."""
+    def __init__(self, input_dims: Dict[str, int], hidden_dim: int, dropout: float):
         super().__init__()
         self.input_dims = input_dims
+        self.modality_names = list(input_dims.keys())
+        self.num_modalities = len(input_dims)
         
-        # Project each modality to same dimension
+        if not self.modality_names:
+            raise ValueError("AttentionFusion requires at least one modality in input_dims.")
+
+        # Modality projections to common space
         self.projections = nn.ModuleDict({
-            name: nn.Linear(dim, hidden_dim)
+            name: nn.Linear(dim, hidden_dim) 
             for name, dim in input_dims.items()
         })
         
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim * len(input_dims), hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, len(input_dims)),
-            nn.Softmax(dim=-1)
-        )
-        
-        # Final projection
-        self.final_proj = nn.Sequential(
+        # Attention weights computation
+        self.attention_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
         )
         
-    # def forward(
-    #     self,
-    #     embeddings: Dict[str, torch.Tensor],
-    #     mask: Optional[Dict[str, torch.Tensor]] = None
-    # ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    #     """
-    #     Forward pass of the attention fusion.
-        
-    #     Args:
-    #         embeddings: Dictionary mapping modality names to their embeddings
-    #         mask: Optional dictionary mapping modality names to attention masks
-            
-    #     Returns:
-    #         Tuple of:
-    #         - Fused embedding [batch_size, hidden_dim]
-    #         - Attention weights [batch_size, num_modalities]
-    #     """
-    #     # Project each modality
-    #     projected = {}
-    #     for name, emb in embeddings.items():
-    #         projected[name] = self.projections[name](emb)
-        
-    #     # Concatenate all projected embeddings
-    #     concat = torch.cat(list(projected.values()), dim=-1)
-        
-    #     # Compute attention weights
-    #     attn_weights = self.attention(concat)
-        
-    #     # Weighted sum
-    #     fused = torch.zeros_like(projected[list(projected.keys())[0]])
-    #     for i, (name, emb) in enumerate(projected.items()):
-    #         fused = fused + attn_weights[:, i].unsqueeze(-1) * emb
-        
-    #     # Final projection
-    #     fused = self.final_proj(fused)
-        
-    #     return fused, attn_weights
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
 
     def forward(
-        self,
-        embeddings: Dict[str, torch.Tensor],
+        self, 
+        embeddings: Dict[str, torch.Tensor], 
         mask: Optional[Dict[str, torch.Tensor]] = None
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass of the attention fusion.
+        Forward pass.
+        Args:
+            embeddings: Dictionary mapping modality names to embeddings.
+                        Keys MUST be a subset of self.modality_names used during init.
+            mask: Optional modality masks.
+        Returns:
+            Tuple of (fused_representation, attention_weights).
         """
-        # ADDED: Verify all embeddings have the same batch size
-        batch_sizes = {name: emb.shape[0] for name, emb in embeddings.items()}
-        if len(set(batch_sizes.values())) > 1:
-            # We have inconsistent batch sizes - fix them
-            min_batch = min(batch_sizes.values())
-            print(f"WARNING: Inconsistent batch sizes in fusion: {batch_sizes}, truncating to {min_batch}")
-            
-            # Truncate all embeddings to smallest batch size
-            embeddings = {name: emb[:min_batch] for name, emb in embeddings.items()}
+        projected_embeddings = []
+        available_modalities = list(embeddings.keys())
+
+        if not available_modalities:
+            raise ValueError("AttentionFusion forward received empty embeddings dictionary.")
+
+        # Project available embeddings
+        for name in available_modalities:
+            if name not in self.projections:
+                # This shouldn't happen if TransactionClassifier builds modality_dims correctly
+                raise KeyError(f"Modality '{name}' provided in embeddings but no projection layer found.")
+            projected_embeddings.append(self.projections[name](embeddings[name]))
         
-        # Project each modality
-        projected = {}
-        for name, emb in embeddings.items():
-            projected[name] = self.projections[name](emb)
+        # Stack projected embeddings: [batch_size, num_available_modalities, hidden_dim]
+        stacked_embeddings = torch.stack(projected_embeddings, dim=1)
         
-        # Print shapes for debugging
-        print(f"Projected shapes: {[p.shape for p in projected.values()]}")
+        # Compute attention scores
+        attention_scores = self.attention_layer(stacked_embeddings) # [batch_size, num_available_modalities, 1]
         
-        # Concatenate all projected embeddings
-        concat = torch.cat(list(projected.values()), dim=-1)
-        
+        # --- Masking (Optional, based on `mask` input) ---
+        # If you have masks indicating validity of entire modalities per sample:
+        if mask is not None:
+            # Build mask tensor matching attention_scores shape
+            modality_mask = torch.stack([mask[name] for name in available_modalities], dim=1)
+            # Unsqueeze to [batch_size, num_available_modalities, 1] for broadcasting
+            modality_mask = modality_mask.unsqueeze(-1)
+            attention_scores = attention_scores.masked_fill(modality_mask == 0, float('-inf'))
+        # -----------------------------------------------
+
         # Compute attention weights
-        attn_weights = self.attention(concat)
+        attention_weights = F.softmax(attention_scores, dim=1) # [batch_size, num_available_modalities, 1]
         
-        # Weighted sum
-        fused = torch.zeros_like(projected[list(projected.keys())[0]])
-        for i, (name, emb) in enumerate(projected.items()):
-            fused = fused + attn_weights[:, i].unsqueeze(-1) * emb
+        # Apply attention
+        fused = torch.sum(attention_weights * stacked_embeddings, dim=1) # [batch_size, hidden_dim]
         
-        # Final projection
-        fused = self.final_proj(fused)
+        # Post-fusion processing
+        fused = self.dropout(fused)
+        fused = self.layer_norm(fused)
         
-        return fused, attn_weights
+        # Return attention weights matching the order of modalities in the input `embeddings` dict
+        # Squeeze the last dimension: [batch_size, num_available_modalities]
+        return fused, attention_weights.squeeze(-1)
 
 class MultiTaskFusion(nn.Module):
     """Multi-task fusion with separate classification heads."""

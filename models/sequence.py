@@ -134,7 +134,7 @@ class SequenceEncoder(nn.Module):
         batch_size, seq_len, input_dim_actual = x.shape
 
         # <<< DEBUG: Check Input >>>
-        print(f"DEBUG SeqEnc Input x: Shape={x.shape}, HasNaN={torch.isnan(x).any().item()}, Min={torch.min(x).item() if x.numel() > 0 else 'N/A':.4f}, Max={torch.max(x).item() if x.numel() > 0 else 'N/A':.4f}")
+        # print(f"DEBUG SeqEnc Input x: Shape={x.shape}, HasNaN={torch.isnan(x).any().item()}, Min={torch.min(x).item() if x.numel() > 0 else 'N/A':.4f}, Max={torch.max(x).item() if x.numel() > 0 else 'N/A':.4f}")
 
         # --- Input Validation ---
         if input_dim_actual != self.input_dim:
@@ -153,13 +153,13 @@ class SequenceEncoder(nn.Module):
             # 1. Clamp negative lengths (should not happen, but safety check)
             invalid_mask = lengths < 0
             if invalid_mask.any():
-                print(f"WARNING (SequenceEncoder): Found {invalid_mask.sum().item()} sequences with length < 0. Setting to 0.")
+                # print(f"WARNING (SequenceEncoder): Found {invalid_mask.sum().item()} sequences with length < 0. Setting to 0.")
                 lengths = lengths.clamp(min=0) # Use clamp for simplicity
 
             # 2. Clamp lengths exceeding the actual sequence dimension (can happen with padding)
             too_long_mask = lengths > seq_len
             if too_long_mask.any():
-                print(f"WARNING (SequenceEncoder): Found {too_long_mask.sum().item()} sequences with length > seq_len={seq_len}. Clamping.")
+                # print(f"WARNING (SequenceEncoder): Found {too_long_mask.sum().item()} sequences with length > seq_len={seq_len}. Clamping.")
                 lengths = lengths.clamp(max=seq_len)
 
         # --- Feature Processing ---
@@ -170,7 +170,7 @@ class SequenceEncoder(nn.Module):
         # Normalize the amount feature
         normed_amount = self.amount_norm(amount)
         # <<< DEBUG: Check Normed Amount >>>
-        print(f"DEBUG SeqEnc Normed Amount: HasNaN={torch.isnan(normed_amount).any().item()}, Min={torch.min(normed_amount).item() if normed_amount.numel() > 0 else 'N/A':.4f}, Max={torch.max(normed_amount).item() if normed_amount.numel() > 0 else 'N/A':.4f}")
+        # print(f"DEBUG SeqEnc Normed Amount: HasNaN={torch.isnan(normed_amount).any().item()}, Min={torch.min(normed_amount).item() if normed_amount.numel() > 0 else 'N/A':.4f}, Max={torch.max(normed_amount).item() if normed_amount.numel() > 0 else 'N/A':.4f}")
 
         # Optional: Normalize other features if needed
         # normed_other_features = self.other_feature_norm(other_features)
@@ -179,7 +179,7 @@ class SequenceEncoder(nn.Module):
         # Use original other features for now
         processed_x = torch.cat([normed_amount, other_features], dim=-1)
         # <<< DEBUG: Check Processed Input to LSTM >>>
-        print(f"DEBUG SeqEnc Processed x: HasNaN={torch.isnan(processed_x).any().item()}, Min={torch.min(processed_x).item() if processed_x.numel() > 0 else 'N/A':.4f}, Max={torch.max(processed_x).item() if processed_x.numel() > 0 else 'N/A':.4f}")
+        # print(f"DEBUG SeqEnc Processed x: HasNaN={torch.isnan(processed_x).any().item()}, Min={torch.min(processed_x).item() if processed_x.numel() > 0 else 'N/A':.4f}, Max={torch.max(processed_x).item() if processed_x.numel() > 0 else 'N/A':.4f}")
 
         # Verify processed shape
         if processed_x.shape[-1] != self.lstm_input_size:
@@ -219,13 +219,13 @@ class SequenceEncoder(nn.Module):
             packed_output, batch_first=True, total_length=seq_len
         )
         # <<< DEBUG: Check LSTM Output >>>
-        print(f"DEBUG SeqEnc LSTM Output: HasNaN={torch.isnan(lstm_out).any().item()}, Min={torch.min(lstm_out).item() if lstm_out.numel() > 0 else 'N/A':.4f}, Max={torch.max(lstm_out).item() if lstm_out.numel() > 0 else 'N/A':.4f}")
+        # print(f"DEBUG SeqEnc LSTM Output: HasNaN={torch.isnan(lstm_out).any().item()}, Min={torch.min(lstm_out).item() if lstm_out.numel() > 0 else 'N/A':.4f}, Max={torch.max(lstm_out).item() if lstm_out.numel() > 0 else 'N/A':.4f}")
 
         # --- Post-processing ---
         # Apply Layer Normalization to the LSTM output sequence
         lstm_out_norm = self.layer_norm(lstm_out)
         # <<< DEBUG: Check LSTM Norm Output >>>
-        print(f"DEBUG SeqEnc LSTM Norm Output: HasNaN={torch.isnan(lstm_out_norm).any().item()}, Min={torch.min(lstm_out_norm).item() if lstm_out_norm.numel() > 0 else 'N/A':.4f}, Max={torch.max(lstm_out_norm).item() if lstm_out_norm.numel() > 0 else 'N/A':.4f}")
+        # print(f"DEBUG SeqEnc LSTM Norm Output: HasNaN={torch.isnan(lstm_out_norm).any().item()}, Min={torch.min(lstm_out_norm).item() if lstm_out_norm.numel() > 0 else 'N/A':.4f}, Max={torch.max(lstm_out_norm).item() if lstm_out_norm.numel() > 0 else 'N/A':.4f}")
 
         # Apply Dropout
         lstm_out_drop = self.dropout(lstm_out_norm)
@@ -250,7 +250,7 @@ class SequenceEncoder(nn.Module):
         # Else: All sequences had length 0, attn_context remains zeros, which is correct.
 
         # <<< DEBUG: Check Attention Context >>>
-        print(f"DEBUG SeqEnc Attention Context: HasNaN={torch.isnan(attn_context).any().item()}, Min={torch.min(attn_context).item() if attn_context.numel() > 0 else 'N/A':.4f}, Max={torch.max(attn_context).item() if attn_context.numel() > 0 else 'N/A':.4f}")
+        # print(f"DEBUG SeqEnc Attention Context: HasNaN={torch.isnan(attn_context).any().item()}, Min={torch.min(attn_context).item() if attn_context.numel() > 0 else 'N/A':.4f}, Max={torch.max(attn_context).item() if attn_context.numel() > 0 else 'N/A':.4f}")
 
         # Return the normalized LSTM output sequence (useful for some downstream tasks),
         # the final hidden/cell states, and the attention context vector.

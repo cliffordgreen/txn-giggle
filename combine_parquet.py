@@ -5,7 +5,7 @@ import os
 # Define the directory containing the parquet files
 parquet_dir = 'Test_1k'
 output_csv = 'combined_1k.csv'
-num_files_to_combine = 10
+num_files_to_combine = 5
 
 try:
     # Find parquet files
