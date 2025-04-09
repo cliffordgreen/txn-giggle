@@ -119,6 +119,26 @@ class TransactionDataModule(pl.LightningDataModule):
         self.transactions_df['hour'] = self.transactions_df['timestamp'].dt.hour
         self.transactions_df['weekday'] = self.transactions_df['timestamp'].dt.weekday
 
+        # Enhanced time features from preprocess.py
+        self.transactions_df['year'] = self.transactions_df['timestamp'].dt.year
+        self.transactions_df['month'] = self.transactions_df['timestamp'].dt.month
+        self.transactions_df['day'] = self.transactions_df['timestamp'].dt.day
+        self.transactions_df['minute'] = self.transactions_df['timestamp'].dt.minute
+        self.transactions_df['second'] = self.transactions_df['timestamp'].dt.second
+        
+        # Binary time-based features
+        self.transactions_df['is_weekend'] = self.transactions_df['weekday'].isin([5, 6]).astype(int)
+        self.transactions_df['is_business_hour'] = ((self.transactions_df['hour'] >= 9) & 
+                                                    (self.transactions_df['hour'] <= 17)).astype(int)
+        self.transactions_df['is_morning'] = ((self.transactions_df['hour'] >= 5) & 
+                                              (self.transactions_df['hour'] < 12)).astype(int)
+        self.transactions_df['is_afternoon'] = ((self.transactions_df['hour'] >= 12) & 
+                                               (self.transactions_df['hour'] < 17)).astype(int)
+        self.transactions_df['is_evening'] = ((self.transactions_df['hour'] >= 17) & 
+                                             (self.transactions_df['hour'] < 22)).astype(int)
+        self.transactions_df['is_night'] = ((self.transactions_df['hour'] >= 22) | 
+                                           (self.transactions_df['hour'] < 5)).astype(int)
+
         # Handle potential NaNs in hour/weekday if timestamp conversion failed
         if self.transactions_df['hour'].isnull().any():
              print("[WARN] Filling NaN 'hour' values (likely from NaT timestamps) with 0.")
@@ -130,6 +150,100 @@ class TransactionDataModule(pl.LightningDataModule):
         # Ensure types after potential filling
         self.transactions_df['hour'] = self.transactions_df['hour'].astype(int)
         self.transactions_df['weekday'] = self.transactions_df['weekday'].astype(int)
+        
+        # Fill NaNs in other time columns
+        for col in ['year', 'month', 'day', 'minute', 'second', 'is_weekend', 
+                   'is_business_hour', 'is_morning', 'is_afternoon', 'is_evening', 'is_night']:
+            if self.transactions_df[col].isnull().any():
+                print(f"[WARN] Filling NaN '{col}' values with 0.")
+                self.transactions_df[col].fillna(0, inplace=True)
+            self.transactions_df[col] = self.transactions_df[col].astype(int)
+
+        # Add amount log transform from preprocess.py
+        if 'amount' in self.transactions_df.columns:
+            self.transactions_df['amount_log'] = np.log1p(self.transactions_df['amount'].fillna(0).clip(lower=0))
+            
+            # User-level amount statistics
+            user_amount_stats = self.transactions_df.groupby('user_id')['amount'].agg([
+                'mean', 'std', 'min', 'max', 'count'
+            ]).reset_index()
+            
+            # Rename columns
+            user_amount_stats.columns = [
+                'user_id',
+                'user_amount_mean',
+                'user_amount_std',
+                'user_amount_min',
+                'user_amount_max',
+                'user_transaction_count'
+            ]
+            
+            # Fill NaN std with 0
+            user_amount_stats['user_amount_std'] = user_amount_stats['user_amount_std'].fillna(0)
+            
+            # Merge with original dataframe
+            self.transactions_df = self.transactions_df.merge(user_amount_stats, on='user_id', how='left')
+            
+            # Relative amount features (safely)
+            mean_divisor = self.transactions_df['user_amount_mean'].replace(0, np.nan)
+            std_divisor = self.transactions_df['user_amount_std'].replace(0, np.nan)
+            
+            self.transactions_df['amount_relative_to_mean'] = self.transactions_df['amount'] / mean_divisor
+            self.transactions_df['amount_relative_to_std'] = (self.transactions_df['amount'] - 
+                                                             self.transactions_df['user_amount_mean']) / std_divisor
+            
+            # Fill NaNs from division
+            self.transactions_df['amount_relative_to_mean'] = self.transactions_df['amount_relative_to_mean'].fillna(0)
+            self.transactions_df['amount_relative_to_std'] = self.transactions_df['amount_relative_to_std'].fillna(0)
+            
+            # Amount percentiles by user
+            try:
+                self.transactions_df['amount_percentile'] = self.transactions_df.groupby('user_id')['amount'].transform(
+                    lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') if x.nunique() > 1 else 0
+                )
+                self.transactions_df['amount_percentile'] = self.transactions_df['amount_percentile'].fillna(0).astype(int)
+            except Exception as e:
+                print(f"Warning: Could not compute amount_percentile: {e}")
+                self.transactions_df['amount_percentile'] = 0
+
+        # Add merchant frequency features from preprocess.py
+        if 'merchant_name' in self.transactions_df.columns:
+            # Merchant global frequency
+            merchant_freq = self.transactions_df['merchant_name'].value_counts()
+            self.transactions_df['merchant_frequency'] = self.transactions_df['merchant_name'].map(merchant_freq)
+            
+            # Merchant frequency per user
+            user_merchant_freq = self.transactions_df.groupby(['user_id', 'merchant_name']).size().reset_index(
+                name='user_merchant_frequency')
+            self.transactions_df = self.transactions_df.merge(user_merchant_freq, 
+                                                            on=['user_id', 'merchant_name'], 
+                                                            how='left')
+            
+            # Fill NaNs in merchant features
+            self.transactions_df['merchant_frequency'] = self.transactions_df['merchant_frequency'].fillna(0).astype(int)
+            self.transactions_df['user_merchant_frequency'] = self.transactions_df['user_merchant_frequency'].fillna(0).astype(int)
+
+        # Add text statistical features from preprocess.py
+        for text_col, prefix in [('raw_description', 'description'), ('memo', 'memo')]:
+            if text_col in self.transactions_df.columns:
+                # Convert to string and fill NaNs
+                self.transactions_df[text_col] = self.transactions_df[text_col].fillna('').astype(str)
+                
+                # Text length features
+                self.transactions_df[f'{prefix}_length'] = self.transactions_df[text_col].str.len()
+                
+                # Word count features
+                self.transactions_df[f'{prefix}_word_count'] = self.transactions_df[text_col].str.split().str.len()
+                
+                # Character type features
+                self.transactions_df[f'{prefix}_digit_count'] = self.transactions_df[text_col].str.count(r'\d')
+                self.transactions_df[f'{prefix}_uppercase_count'] = self.transactions_df[text_col].str.count(r'[A-Z]')
+                self.transactions_df[f'{prefix}_special_count'] = self.transactions_df[text_col].str.count(r'[^a-zA-Z0-9\s]')
+                
+                # Fill NaNs and convert to int
+                for feat in [f'{prefix}_length', f'{prefix}_word_count', f'{prefix}_digit_count', 
+                            f'{prefix}_uppercase_count', f'{prefix}_special_count']:
+                    self.transactions_df[feat] = self.transactions_df[feat].fillna(0).astype(int)
 
         # --- Category ID Handling ---
         self.category_id_map = None
@@ -297,18 +411,57 @@ class TransactionDataModule(pl.LightningDataModule):
         print("Calculating raw transaction features (vectorized)...")
 
         # --- Transaction Features (Vectorized - Already Done) ---
-        self.tx_feat_cols_to_scale = ['amount']
-        self.tx_feat_cols_no_scale = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
+        # Original cyclic time features
+        self.tx_feat_cols_to_scale = [
+            'amount', 'amount_log', 'amount_relative_to_mean', 'amount_relative_to_std',
+            'user_amount_mean', 'user_amount_std', 'user_amount_min', 'user_amount_max',
+            'merchant_frequency', 'user_merchant_frequency',
+            'description_length', 'description_word_count', 'description_digit_count',
+            'description_uppercase_count', 'description_special_count',
+            'memo_length', 'memo_word_count', 'memo_digit_count',
+            'memo_uppercase_count', 'memo_special_count'
+        ]
+        
+        # Keep only columns that exist in the DataFrame
+        self.tx_feat_cols_to_scale = [col for col in self.tx_feat_cols_to_scale if col in df.columns]
+        
+        # Non-scaled features (one-hot or cyclic)
+        self.tx_feat_cols_no_scale = [
+            'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
+            'is_weekend', 'is_business_hour', 'is_morning',
+            'is_afternoon', 'is_evening', 'is_night',
+            'amount_percentile', 'user_transaction_count'
+        ]
+        
+        # Keep only columns that exist
+        self.tx_feat_cols_no_scale = [col for col in self.tx_feat_cols_no_scale if col in df.columns]
+        
+        # Ensure we have the basic columns needed for cyclic encoding
         hour = df['hour'].fillna(0).astype(int)
         day = df['weekday'].fillna(0).astype(int)
-        amount = df['amount'].fillna(0.0)
+        
+        # Always calculate cyclic features
         hour_sin = np.sin(2 * np.pi * hour / 24)
         hour_cos = np.cos(2 * np.pi * hour / 24)
         day_sin = np.sin(2 * np.pi * day / 7)
         day_cos = np.cos(2 * np.pi * day / 7)
-        tx_features_array = np.column_stack([
-            amount, hour_sin, hour_cos, day_sin, day_cos
-        ])
+        
+        # Create feature arrays with both the to-scale and no-scale features
+        to_scale_array = df[self.tx_feat_cols_to_scale].fillna(0).values if self.tx_feat_cols_to_scale else np.array([]).reshape(len(df), 0)
+        
+        # Always add cyclic time features
+        cyclic_array = np.column_stack([hour_sin, hour_cos, day_sin, day_cos])
+        
+        # Add other no-scale features if they exist
+        other_no_scale = [col for col in self.tx_feat_cols_no_scale if col not in ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']]
+        if other_no_scale:
+            other_array = df[other_no_scale].fillna(0).values
+            no_scale_array = np.column_stack([cyclic_array, other_array])
+        else:
+            no_scale_array = cyclic_array
+        
+        # Combine to-scale and no-scale features
+        tx_features_array = np.column_stack([to_scale_array, no_scale_array])
         raw_features_dict['transaction'] = tx_features_array.astype(np.float64)
         print(f"  Raw transaction features calculated. Shape: {raw_features_dict['transaction'].shape}")
 
