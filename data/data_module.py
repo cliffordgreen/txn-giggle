@@ -864,9 +864,10 @@ class TransactionDataModule(pl.LightningDataModule):
             print( test_mask.cpu())#.numpy()
     
             # --- Save Validation Set ---
+            val_mask_np = val_mask.cpu().numpy() # Convert tensor to numpy
             if np.any(val_mask_np):
                 val_node_indices_0_N = np.where(val_mask_np)[0] # Get indices 0..N-1
-                val_true_labels = all_labels[val_mask_np]
+                val_true_labels = self.graph_data['transaction'].y_global.cpu().numpy()[val_mask_np]
                 val_user_ids = node_idx_to_user_id[val_mask_np]
                 # Get original DF indices corresponding to these nodes
                 val_original_indices = orig_indices[val_mask_np]
@@ -884,9 +885,10 @@ class TransactionDataModule(pl.LightningDataModule):
                 print("Validation set is empty. Skipping CSV save.")
     
             # --- Save Test Set ---
+            test_mask_np = test_mask.cpu().numpy() # Convert tensor to numpy
             if np.any(test_mask_np):
                 test_node_indices_0_N = np.where(test_mask_np)[0] # Get indices 0..N-1
-                test_true_labels = all_labels[test_mask_np]
+                test_true_labels = self.graph_data['transaction'].y_global.cpu().numpy()[test_mask_np]
                 test_user_ids = node_idx_to_user_id[test_mask_np]
                  # Get original DF indices corresponding to these nodes
                 test_original_indices = orig_indices[test_mask_np]
