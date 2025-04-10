@@ -4,13 +4,40 @@ from typing import Dict, List, Optional, Tuple
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from datetime import datetime
 import json
+import os
+import glob
 
-def load_data(data_path: str) -> pd.DataFrame:
-    """Load transaction data from CSV or parquet file."""
-    if data_path.endswith('.parquet'):
-        df = pd.read_parquet(data_path)
+def load_data(data_path: str, max_files: Optional[int] = None) -> pd.DataFrame:
+    """
+    Load transaction data. 
+    If data_path is a directory, loads and concatenates all .parquet files within it,
+    up to max_files if specified.
+    If data_path is a file, loads the specified CSV or parquet file.
+    """
+    if os.path.isdir(data_path):
+        parquet_files = sorted(glob.glob(os.path.join(data_path, '*.parquet'))) # Sort for consistency
+        if not parquet_files:
+            raise FileNotFoundError(f"No .parquet files found in directory: {data_path}")
+        
+        if max_files is not None and max_files > 0:
+            print(f"Limiting to {max_files} files out of {len(parquet_files)} found.")
+            parquet_files = parquet_files[:max_files]
+        
+        df_list = [pd.read_parquet(f) for f in parquet_files]
+        df = pd.concat(df_list, ignore_index=True)
+        print(f"Loaded and concatenated {len(parquet_files)} parquet files from {data_path}")
+        
+    elif os.path.isfile(data_path):
+        if data_path.endswith('.parquet'):
+            df = pd.read_parquet(data_path)
+            print(f"Loaded single parquet file: {data_path}")
+        elif data_path.endswith('.csv'):
+             df = pd.read_csv(data_path)
+             print(f"Loaded single CSV file: {data_path}")
+        else:
+             raise ValueError(f"Unsupported file type: {data_path}. Only .parquet and .csv are supported.")
     else:
-        df = pd.read_csv(data_path)
+        raise FileNotFoundError(f"Path not found or is not a valid file/directory: {data_path}")
 
     #df = df.head(1000)
     # Use posted_date as timestamp if available
@@ -59,48 +86,6 @@ def extract_amount_features(df: pd.DataFrame) -> pd.DataFrame:
     # Consider adding: df['amount'] = df['amount'].clip(lower=0) if negative amounts are possible errors
     df['amount_log'] = np.log1p(df['amount'])
 
-    # Amount statistics per user
-    user_amount_stats = df.groupby('user_id')['amount'].agg([
-        'mean', 'std', 'min', 'max', 'count'
-    ]).reset_index()
-
-    # Rename columns
-    user_amount_stats.columns = [
-        'user_id',
-        'user_amount_mean',
-        'user_amount_std',
-        'user_amount_min',
-        'user_amount_max',
-        'user_transaction_count'
-    ]
-
-    # IMPORTANT: Fill NaN std (from users with 1 transaction) with 0.
-    # If std is 0, the relative_std feature doesn't make much sense,
-    # but filling with 0 prevents NaN propagation here. We'll handle division by 0 next.
-    user_amount_stats['user_amount_std'] = user_amount_stats['user_amount_std'].fillna(0)
-
-    # Merge with original dataframe
-    df = df.merge(user_amount_stats, on='user_id', how='left')
-
-    # Amount relative to user statistics - **SAFER DIVISION**
-    # Replace 0s in divisors with NaN temporarily to avoid inf. Resulting NaNs will be handled later.
-    mean_divisor = df['user_amount_mean'].replace(0, np.nan)
-    std_divisor = df['user_amount_std'].replace(0, np.nan)
-
-    df['amount_relative_to_mean'] = df['amount'] / mean_divisor
-    df['amount_relative_to_std'] = (df['amount'] - df['user_amount_mean']) / std_divisor
-
-    # Amount percentiles
-    # Wrap qcut in try-except as it can fail on groups with non-unique edges
-    try:
-        df['amount_percentile'] = df.groupby('user_id')['amount'].transform(
-            lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') if x.nunique() > 1 else 0 # Assign 0 or NaN if only one unique value
-        )
-    except Exception as e:
-        print(f"Warning: Could not compute amount_percentile for some groups: {e}")
-        df['amount_percentile'] = np.nan # Assign NaN if qcut fails
-
-
     return df    
 
 
@@ -110,10 +95,6 @@ def extract_merchant_features(df: pd.DataFrame) -> pd.DataFrame:
     merchant_freq = df['merchant_name'].value_counts()
     df['merchant_frequency'] = df['merchant_name'].map(merchant_freq)
     
-    # Merchant frequency per user
-    user_merchant_freq = df.groupby(['user_id', 'merchant_name']).size().reset_index(name='user_merchant_frequency')
-    df = df.merge(user_merchant_freq, on=['user_id', 'merchant_name'], how='left')
-    
     # Merchant categories (if available)
     if 'merchant_category' in df.columns:
         df['merchant_category_frequency'] = df.groupby('merchant_category')['merchant_category'].transform('count')
@@ -121,7 +102,20 @@ def extract_merchant_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def extract_text_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Extract features from text fields."""
+    """Extract features from text fields. Handles missing columns."""
+    # Ensure 'description' column exists
+    if 'description' not in df.columns:
+        print("Warning: 'description' column not found. Creating empty column.")
+        df['description'] = ''
+    # Ensure 'memo' column exists
+    if 'memo' not in df.columns:
+        print("Warning: 'memo' column not found. Creating empty column.")
+        df['memo'] = ''
+        
+    # Fill NaNs in text columns before processing
+    df['description'] = df['description'].fillna('')
+    df['memo'] = df['memo'].fillna('')
+
     # Text length features
     df['description_length'] = df['description'].str.len()
     df['memo_length'] = df['memo'].str.len()
@@ -186,11 +180,12 @@ def preprocess_data(
     output_path: str,
     label_mapping_path: Optional[str] = None,
     categorical_columns: Optional[List[str]] = None,
-    numerical_columns: Optional[List[str]] = None
+    numerical_columns: Optional[List[str]] = None,
+    max_files: Optional[int] = None
 ) -> Tuple[pd.DataFrame, Dict[str, LabelEncoder], Dict[str, StandardScaler]]:
     """Preprocess transaction data and engineer features."""
     # Load data
-    df = load_data(data_path)
+    df = load_data(data_path, max_files=max_files)
     
     # Extract features
     df = extract_temporal_features(df)
@@ -225,16 +220,7 @@ def preprocess_data(
         numerical_columns = [
             'amount',
             'amount_log',
-            'user_amount_mean',
-            'user_amount_std',
-            'user_amount_min',
-            'user_amount_max',
-            'user_transaction_count',
-            'amount_relative_to_mean',
-            'amount_relative_to_std',
-            'amount_percentile',
             'merchant_frequency',
-            'user_merchant_frequency',
             'description_length',
             'memo_length',
             'description_word_count',
@@ -246,9 +232,11 @@ def preprocess_data(
             'memo_uppercase_count',
             'memo_special_count'
         ]
+        # Filter numerical columns to only include those present in the DataFrame
+        numerical_columns = [col for col in numerical_columns if col in df.columns]
     
-    # Handle missing values
-    df = df.fillna({
+    # Handle missing values only for existing columns
+    default_fill_values = {
         'description': '',
         'memo': '',
         'merchant_name': 'unknown',
@@ -262,7 +250,12 @@ def preprocess_data(
         'region_name': 'unknown',
         'language_name': 'unknown',
         'category_name': 'unknown'
-    })
+    }
+    
+    # Create a dictionary with fill values only for columns present in the DataFrame
+    fill_values_for_existing_cols = {col: val for col, val in default_fill_values.items() if col in df.columns}
+    
+    df = df.fillna(fill_values_for_existing_cols)
     
     # Encode categorical features
     df, label_encoders = encode_categorical_features(df, categorical_columns)
@@ -290,14 +283,16 @@ def preprocess_data(
 def main(
     data_path: str,
     output_path: str,
-    label_mapping_path: Optional[str] = None
+    label_mapping_path: Optional[str] = None,
+    max_files: Optional[int] = None
 ):
     """Main function for data preprocessing."""
     # Preprocess data
     df, label_encoders, scalers = preprocess_data(
         data_path=data_path,
         output_path=output_path,
-        label_mapping_path=label_mapping_path
+        label_mapping_path=label_mapping_path,
+        max_files=max_files
     )
     
     print(f"Preprocessed data saved to {output_path}")
@@ -317,11 +312,14 @@ if __name__ == '__main__':
                       help='Path to save preprocessed data')
     parser.add_argument('--label_mapping_path', type=str, default=None,
                       help='Path to save label mappings')
+    parser.add_argument('--max_files', type=int, default=None,
+                        help='Maximum number of parquet files to load from a directory')
     
     args = parser.parse_args()
     
     main(
         data_path=args.data_path,
         output_path=args.output_path,
-        label_mapping_path=args.label_mapping_path
+        label_mapping_path=args.label_mapping_path,
+        max_files=args.max_files
     ) 
