@@ -918,7 +918,7 @@ class TransactionDataModule(pl.LightningDataModule):
         if self.graph_data is None or self.tokenizer is None:
             raise RuntimeError("Graph data or tokenizer not initialized.")
         print("Tokenizing text fields...")
-        text_fields_to_process = ['raw_description', 'memo', 'merchant_name']
+        text_fields_to_process = ['raw_description', 'memo', 'merchant_name', 'mcc_name']
         processed_tokens = {}
         start_time_text = time.time()
         for field in text_fields_to_process:
