@@ -213,7 +213,8 @@ def train_advanced(
         devices=1, # Assuming single device for now
         callbacks=callbacks,
         logger=logger,
-        log_every_n_steps=10, # Log less frequently
+        log_every_n_steps=1000,
+        val_check_interval=1000,# Log less frequently
         # gradient_clip_val=1 # Optional
     )
 
