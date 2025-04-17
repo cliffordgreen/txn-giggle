@@ -79,28 +79,31 @@ MIT License
 
 ## Standard Training (Multi-Task Learning)
 
-To train the model using the standard multi-task learning setup (predicting both global and user-specific categories simultaneously if configured), use the `train_new.py` script.
+To train the model using the standard multi-task learning setup (predicting both global and user-specific categories simultaneously if configured), use the `train.py` script.
 
 ```bash
-python train_new.py \
-    --data_path path/to/your/transactions.csv \
-    --output_dir ./standard_training_output \\
-    --config_path config/model_config.yaml \\
+python train.py \\
+    --data_path path/to/your/transactions.csv \\
+    --config_path path/to/your/model_config.yaml \\
+    --user_id_col user_id \\
+    --global_label_col category_id \\
+    --user_label_col user_category_id \\
+    --timestamp_col books_create_timestamp \\
+    --text_cols raw_description memo merchant_name \\
+    --amount_col amount \\
     --batch_size 64 \\
     --max_epochs 100 \\
     --learning_rate 1e-4 \\
     --weight_decay 1e-5 \\
-    --mtl_weight_global 0.5 \\
-    --mtl_weight_user 0.5 \\
-    # --use_scheduleC_label # Add this flag if schedule C task is desired
-    # --mtl_weight_scheduleC 0.1 # Add weight if schedule C is used
     --accelerator gpu \\
-    --precision 32 \\
-    --num_workers 4 \
-    # Add other relevant arguments from train_new.py --help
+    --devices 1 \\
+    --log_dir ./training_logs \\
+    --experiment_name standard_training_run \\
+    --logger tensorboard \\
+    # Add other relevant arguments from train.py
 ```
 
-Refer to `train_new.py --help` for a full list of arguments and their descriptions. The model configuration (encoder details, fusion parameters, etc.) is primarily controlled via the YAML file specified by `--config_path`.
+Refer to `train.py --help` for a full list of arguments and their descriptions. The model configuration (encoder details, fusion parameters, etc.) is primarily controlled via the YAML file specified by `--config_path`.
 
 
 ## Meta-Learning for Cold-Start Adaptation (MAML)

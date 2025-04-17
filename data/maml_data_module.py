@@ -52,7 +52,7 @@ class MAMLTaskDataset(Dataset):
 
         # Group by user for efficient task sampling
         self.user_groups = self.df_filtered.groupby(self.user_id_column)
-        self.user_indices = {user: group.index.tolist() for user, group in self.user_groups.groups.items()}
+        self.user_indices = {user: group.tolist() for user, group in self.user_groups.groups.items()}
 
         # Filter users with insufficient data for K_shot + 1 query item
         min_required = self.K_shot + 1
@@ -224,27 +224,21 @@ class MAMLTransactionDataModule(pl.LightningDataModule):
         # Ensure label column exists and handle NaNs (e.g., fill with a specific value like -1 or 'UNKNOWN')
         if self.maml_label_column not in self.transactions_df.columns:
              raise ValueError(f"MAML target label column '{self.maml_label_column}' not found in DataFrame.")
-        # Example NaN handling: Fill with -1, assuming labels are non-negative integers
+        # Example NaN handling: Fill with -1 or a dedicated string
+        fill_value = -1
         if self.transactions_df[self.maml_label_column].isnull().any():
-             print(f"[WARN] MAML label column '{self.maml_label_column}' contains NaNs. Filling with -1.")
-             self.transactions_df[self.maml_label_column] = self.transactions_df[self.maml_label_column].fillna(-1)
-        # Convert labels to integer type
-        try:
-            self.transactions_df[self.maml_label_column] = self.transactions_df[self.maml_label_column].astype(int)
-            # Calculate number of classes based on max value + 1 (assuming 0-based)
-            # Filter out potential negative fill values (-1)
-            valid_labels = self.transactions_df[self.maml_label_column][self.transactions_df[self.maml_label_column] >= 0]
-            if not valid_labels.empty:
-                 self.num_maml_classes = valid_labels.max() + 1
-            else:
-                 self.num_maml_classes = 0
-            print(f"Calculated num_maml_classes (int): {self.num_maml_classes}")
-        except ValueError:
-            print(f"[WARN] Could not convert MAML label column '{self.maml_label_column}' to int. Attempting factorization.")
-            codes, uniques = pd.factorize(self.transactions_df[self.maml_label_column].astype(str), sort=True)
-            self.transactions_df[self.maml_label_column] = codes
-            self.num_maml_classes = len(uniques)
-            print(f"Factorized '{self.maml_label_column}' into {self.num_maml_classes} codes.")
+             print(f"[WARN] MAML label column '{self.maml_label_column}' contains NaNs. Filling with {fill_value}.")
+             self.transactions_df[self.maml_label_column] = self.transactions_df[self.maml_label_column].fillna(fill_value)
+
+        # <<< FIX: Always factorize the label column to get the correct number of unique classes >>>
+        print(f"Factorizing MAML label column '{self.maml_label_column}' to determine class count...")
+        # Convert to string first to handle potential mix of int/str or large ints consistently
+        codes, uniques = pd.factorize(self.transactions_df[self.maml_label_column].astype(str), sort=True)
+        self.transactions_df[self.maml_label_column] = codes # Assign the 0-based codes back
+        self.num_maml_classes = len(uniques) # Number of classes is the count of unique factors
+        # Store the mapping from code back to original value (optional, for debugging/interpretation)
+        self.maml_label_map = {code: unique_val for code, unique_val in enumerate(uniques)}
+        print(f"Found {self.num_maml_classes} unique classes in '{self.maml_label_column}'.")
 
 
         # --- 2. Get Unique Users and Split ---
