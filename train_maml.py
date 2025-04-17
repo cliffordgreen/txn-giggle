@@ -205,8 +205,18 @@ def main(args):
 
     # --- 5. Start Meta-Training ---
     print("--- Starting Meta-Training --- ")
+    # Check if a pretrained checkpoint path is provided
+    fit_kwargs = {}
+    if args.load_pretrained_ckpt:
+        if os.path.exists(args.load_pretrained_ckpt):
+            print(f"Loading weights from pre-trained checkpoint: {args.load_pretrained_ckpt}")
+            fit_kwargs['ckpt_path'] = args.load_pretrained_ckpt
+        else:
+            print(f"[WARN] Pre-trained checkpoint not found at: {args.load_pretrained_ckpt}. Starting from scratch.")
+
     try:
-        trainer.fit(model, datamodule=maml_dm)
+        # Pass ckpt_path to trainer.fit if provided
+        trainer.fit(model, datamodule=maml_dm, **fit_kwargs)
         print("--- Meta-Training Finished --- ")
     except Exception as e:
         print(f"[ERROR] Training failed: {e}")
@@ -291,6 +301,9 @@ if __name__ == '__main__':
 
     # <<< Add config path argument >>>
     parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML base model configuration file.')
+
+    # Add an argument parser option for the checkpoint path
+    parser.add_argument('--load_pretrained_ckpt', type=str, default=None, help='Path to a pre-trained model checkpoint to initialize MAML.')
 
     args = parser.parse_args()
     main(args) 
