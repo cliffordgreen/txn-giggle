@@ -15,43 +15,46 @@ from .losses import FocalLoss
 from torch_geometric.data import HeteroData
 
 class AdvancedTransactionCategorizationModel(pl.LightningModule):
-    """ Multi-modal transaction categorization using HGT, TFT, FinBERT, 
+    """ Multi-modal transaction categorization using HGT, TFT, FinBERT,
         User Embeddings, Attention Fusion, Focal Loss, and MTL.
+        Includes optional Schedule C prediction head.
     """
-    def __init__(self, 
+    def __init__(self,
                  # Config Dictionaries
                  model_config: Dict[str, Any], # Contains keys like graph_encoder_params etc.
                  # Training Config
-                 learning_rate: float = 1e-4, 
+                 learning_rate: float = 1e-4,
                  weight_decay: float = 1e-5,
-                 mtl_weights: Dict[str, float] = {'global': 0.5, 'user': 0.5},
+                 mtl_weights: Dict[str, float] = {'global': 0.5, 'user': 0.5}, # Can include 'scheduleC'
                  focal_loss_alpha: float = 0.25,
                  focal_loss_gamma: float = 2.0,
-                 # Add DataFrame reference
-                 transactions_df_ref: pd.DataFrame = None 
+                 # Add DataFrame reference (Optional, might not be needed if graph contains all)
+                 transactions_df_ref: Optional[pd.DataFrame] = None
                  ):
         super().__init__()
         # Store simple hyperparameters automatically
         self.save_hyperparameters('learning_rate', 'weight_decay',
                                 'mtl_weights', 'focal_loss_alpha', 'focal_loss_gamma')
         # Store complex configs manually (needed if loading from checkpoint)
-        # We access these via self._config_name during init
-        self._model_config = model_config 
-        self._graph_config = model_config['graph_encoder_params']
-        self._sequence_config = model_config['sequence_encoder_params']
-        self._text_config = model_config['text_encoder_params']
-        self._fusion_config = model_config['fusion_params']
-        
+        self._model_config = model_config
+        self._graph_config = model_config.get('graph_encoder_params', {}) # Handle missing key
+        self._sequence_config = model_config.get('sequence_encoder_params', {})
+        self._text_config = model_config.get('text_encoder_params', {})
+        self._fusion_config = model_config.get('fusion_params', {})
+
         # Extract required counts/dims from the config for convenience
-        num_global_classes = model_config['num_global_classes']
-        num_user_classes = model_config['num_user_classes']
-        num_users = model_config['num_users']
-        user_embed_dim = model_config['user_embed_dim']
+        num_global_classes = model_config.get('num_global_classes', 0)
+        num_user_classes = model_config.get('num_user_classes', 0)
+        num_users = model_config.get('num_users', 0)
+        user_embed_dim = model_config.get('user_embed_dim', 64) # Provide default
+        # New: Schedule C classes and head flag
+        num_scheduleC_classes = model_config.get('num_scheduleC_classes', 0)
+        self.use_scheduleC_head = num_scheduleC_classes > 0
 
         # Store references (NOT saved as hparams)
         self._transactions_df_ref = transactions_df_ref
-        # We still need the full graph for labels if not propagated by loader
-        self._full_graph_data_ref = None # Will be set by train script
+        # Reference to full graph might be needed if labels aren't passed in batch (depends on loader)
+        # self._full_graph_data_ref = None # Set by train script if needed
 
         # <<< Store modality flags from config >>>
         self.use_gnn_encoder = model_config.get('use_gnn_encoder', True)
@@ -60,345 +63,524 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
         # --- 1. Encoders ---
         self.graph_encoder = None
+        graph_out_dim = 0
         if self.use_gnn_encoder:
-             self.graph_encoder = HGT(
-                in_channels=self._graph_config['in_channels'],
-                hidden_channels=self._graph_config['hidden_channels'], 
-                out_channels=self._graph_config['out_channels'], 
-                metadata=self._graph_config['metadata'], 
-                num_heads=self._graph_config['num_heads'], 
-                num_layers=self._graph_config['num_layers']
-                # Add dropout if HGT supports it
-             )
-             print(f"[INFO] HGT Encoder Initialized. Output Dim: {self._graph_config['out_channels']}")
+             if not self._graph_config:
+                 print("[WARN] GNN encoder enabled but 'graph_encoder_params' missing in config. Skipping GNN init.")
+                 self.use_gnn_encoder = False # Disable if config missing
+             elif 'metadata' not in self._graph_config:
+                 print("[WARN] GNN encoder enabled but 'metadata' missing in graph_encoder_params. Skipping GNN init.")
+                 self.use_gnn_encoder = False # Disable if metadata missing
+             else:
+                 # <<< Pass metadata from config >>>
+                 hgt_metadata = self._graph_config['metadata']
+                 print(f"[INFO] Initializing HGT with metadata: Nodes={hgt_metadata[0]}, Edges={hgt_metadata[1]}")
+                 self.graph_encoder = HGT(
+                    in_channels=self._graph_config.get('in_channels', -1), # HGT can infer if -1
+                    hidden_channels=self._graph_config.get('hidden_channels', 64),
+                    out_channels=self._graph_config.get('out_channels', 64),
+                    metadata=hgt_metadata,
+                    num_heads=self._graph_config.get('num_heads', 4),
+                    num_layers=self._graph_config.get('num_layers', 2)
+                    # Add dropout if HGT supports it, e.g., dropout=self._graph_config.get('dropout', 0.1)
+                 )
+                 graph_out_dim = self._graph_config['out_channels']
+                 print(f"[INFO] HGT Encoder Initialized. Output Dim: {graph_out_dim}")
+        else:
+             print("[INFO] GNN Encoder is disabled via config.")
 
-        # <<< Conditionally initialize Sequence Encoder >>>
         self.sequence_encoder = None
-        seq_out_dim = 0 # Default if not used
+        seq_out_dim = 0
         if self.use_sequence_encoder:
-            self.sequence_encoder = PytorchForecastingTFTWrapper(
-                output_dim=self._sequence_config['output_dim'],
-                tft_params=self._sequence_config.get('tft_params', {}),
-                embedding_source_key=self._sequence_config.get('embedding_source_key', 'encoder_variables')
-            )
-            seq_out_dim = self.sequence_encoder.get_output_dim()
-            print(f"[INFO] TFT Wrapper Initialized. Output Dim: {seq_out_dim}")
+            if not self._sequence_config:
+                 print("[WARN] Sequence encoder enabled but 'sequence_encoder_params' missing. Skipping init.")
+                 self.use_sequence_encoder = False
+            else:
+                 self.sequence_encoder = PytorchForecastingTFTWrapper(
+                    output_dim=self._sequence_config.get('output_dim', 64), # Provide default
+                    tft_params=self._sequence_config.get('tft_params', {}),
+                    embedding_source_key=self._sequence_config.get('embedding_source_key', 'encoder_variables')
+                 )
+                 seq_out_dim = self.sequence_encoder.get_output_dim()
+                 print(f"[INFO] TFT Wrapper Initialized. Output Dim: {seq_out_dim}")
+        else:
+             print("[INFO] Sequence Encoder is disabled via config.")
 
         self.text_encoder = None
-        text_out_dim = 0 # Default if not used
+        text_out_dim = 0
         if self.use_text_encoder:
-             self.text_encoder = FinBERTEmbedder(
-                model_name=self._text_config.get('model_name', 'ProsusAI/finbert'),
-                pooling_strategy=self._text_config.get('pooling_strategy', 'mean'),
-                finetune=self._text_config.get('finetune', True),
-                projection_dim=self._text_config.get('projection_dim', 0)
-             )
-             text_out_dim = self.text_encoder.get_output_dim()
-             print(f"[INFO] FinBERT Encoder Initialized. Output Dim: {text_out_dim}")
+             if not self._text_config:
+                 print("[WARN] Text encoder enabled but 'text_encoder_params' missing. Skipping init.")
+                 self.use_text_encoder = False
+             else:
+                 self.text_encoder = FinBERTEmbedder(
+                    model_name=self._text_config.get('model_name', 'ProsusAI/finbert'),
+                    pooling_strategy=self._text_config.get('pooling_strategy', 'mean'),
+                    finetune=self._text_config.get('finetune', True),
+                    projection_dim=self._text_config.get('projection_dim', 0) # Allow projection
+                 )
+                 text_out_dim = self.text_encoder.get_output_dim()
+                 print(f"[INFO] FinBERT Encoder Initialized. Output Dim: {text_out_dim}")
         else:
-             text_out_dim = 0 # Ensure text_out_dim exists
-             
-        self.user_embedding = nn.Embedding(num_users, user_embed_dim)
-        print(f"[INFO] User Embedding Initialized. Output Dim: {user_embed_dim}")
+             print("[INFO] Text Encoder is disabled via config.")
 
-        # --- 2. Fusion Module --- 
-        # <<< Adjust fusion input dims based on active encoders >>>
+        self.user_embedding = nn.Embedding(num_users, user_embed_dim)
+        print(f"[INFO] User Embedding Initialized. Num Users: {num_users}, Output Dim: {user_embed_dim}")
+
+        # --- 2. Fusion Module ---
         fusion_input_dims = {}
         if self.use_gnn_encoder and self.graph_encoder:
-             fusion_input_dims['graph'] = self._graph_config['out_channels']
+             fusion_input_dims['graph'] = graph_out_dim
         if self.use_sequence_encoder and self.sequence_encoder:
              fusion_input_dims['sequence'] = seq_out_dim
         if self.use_text_encoder and self.text_encoder:
              fusion_input_dims['text'] = text_out_dim
-        # Always include user embedding (assuming it's always used)
-        fusion_input_dims['user'] = user_embed_dim
-        
-        # Ensure at least one modality is active
+        # Always include user embedding if num_users > 0
+        if num_users > 0:
+            fusion_input_dims['user'] = user_embed_dim
+        else:
+            print("[WARN] num_users is 0. User embedding will not be used in fusion.")
+
         if not fusion_input_dims:
-            raise ValueError("No encoders are enabled. At least one encoder (graph, sequence, text) must be active.")
-            
+            raise ValueError("No modalities are enabled or configured correctly. At least one encoder (graph, sequence, text) or user embedding must be active.")
+        if not self._fusion_config:
+             raise ValueError("'fusion_params' missing from model_config, cannot initialize fusion module.")
+
         self.fusion_module = AttentionFusion(
             modality_dims=fusion_input_dims,
-            hidden_dim=self._fusion_config['hidden_dim'], 
-            output_dim=self._fusion_config['output_dim'], 
+            hidden_dim=self._fusion_config.get('hidden_dim', 128), # Provide default
+            output_dim=self._fusion_config.get('output_dim', 128), # Provide default
             dropout=self._fusion_config.get('dropout', 0.1)
         )
         fused_dim = self._fusion_config['output_dim']
-        print(f"[INFO] Attention Fusion Initialized. Output Dim: {fused_dim}")
+        print(f"[INFO] Attention Fusion Initialized. Input Dims: {fusion_input_dims}, Output Dim: {fused_dim}")
 
         # --- 3. Classification Heads ---
-        self.global_head = nn.Linear(fused_dim, num_global_classes)
-        self.user_specific_head = nn.Linear(fused_dim, num_user_classes)
-        print(f"[INFO] Classifiers Initialized: Global={num_global_classes}, User={num_user_classes}")
+        self.global_head = None
+        if num_global_classes > 0:
+             self.global_head = nn.Linear(fused_dim, num_global_classes)
+             print(f"[INFO] Global Classifier Initialized: Output Classes={num_global_classes}")
+        else:
+             print("[INFO] Global classification head skipped (num_global_classes=0).")
 
-        # --- 4. Loss Function ---
-        self.focal_loss_global = FocalLoss(
-            alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma, 
-            num_classes=num_global_classes # Pass num_classes for alpha tensor creation
-        )
-        self.focal_loss_user = FocalLoss(
-            alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma, 
-            num_classes=num_user_classes # Pass num_classes for alpha tensor creation
-        )
-        print("[INFO] Focal Loss Initialized.")
+        self.user_specific_head = None
+        if num_user_classes > 0:
+             self.user_specific_head = nn.Linear(fused_dim, num_user_classes)
+             print(f"[INFO] User Classifier Initialized: Output Classes={num_user_classes}")
+        else:
+             print("[INFO] User classification head skipped (num_user_classes=0).")
 
-    def forward(self, 
-                graph_batch: Optional[HeteroData] = None, 
-                sequence_batch: Optional[Any] = None, 
-                text_batch: Optional[List[str]] = None, 
+        # <<< Conditional Schedule C Head >>>
+        self.scheduleC_head = None
+        if self.use_scheduleC_head:
+             self.scheduleC_head = nn.Linear(fused_dim, num_scheduleC_classes)
+             print(f"[INFO] Schedule C Classifier Initialized: Output Classes={num_scheduleC_classes}")
+        else:
+             print("[INFO] Schedule C classification head skipped (num_scheduleC_classes=0).")
+
+        # --- 4. Loss Functions ---
+        self.focal_loss_global = None
+        if self.global_head:
+             self.focal_loss_global = FocalLoss(
+                 alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma,
+                 num_classes=num_global_classes
+             )
+             print("[INFO] Global Focal Loss Initialized.")
+
+        self.focal_loss_user = None
+        if self.user_specific_head:
+             self.focal_loss_user = FocalLoss(
+                 alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma,
+                 num_classes=num_user_classes
+             )
+             print("[INFO] User Focal Loss Initialized.")
+
+        # <<< Conditional Schedule C Loss >>>
+        self.focal_loss_scheduleC = None
+        if self.scheduleC_head:
+             self.focal_loss_scheduleC = FocalLoss(
+                 alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma,
+                 num_classes=num_scheduleC_classes
+             )
+             print("[INFO] Schedule C Focal Loss Initialized.")
+
+    def forward(self,
+                graph_batch: Optional[HeteroData] = None,
+                sequence_batch: Optional[Any] = None,
+                text_batch: Optional[List[str]] = None,
                 user_ids: Optional[torch.Tensor] = None,
-                batch_size: Optional[int] = None
-                ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        
+                batch_size: Optional[int] = None # Needed for slicing GNN output
+                ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: # Added ScheduleC logits
+        """Forward pass through encoders, fusion, and classification heads."""
         embeddings_to_fuse = {}
+        graph_embed = None # Initialize graph_embed
 
-        # --- 1. Graph Encoding --- 
+        # --- 1. Graph Encoding ---
         if self.graph_encoder and graph_batch:
             try:
+                # Pass both x_dict and edge_index_dict
                 node_embeddings_dict = self.graph_encoder(graph_batch.x_dict, graph_batch.edge_index_dict)
-                
-                # --- Extract embeddings for TARGET transaction nodes --- 
-                # Slice the first batch_size nodes from the GNN output
+
                 if 'transaction' in node_embeddings_dict:
                      if batch_size is None:
-                          # Try to infer batch_size if not passed (e.g., from user_ids)
                           if user_ids is not None: batch_size = user_ids.shape[0]
+                          # Add fallback using maybe _raw_text length if text_encoder is on?
+                          elif self.use_text_encoder and text_batch is not None: batch_size = len(text_batch)
                           else: raise ValueError("Forward pass needs batch_size if graph_batch is provided.")
-                     
-                     # Ensure we don't slice beyond available nodes
+
                      num_nodes_in_batch_output = node_embeddings_dict['transaction'].shape[0]
                      if batch_size > num_nodes_in_batch_output:
                          print(f"[WARN] Forward: batch_size ({batch_size}) > GNN output nodes ({num_nodes_in_batch_output}). Slicing available nodes.")
                          graph_embed = node_embeddings_dict['transaction'][:num_nodes_in_batch_output]
-                     else:
-                         graph_embed = node_embeddings_dict['transaction'][:batch_size]
-                         
-                     if graph_embed is not None:
+                     elif batch_size > 0:
+                          graph_embed = node_embeddings_dict['transaction'][:batch_size]
+                     # else: batch_size might be 0, graph_embed remains None
+
+                     if graph_embed is not None and graph_embed.shape[0] > 0: # Check size > 0
                          embeddings_to_fuse['graph'] = graph_embed.to(self.device)
+                     elif batch_size > 0: # Only warn if batch_size was expected to be > 0
+                          print("[WARN] Forward: HGT 'transaction' embedding is None or empty after slicing.")
+
                 else:
                     print("[WARN] Forward: HGT output missing 'transaction' embeddings.")
             except Exception as e:
                 print(f"[ERROR] HGT Encoder forward failed: {e}")
-                # Decide if we should raise or continue without graph embeddings
+                import traceback
+                traceback.print_exc() # Print full traceback for GNN errors
 
-        # --- 2. Sequence Encoding --- 
+        # --- 2. Sequence Encoding ---
         if self.sequence_encoder and sequence_batch is not None:
             try:
                 seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
-                if seq_embed is not None:
-                    embeddings_to_fuse['sequence'] = seq_embed.to(self.device)
+                if seq_embed is not None and seq_embed.shape[0] > 0:
+                    # Ensure batch size matches graph if graph is used
+                    if graph_embed is not None and seq_embed.shape[0] != graph_embed.shape[0]:
+                         print(f"[ERROR] Forward: Sequence batch size ({seq_embed.shape[0]}) mismatch with Graph ({graph_embed.shape[0]})")
+                    else:
+                        embeddings_to_fuse['sequence'] = seq_embed.to(self.device)
+                elif graph_embed is not None and graph_embed.shape[0] > 0: # Check if expected based on graph
+                    print("[WARN] Forward: TFT output is None or empty.")
             except Exception as e:
                 print(f"[ERROR] TFT Encoder forward failed: {e}")
-                
-        # --- 3. Text Encoding --- 
+
+        # --- 3. Text Encoding ---
         if self.text_encoder and text_batch is not None:
             try:
                 text_embed = self.text_encoder(text_batch)
-                if text_embed is not None:
-                    embeddings_to_fuse['text'] = text_embed.to(self.device)
+                if text_embed is not None and text_embed.shape[0] > 0:
+                    # Ensure batch size matches graph if graph is used
+                    ref_shape = graph_embed.shape[0] if graph_embed is not None else (seq_embed.shape[0] if 'sequence' in embeddings_to_fuse else None)
+                    if ref_shape is not None and text_embed.shape[0] != ref_shape:
+                         print(f"[ERROR] Forward: Text batch size ({text_embed.shape[0]}) mismatch with reference ({ref_shape})")
+                    else:
+                         embeddings_to_fuse['text'] = text_embed.to(self.device)
+                elif ref_shape is not None and ref_shape > 0: # Check if expected
+                    print("[WARN] Forward: FinBERT output is None or empty.")
+
             except Exception as e:
                 print(f"[ERROR] FinBERT Encoder forward failed: {e}")
-                
-        # --- 4. User Embedding --- 
+
+        # --- 4. User Embedding ---
         if self.user_embedding and user_ids is not None:
-            try:
-                user_embed = self.user_embedding(user_ids.to(self.device))
-                if user_embed is not None:
-                    embeddings_to_fuse['user'] = user_embed.to(self.device)
-            except Exception as e:
-                print(f"[ERROR] User Embedding forward failed: {e}")
-                
-        # Check shapes and device consistency before fusion
-        ref_batch_size = None
+             # Check if num_users > 0 before trying to embed
+            if self.user_embedding.num_embeddings > 0:
+                try:
+                    # Clamp user_ids to be safe
+                    user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
+                    user_embed = self.user_embedding(user_ids_clamped.to(self.device))
+                    if user_embed is not None and user_embed.shape[0] > 0:
+                        # Ensure batch size matches graph if graph is used
+                        ref_shape = graph_embed.shape[0] if graph_embed is not None else (embeddings_to_fuse.get('sequence', embeddings_to_fuse.get('text', None)).shape[0] if embeddings_to_fuse else None)
+                        if ref_shape is not None and user_embed.shape[0] != ref_shape:
+                            print(f"[ERROR] Forward: User ID batch size ({user_embed.shape[0]}) mismatch with reference ({ref_shape})")
+                        else:
+                            embeddings_to_fuse['user'] = user_embed.to(self.device)
+                    elif ref_shape is not None and ref_shape > 0: # Check if expected
+                         print("[WARN] Forward: User embedding is None or empty.")
+                except Exception as e:
+                    print(f"[ERROR] User Embedding forward failed: {e}")
+            else:
+                print("[WARN] Forward: Skipping user embedding as num_users is 0.")
+
+
+        # --- Pre-Fusion Checks ---
         if not embeddings_to_fuse:
             print("[ERROR] Forward: No embeddings available for fusion.")
-            return None, None
-        else:
-            # Check batch sizes and device
-            for name, emb in embeddings_to_fuse.items():
-                 if ref_batch_size is None: ref_batch_size = emb.shape[0]
-                 if emb.shape[0] != ref_batch_size:
-                      print(f"[ERROR] Forward: Mismatched batch size for {name}: {emb.shape[0]} vs {ref_batch_size}")
-                      return None, None
-                 if emb.device != self.device:
-                      print(f"[ERROR] Forward: Embedding {name} is on wrong device: {emb.device} vs {self.device}")
-                      return None, None
+            return None, None, None # Return three Nones
 
-        # --- 5. Fusion --- 
+        ref_batch_size = None
+        first_key = next(iter(embeddings_to_fuse))
+        ref_batch_size = embeddings_to_fuse[first_key].shape[0]
+
+        if ref_batch_size == 0:
+             print("[WARN] Forward: Fusion input batch size is 0. Returning None.")
+             return None, None, None
+
+        for name, emb in embeddings_to_fuse.items():
+             if emb.shape[0] != ref_batch_size:
+                  print(f"[ERROR] Forward: Mismatched batch size for {name}: {emb.shape[0]} vs {ref_batch_size}. Skipping fusion.")
+                  return None, None, None
+             if emb.device != self.device:
+                  print(f"[ERROR] Forward: Embedding {name} is on wrong device: {emb.device} vs {self.device}. Skipping fusion.")
+                  return None, None, None
+
+        # --- 5. Fusion ---
+        fused_representation = None
         try:
             fused_representation, _ = self.fusion_module(embeddings_to_fuse)
         except Exception as e:
              print(f"[ERROR] Fusion module forward failed: {e}")
-             # Return Nones if fusion fails
-             return None, None
+             return None, None, None # Return Nones if fusion fails
 
-        # --- 6. Classify --- 
+        # --- 6. Classify ---
         global_logits = None
         user_specific_logits = None
+        scheduleC_logits = None # Initialize
+
+        if fused_representation is None:
+             print("[ERROR] Forward: Fused representation is None after fusion module.")
+             return None, None, None
+
         try:
             if self.global_head:
                  global_logits = self.global_head(fused_representation)
             if self.user_specific_head:
                  user_specific_logits = self.user_specific_head(fused_representation)
+            # <<< Conditional Schedule C Classification >>>
+            if self.scheduleC_head:
+                 scheduleC_logits = self.scheduleC_head(fused_representation)
         except Exception as e:
              print(f"[ERROR] Classifier head forward failed: {e}")
-             # Return Nones if classification fails
-             return None, None
+             # Return Nones based on which heads exist
+             return (None if self.global_head else global_logits,
+                     None if self.user_specific_head else user_specific_logits,
+                     None if self.scheduleC_head else scheduleC_logits)
 
-        return global_logits, user_specific_logits 
+        return global_logits, user_specific_logits, scheduleC_logits # Return all three
 
-    # Comment out the now unused helper method
-    # def _get_labels_for_batch(self, original_indices: Optional[torch.Tensor], stage: str, batch_idx: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    #     """Helper to look up labels using original indices from the full graph data."""
-    #     labels_global, labels_user = None, None
-    #     if original_indices is None or self._full_graph_data_ref is None:
-    #          print(f"[WARN] {stage}_step (batch {batch_idx}): Cannot lookup labels, missing indices or full graph ref.")
-    #          return None, None
-    #     try:
-    #         original_indices_cpu = original_indices.cpu().long()
-    #         # Access the transaction store in the referenced full graph data
-    #         tx_store = self._full_graph_data_ref['transaction'] 
-    #         if hasattr(tx_store, 'y_global'):
-    #             labels_global = tx_store.y_global[original_indices_cpu]
-    #         if hasattr(tx_store, 'y_user'):
-    #             labels_user = tx_store.y_user[original_indices_cpu]
-    #     except Exception as e:
-    #          print(f"[ERROR] {stage}_step (batch {batch_idx}): Error during label lookup: {e}")
-    #          return None, None
-    #     return labels_global, labels_user
-        
-    def _calculate_mtl_loss(self, 
-                              global_logits: torch.Tensor, global_target: torch.Tensor, 
-                              user_logits: torch.Tensor, user_target: torch.Tensor
-                              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # _get_labels_for_batch helper removed
+
+    def _calculate_mtl_loss(self,
+                              global_logits: Optional[torch.Tensor], global_target: Optional[torch.Tensor],
+                              user_logits: Optional[torch.Tensor], user_target: Optional[torch.Tensor],
+                              scheduleC_logits: Optional[torch.Tensor], scheduleC_target: Optional[torch.Tensor] # Added Schedule C
+                              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: # Added Schedule C loss
          """Calculates individual and combined MTL loss."""
          loss_global = torch.tensor(0.0, device=self.device)
-         if global_logits is not None and global_target is not None:
+         loss_user = torch.tensor(0.0, device=self.device)
+         loss_scheduleC = torch.tensor(0.0, device=self.device) # Initialize
+
+         # --- Global Loss ---
+         if self.focal_loss_global and global_logits is not None and global_target is not None:
              try:
-                 # Loss expects targets on the same device as logits
                  loss_global = self.focal_loss_global(global_logits, global_target.to(global_logits.device))
              except Exception as e:
                  print(f"[ERROR] Global loss calculation failed: {e}")
-                 loss_global = torch.tensor(0.0, device=self.device, requires_grad=True) 
- 
-         loss_user = torch.tensor(0.0, device=self.device)
-         if user_logits is not None and user_target is not None:
+                 loss_global = torch.tensor(0.0, device=self.device, requires_grad=True) # Ensure grad if error
+
+         # --- User Loss ---
+         if self.focal_loss_user and user_logits is not None and user_target is not None:
              try:
-                 # Loss expects targets on the same device as logits
                  loss_user = self.focal_loss_user(user_logits, user_target.to(user_logits.device))
              except Exception as e:
                  print(f"[ERROR] User loss calculation failed: {e}")
                  loss_user = torch.tensor(0.0, device=self.device, requires_grad=True)
-                 
-         weight_global = self.hparams.mtl_weights.get('global', 0.5)
-         weight_user = self.hparams.mtl_weights.get('user', 0.5)
-         total_loss = weight_global * loss_global + weight_user * loss_user
-         
-         # Handle potential NaN loss before returning
+
+         # --- Schedule C Loss (Conditional) ---
+         if self.focal_loss_scheduleC and scheduleC_logits is not None and scheduleC_target is not None:
+             # Check if scheduleC weight exists
+             if 'scheduleC' in self.hparams.mtl_weights:
+                 try:
+                      # Consider filtering out ignored indices (e.g., -1 for UNKNOWN) if needed
+                      # loss_scheduleC = self.focal_loss_scheduleC(scheduleC_logits[scheduleC_target >= 0], scheduleC_target[scheduleC_target >= 0].to(scheduleC_logits.device))
+                      loss_scheduleC = self.focal_loss_scheduleC(scheduleC_logits, scheduleC_target.to(scheduleC_logits.device))
+                 except Exception as e:
+                      print(f"[ERROR] Schedule C loss calculation failed: {e}")
+                      loss_scheduleC = torch.tensor(0.0, device=self.device, requires_grad=True)
+             # else: loss_scheduleC remains 0 if weight not specified
+
+         # --- Combine Losses ---
+         total_loss = torch.tensor(0.0, device=self.device)
+         weight_global = self.hparams.mtl_weights.get('global', 0.0) # Default 0 if not specified
+         weight_user = self.hparams.mtl_weights.get('user', 0.0)
+         weight_scheduleC = self.hparams.mtl_weights.get('scheduleC', 0.0) # Default 0
+
+         if weight_global > 0: total_loss += weight_global * loss_global
+         if weight_user > 0: total_loss += weight_user * loss_user
+         if weight_scheduleC > 0: total_loss += weight_scheduleC * loss_scheduleC
+
+         # Handle potential NaN/Inf loss
          if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
-              print(f"[WARN] Calculated total_loss is NaN/Inf. Global={loss_global.item()}, User={loss_user.item()}")
-              # Return a zero tensor that requires grad for training step
+              print(f"[WARN] Calculated total_loss is NaN/Inf. "
+                    f"Global={loss_global.item():.4f}(w={weight_global:.2f}), "
+                    f"User={loss_user.item():.4f}(w={weight_user:.2f}), "
+                    f"SchedC={loss_scheduleC.item():.4f}(w={weight_scheduleC:.2f})")
               total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-              # Set individual losses to 0 for logging consistency
+              # Reset individual losses for logging consistency if total is NaN
               loss_global = torch.tensor(0.0, device=self.device)
               loss_user = torch.tensor(0.0, device=self.device)
-              
-         return total_loss, loss_global, loss_user
-         
-    def _calculate_accuracy(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Helper to calculate accuracy."""
-        # Ensure inputs are valid tensors on the same device
+              loss_scheduleC = torch.tensor(0.0, device=self.device)
+
+         return total_loss, loss_global, loss_user, loss_scheduleC # Return all four
+
+    def _calculate_accuracy(self, logits: Optional[torch.Tensor], targets: Optional[torch.Tensor]) -> torch.Tensor:
+        """Helper to calculate accuracy, handles None inputs."""
         if logits is None or targets is None or logits.shape[0] == 0 or targets.shape[0] == 0:
              return torch.tensor(0.0, device=self.device)
         if logits.shape[0] != targets.shape[0]:
              print(f"[WARN] Accuracy calc: Logits batch ({logits.shape[0]}) != Targets batch ({targets.shape[0]})")
              return torch.tensor(0.0, device=self.device)
-             
+        # Check if targets contain only ignored values (e.g., -1)
+        valid_targets = targets[targets >= 0] # Assuming negative values are ignored
+        if valid_targets.shape[0] == 0:
+            return torch.tensor(0.0, device=self.device) # No valid targets to calculate accuracy on
+
         with torch.no_grad():
-            preds = torch.argmax(logits, dim=1)
-            targets_on_device = targets.to(logits.device).long()
-            # Clamp targets AFTER moving to device and converting to long
-            targets_clamped = torch.clamp(targets_on_device, 0, logits.shape[1]-1)
+            # Only calculate accuracy on valid targets
+            logits_valid = logits[targets >= 0]
+            targets_valid = valid_targets.to(logits.device).long()
+
+            if logits_valid.shape[0] == 0: # Double check after filtering
+                 return torch.tensor(0.0, device=self.device)
+
+            preds = torch.argmax(logits_valid, dim=1)
+            # Clamp targets based on the number of classes in logits AFTER filtering
+            num_classes = logits_valid.shape[1]
+            targets_clamped = torch.clamp(targets_valid, 0, num_classes - 1)
             correct = (preds == targets_clamped).float()
             accuracy = correct.mean()
         return accuracy
 
     def _step(self, batch: Any, batch_idx: int, stage: str) -> Optional[torch.Tensor]:
-        """Common logic for train/val/test steps, assuming HGTLoader yields HeteroData."""
-        # --- Unpack Batch & Extract Data (Using Slicing based on batch_size) --- 
-        if not isinstance(batch, HeteroData):
-            print(f"[ERROR] {stage}_step received unexpected batch type: {type(batch)}.")
-            return None
-        
-        graph_batch = batch # Pass the full sampled graph to forward
-        sequence_batch = None 
+        """Common logic for train/val/test steps."""
+        # --- Unpack Batch & Extract Data ---
+        graph_batch = None
+        sequence_batch = None
         text_batch = None
         user_ids = None
         global_target = None
         user_target = None
+        scheduleC_target = None # Initialize
         batch_size = None
-        
+
+        # Assuming batch is HeteroData from HGTLoader if GNN is used
+        if self.use_gnn_encoder:
+            if not isinstance(batch, HeteroData):
+                print(f"[ERROR] {stage}_step received unexpected batch type: {type(batch)} when GNN enabled.")
+                return None
+            graph_batch = batch # Pass the full sampled graph
+        else:
+             # Handle non-GNN batch format (e.g., a dictionary)
+             # This needs specific implementation based on how non-GNN loader yields data
+             print(f"[WARN] {stage}_step running without GNN. Assuming batch is a dictionary (implement proper handling).")
+             if not isinstance(batch, dict):
+                  print(f"[ERROR] {stage}_step received unexpected batch type: {type(batch)} when GNN disabled.")
+                  return None
+             # Example: Extract data needed for non-GNN modalities from the dict
+             # sequence_batch = batch.get('sequence_data')
+             # text_batch = batch.get('text_data')
+             # user_ids = batch.get('user_ids')
+             # global_target = batch.get('global_labels')
+             # ... etc ...
+             # Need to determine batch_size from the available data
+             # batch_size = user_ids.shape[0] if user_ids is not None else len(text_batch) # Example
+             # For now, we'll assume the required data is present in the HeteroData structure even if GNN isn't used for processing
+             if not isinstance(batch, HeteroData): # Fallback check
+                  print(f"[ERROR] {stage}_step requires HeteroData structure even if GNN is off for current data extraction logic.")
+                  return None
+             graph_batch = batch # Still use HeteroData for unpacking, just won't pass to GNN encoder
+
+
         try:
             if 'transaction' in graph_batch.node_types:
                 tx_store = graph_batch['transaction']
-                
-                # Get batch_size (number of seed nodes)
-                if hasattr(tx_store, 'batch_size'):
+
+                # Determine batch_size (number of seed nodes for HGTLoader, or total nodes if not HGT)
+                # HGTLoader adds 'batch_size' attribute to the central node type store
+                if hasattr(tx_store, 'batch_size') and tx_store.batch_size is not None:
                      batch_size = tx_store.batch_size
-                     if batch_size is None or batch_size == 0: 
-                          print(f"[WARN] {stage}_step (batch {batch_idx}): tx_store.batch_size is None or 0. Cannot proceed.")
-                          return None
-                elif hasattr(tx_store, 'input_id'): # Fallback if batch_size missing
-                     batch_size = tx_store.input_id.shape[0]
                      if batch_size == 0:
-                          print(f"[WARN] {stage}_step (batch {batch_idx}): Determined batch_size is 0 from input_id. Skipping.")
+                          print(f"[WARN] {stage}_step (batch {batch_idx}): tx_store.batch_size is 0. Skipping batch.")
                           return None
+                elif hasattr(tx_store, 'input_id'): # Fallback for HGTLoader if batch_size missing
+                     batch_size = tx_store.input_id.shape[0]
+                     if batch_size == 0: print(f"[WARN] {stage}_step (batch {batch_idx}): Determined batch_size=0 from input_id. Skipping.") ; return None
                      print(f"[INFO] {stage}_step (batch {batch_idx}): Used input_id length for batch_size: {batch_size}")
+                elif hasattr(tx_store, 'num_nodes'):
+                     # If not using HGTLoader, batch_size might just be the number of nodes in the batch graph
+                     batch_size = tx_store.num_nodes
+                     if batch_size == 0: print(f"[WARN] {stage}_step (batch {batch_idx}): Determined batch_size=0 from num_nodes. Skipping.") ; return None
+                     # print(f"[INFO] {stage}_step (batch {batch_idx}): Used tx_store.num_nodes for batch_size: {batch_size}")
                 else:
                      print(f"[ERROR] {stage}_step (batch {batch_idx}): Cannot determine batch_size.")
                      return None
-                
-                # --- Fetch data for the seed nodes by slicing first batch_size elements --- 
-                
-                # User ID 
-                if self.user_embedding and hasattr(tx_store, 'user_id_code') and tx_store.user_id_code.shape[0] >= batch_size:
-                    user_ids = tx_store.user_id_code[:batch_size]
-                          
-                # Text (use _raw_text)
-                if self.use_text_encoder and hasattr(tx_store, '_raw_text'):
-                    if len(tx_store._raw_text) >= batch_size:
-                        text_batch = tx_store._raw_text[:batch_size]
-                    else:
-                         print(f"[WARN] {stage}_step (batch {batch_idx}): _raw_text length ({len(tx_store._raw_text)}) < batch_size ({batch_size}).")
-                               
-                # Sequence 
-                if self.use_sequence_encoder and hasattr(tx_store, 'seq_features') and hasattr(tx_store, 'seq_lengths'):
-                    if tx_store.seq_features.shape[0] >= batch_size:
-                        sequence_batch = {
-                            'sequences': tx_store.seq_features[:batch_size],
-                            'lengths': tx_store.seq_lengths[:batch_size]
-                        }
-                        # Add categorical features if they exist
-                        if hasattr(tx_store, 'seq_cat_features') and tx_store.seq_cat_features.shape[0] >= batch_size:
-                             sequence_batch['seq_cat_features'] = tx_store.seq_cat_features[:batch_size]
-                        else:
-                             print(f"[WARN] {stage}_step (batch {batch_idx}): Missing or incorrectly sized seq_cat_features.")
-                    else:
-                         print(f"[WARN] {stage}_step (batch {batch_idx}): seq_features length ({tx_store.seq_features.shape[0]}) < batch_size ({batch_size}).")
-                               
-                # Labels 
-                if hasattr(tx_store, 'y_global') and tx_store.y_global.shape[0] >= batch_size:
-                    global_target = tx_store.y_global[:batch_size]
+
+                # --- Fetch data by slicing first batch_size elements (assumes target nodes are first) ---
+                # This slicing logic is specific to HGTLoader's output where target nodes are first.
+                # If using a different loader, data extraction needs adjustment.
+                nodes_available = tx_store.num_nodes
+                if batch_size > nodes_available:
+                     print(f"[WARN] {stage}_step (batch {batch_idx}): Required batch_size ({batch_size}) > nodes available ({nodes_available}). Using available.")
+                     slice_len = nodes_available
                 else:
-                     print(f"[WARN] {stage}_step (batch {batch_idx}): Cannot extract global_target via slicing.")
-                     
-                if hasattr(tx_store, 'y_user') and tx_store.y_user.shape[0] >= batch_size:
-                    user_target = tx_store.y_user[:batch_size]
-                # else: user_target might be optional
-                          
-            else:
-                 print(f"[WARN] {stage}_step (batch {batch_idx}): 'transaction' node type not found in HGTLoader batch.")
-                 return None 
+                     slice_len = batch_size
+
+                if slice_len == 0: print(f"[WARN] {stage}_step (batch {batch_idx}): Effective batch size is 0 after checks. Skipping."); return None
+
+                # User ID
+                if hasattr(tx_store, 'user_id_code'):
+                    if tx_store.user_id_code.shape[0] >= slice_len:
+                        user_ids = tx_store.user_id_code[:slice_len]
+                    else: print(f"[WARN] {stage}_step (batch {batch_idx}): Insufficient user_id_code elements.")
+
+                # Text (_raw_text is Python list, handle differently)
+                if self.use_text_encoder and hasattr(tx_store, '_raw_text'):
+                    if tx_store._raw_text is not None and len(tx_store._raw_text) >= slice_len:
+                         # _raw_text might be on the whole graph, need mapping if GNN sampled
+                         if hasattr(tx_store, 'input_id'): # HGTLoader provides input_id map
+                             original_indices = tx_store.input_id[:slice_len] # Get original indices of seed nodes
+                             # Need the full graph's _raw_text IF _raw_text wasn't copied to batch
+                             # This assumes _raw_text IS copied/sliced correctly by the loader
+                             text_batch = [tx_store._raw_text[i] for i in range(slice_len)] # Simpler if loader handles it
+                         elif len(tx_store._raw_text) == tx_store.num_nodes: # Assume direct mapping if no input_id
+                              text_batch = tx_store._raw_text[:slice_len]
+                         else:
+                              print(f"[WARN] {stage}_step (batch {batch_idx}): Cannot map _raw_text, length mismatch ({len(tx_store._raw_text)}) vs nodes ({tx_store.num_nodes}).")
+                    else: print(f"[WARN] {stage}_step (batch {batch_idx}): Missing or insufficient _raw_text elements.")
+
+                # Sequence
+                if self.use_sequence_encoder and hasattr(tx_store, 'seq_features') and hasattr(tx_store, 'seq_lengths'):
+                    # Assume sequence features are already sliced correctly for the batch_size nodes
+                    if tx_store.seq_features.shape[0] >= slice_len:
+                        sequence_batch = {
+                            'sequences': tx_store.seq_features[:slice_len],
+                            'lengths': tx_store.seq_lengths[:slice_len]
+                        }
+                        # Add categorical features if they exist and match size
+                        if hasattr(tx_store, 'seq_cat_features') and tx_store.seq_cat_features.shape[0] >= slice_len:
+                             sequence_batch['seq_cat_features'] = tx_store.seq_cat_features[:slice_len]
+                        # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Missing or incorrectly sized seq_cat_features.")
+                    else: print(f"[WARN] {stage}_step (batch {batch_idx}): Insufficient seq_features elements.")
+
+                # Labels
+                if hasattr(tx_store, 'y_global') and tx_store.y_global.shape[0] >= slice_len:
+                    global_target = tx_store.y_global[:slice_len]
+                # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Cannot extract global_target.")
+
+                if hasattr(tx_store, 'y_user') and tx_store.y_user.shape[0] >= slice_len:
+                    user_target = tx_store.y_user[:slice_len]
+                # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Cannot extract user_target.")
+
+                # <<< Conditional Schedule C Label Extraction >>>
+                if self.use_scheduleC_head and hasattr(tx_store, 'y_scheduleC'):
+                     if tx_store.y_scheduleC.shape[0] >= slice_len:
+                         scheduleC_target = tx_store.y_scheduleC[:slice_len]
+                     # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Cannot extract scheduleC_target.")
+
+
+            else: # 'transaction' node type not found
+                 print(f"[WARN] {stage}_step (batch {batch_idx}): 'transaction' node type not found in batch.")
+                 return None
 
         except Exception as e:
             print(f"[ERROR] Failed during batch data extraction in {stage}_step (batch {batch_idx}): {e}")
@@ -406,73 +588,118 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             traceback.print_exc()
             return None
 
-        # --- Validation after extraction --- 
-        if global_target is None: 
-            print(f"[WARN] {stage}_step (batch {batch_idx}): global_target is None after extraction. Skipping batch.")
-            return None 
-        if self.user_embedding and user_ids is None:
-             print(f"[WARN] {stage}_step (batch {batch_idx}): user_ids is None after extraction. Skipping batch.")
-             return None
-        # Add more checks as needed for text_batch, sequence_batch if they are critical
+        # --- Validation after extraction ---
+        # Check if at least one target is available based on active heads
+        target_available = False
+        if self.global_head and global_target is not None: target_available = True
+        if self.user_specific_head and user_target is not None: target_available = True
+        if self.scheduleC_head and scheduleC_target is not None: target_available = True
 
-        # --- Forward pass --- 
+        if not target_available and stage != 'predict': # Need labels for train/val/test
+            print(f"[WARN] {stage}_step (batch {batch_idx}): No target labels found for active heads. Skipping batch.")
+            return None
+        # Check user_ids if user embedding is used
+        if self.user_embedding and self.user_embedding.num_embeddings > 0 and user_ids is None:
+             print(f"[WARN] {stage}_step (batch {batch_idx}): user_ids is None but user embedding is active. Skipping batch.")
+             return None
+        # Check other required inputs based on enabled modalities
+        if self.use_sequence_encoder and sequence_batch is None:
+              print(f"[WARN] {stage}_step (batch {batch_idx}): sequence_batch is None but sequence encoder is active. Skipping batch.")
+              return None
+        if self.use_text_encoder and text_batch is None:
+              print(f"[WARN] {stage}_step (batch {batch_idx}): text_batch is None but text encoder is active. Skipping batch.")
+              return None
+
+        # --- Forward pass ---
         device = self.device
-        graph_batch = graph_batch.to(device)
+        # Move graph batch to device only if GNN is used
+        if self.use_gnn_encoder and graph_batch is not None:
+             graph_batch = graph_batch.to(device)
+        # Move other inputs to device
         user_ids = user_ids.to(device) if user_ids is not None else None
         if isinstance(sequence_batch, dict):
              sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k,v in sequence_batch.items()}
-        elif isinstance(sequence_batch, torch.Tensor):
-             sequence_batch = sequence_batch.to(device)
-        
-        # Pass determined batch_size to forward
-        global_logits, user_specific_logits = self(graph_batch, sequence_batch, text_batch, user_ids, batch_size=batch_size)
+        # Text batch remains on CPU, handled by text encoder
 
-        # --- Loss Calculation --- 
-        if global_logits is None:
-             print(f"[WARN] {stage}_step (batch {batch_idx}): global_logits is None after forward pass.")
-             return None
-             
-        total_loss, loss_global, loss_user = self._calculate_mtl_loss(
-            global_logits, global_target, # Pass CPU targets, loss fn moves them
-            user_specific_logits, user_target 
+        # Pass determined batch_size to forward (crucial for GNN slicing)
+        global_logits, user_specific_logits, scheduleC_logits = self( # Unpack third logit
+            graph_batch=graph_batch if self.use_gnn_encoder else None, # Pass graph only if used
+            sequence_batch=sequence_batch,
+            text_batch=text_batch,
+            user_ids=user_ids,
+            batch_size=slice_len # Use the actual number of nodes being processed
         )
 
-        # --- Accuracy Calculation --- 
+        # --- Loss Calculation ---
+        # Check if any logits were produced (at least one head must be active)
+        logits_produced = global_logits is not None or user_specific_logits is not None or scheduleC_logits is not None
+        if not logits_produced:
+             print(f"[WARN] {stage}_step (batch {batch_idx}): No logits produced by forward pass. Skipping loss calculation.")
+             return None
+
+        # Ensure targets are on CPU for the loss function (it handles moving them)
+        total_loss, loss_global, loss_user, loss_scheduleC = self._calculate_mtl_loss( # Unpack fourth loss
+            global_logits, global_target.cpu() if global_target is not None else None,
+            user_specific_logits, user_target.cpu() if user_target is not None else None,
+            scheduleC_logits, scheduleC_target.cpu() if scheduleC_target is not None else None # Pass schedule C items
+        )
+
+        # --- Accuracy Calculation ---
         acc_global = self._calculate_accuracy(global_logits, global_target)
         acc_user = self._calculate_accuracy(user_specific_logits, user_target)
+        acc_scheduleC = self._calculate_accuracy(scheduleC_logits, scheduleC_target) # Calculate Schedule C Acc
 
-        # --- Logging & Return --- 
-        log_batch_size = global_logits.shape[0]
-        log_dict = {
-            f'{stage}_loss': total_loss,
-            f'{stage}_global_loss': loss_global,
-            f'{stage}_user_loss': loss_user,
-            f'{stage}_acc_global': acc_global,
-            f'{stage}_acc_user': acc_user
-        }
-        self.log_dict(log_dict, on_step=(stage=='train'), on_epoch=True, prog_bar=(stage=='train'), batch_size=log_batch_size, sync_dist=True)
+        # --- Logging & Return ---
+        # Determine log batch size from any available logits
+        log_batch_size = 0
+        if global_logits is not None: log_batch_size = global_logits.shape[0]
+        elif user_specific_logits is not None: log_batch_size = user_specific_logits.shape[0]
+        elif scheduleC_logits is not None: log_batch_size = scheduleC_logits.shape[0]
+        if log_batch_size == 0:
+            print(f"[WARN] {stage}_step (batch {batch_idx}): Log batch size is 0. Skipping logging.")
+            # Still return loss for training step if calculated
+            return total_loss if stage == 'train' and torch.is_tensor(total_loss) else None
 
+
+        log_dict = { f'{stage}/total_loss': total_loss }
+        # Only log metrics for active heads/losses
+        if self.global_head:
+             log_dict[f'{stage}/global_loss'] = loss_global
+             log_dict[f'{stage}/acc_global'] = acc_global
+        if self.user_specific_head:
+             log_dict[f'{stage}/user_loss'] = loss_user
+             log_dict[f'{stage}/acc_user'] = acc_user
+        if self.scheduleC_head:
+             log_dict[f'{stage}/scheduleC_loss'] = loss_scheduleC
+             log_dict[f'{stage}/acc_scheduleC'] = acc_scheduleC
+
+        # Use sync_dist=True for distributed training
+        self.log_dict(log_dict, on_step=(stage=='train'), on_epoch=True, prog_bar=True, batch_size=log_batch_size, sync_dist=True)
+
+
+        # Return total_loss only for the training stage driver
         return total_loss if stage == 'train' else None
 
-    # --- Standard Lightning Hooks --- 
+    # --- Standard Lightning Hooks ---
     def training_step(self, batch: Any, batch_idx: int) -> Optional[torch.Tensor]:
         return self._step(batch, batch_idx, stage='train')
 
     def validation_step(self, batch: Any, batch_idx: int) -> None:
-        self._step(batch, batch_idx, stage='val') 
+        self._step(batch, batch_idx, stage='val')
 
     def test_step(self, batch: Any, batch_idx: int) -> None:
         self._step(batch, batch_idx, stage='test')
 
     def configure_optimizers(self):
-        # Placeholder: Simple optimizer for all params
-        # TODO: Implement differential LR for text encoder if desired
-        # TODO: Integrate MAML optimizer logic if used
+        # TODO: Implement differential LR (e.g., lower LR for text encoder) if needed
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
-            lr=self.hparams.learning_rate, 
+            filter(lambda p: p.requires_grad, self.parameters()), # Only optimize parameters that require grad
+            lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay
         )
         print("[INFO] configure_optimizers: Returning simple AdamW optimizer.")
+        # Example Scheduler (Optional):
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
+        # return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "monitor": "val/total_loss"}}
         return optimizer
         # Add scheduler later if needed 

@@ -36,9 +36,16 @@ def load_data(data_path: str) -> pd.DataFrame:
         # Handle timestamp (use actual column name)
         timestamp_col = 'books_create_timestamp' # <<< Use correct column name
         if timestamp_col not in df.columns:
-            print(f"[WARN] Timestamp column '{timestamp_col}' not found. Using default date.")
-            df['timestamp'] = pd.Timestamp('2020-01-01') # Still create standard 'timestamp' col
-        else:
+            # Try fallback 'posted_date'
+            if 'posted_date' in df.columns:
+                 timestamp_col = 'posted_date'
+                 print(f"[INFO] Using fallback timestamp column '{timestamp_col}'")
+            else:
+                 print(f"[WARN] Timestamp columns ('books_create_timestamp', 'posted_date') not found. Using default date.")
+                 df['timestamp'] = pd.Timestamp('2020-01-01') # Still create standard 'timestamp' col
+                 timestamp_col = None # Mark that no original timestamp found
+
+        if timestamp_col: # Process if a timestamp column was found
             print(f"Converting '{timestamp_col}' column to datetime...")
             # Create the standard 'timestamp' column from the source column
             df['timestamp'] = pd.to_datetime(df[timestamp_col], errors='coerce')
@@ -51,8 +58,12 @@ def load_data(data_path: str) -> pd.DataFrame:
             print("Timestamp conversion/handling complete.")
         
         # Extract time features from the standard 'timestamp' column
-        df['weekday'] = df['timestamp'].dt.weekday
-        df['hour'] = df['timestamp'].dt.hour
+        if 'timestamp' in df.columns:
+            df['weekday'] = df['timestamp'].dt.weekday
+            df['hour'] = df['timestamp'].dt.hour
+        else: # Create dummy columns if no timestamp
+             df['weekday'] = 0
+             df['hour'] = 0
 
         # Handle text fields (replace if different names are used)
         for col in ['raw_description', 'memo', 'merchant_name']:
@@ -90,6 +101,7 @@ def train_advanced(
     # <<< HGTLoader specific config >>>
     hgt_num_samples: Optional[Dict[str, List[int]]] = None,
     # num_hgt_layers is derived from model_config now
+    use_scheduleC_label: bool = False,
 ):
     """Train the advanced transaction classifier."""
     pl.seed_everything(seed)
@@ -125,7 +137,8 @@ def train_advanced(
         # Pass flags to DataModule
         use_sequence_encoder=use_seq,
         use_gnn_encoder=use_graph,
-        use_text_encoder=use_text
+        use_text_encoder=use_text,
+        use_scheduleC_label=use_scheduleC_label
     )
     print("Setting up DataModuleV2...")
     data_module.setup('fit') 
@@ -135,7 +148,8 @@ def train_advanced(
     num_global_classes = data_module.num_global_classes
     num_user_classes = data_module.num_user_classes
     num_users = data_module.num_users
-    print(f"DataModule counts: #Global={num_global_classes}, #User={num_user_classes}, #Users={num_users}")
+    num_scheduleC_classes = data_module.num_scheduleC_classes
+    print(f"DataModule counts: #Global={num_global_classes}, #User={num_user_classes}, #Users={num_users}, #SchedC={num_scheduleC_classes}")
 
     # Required by HGT
     model_config['graph_encoder_params']['in_channels'] = data_module.node_feature_dims
@@ -145,6 +159,7 @@ def train_advanced(
     # Required by Classifiers
     model_config['num_global_classes'] = num_global_classes
     model_config['num_user_classes'] = num_user_classes
+    model_config['num_scheduleC_classes'] = num_scheduleC_classes
     # Update fusion dims based on actual encoder output dims
     model_config['fusion_params']['graph_dim'] = model_config['graph_encoder_params'].get('out_channels', 128)
     model_config['fusion_params']['seq_dim'] = model_config['sequence_encoder_params'].get('output_dim', 128)
@@ -274,8 +289,12 @@ if __name__ == '__main__':
     # --- MTL/Focal Loss Arguments --- 
     parser.add_argument('--mtl_weight_global', type=float, default=0.5, help='Weight for global loss')
     parser.add_argument('--mtl_weight_user', type=float, default=0.5, help='Weight for user loss')
+    parser.add_argument('--mtl_weight_scheduleC', type=float, default=0.0, # New argument, default 0
+                        help='Weight for Schedule C loss (only used if --use_scheduleC_label is set)')
     parser.add_argument('--focal_alpha', type=float, default=0.25, help='Alpha for Focal Loss')
     parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma for Focal Loss')
+    parser.add_argument('--use_scheduleC_label', action='store_true', # Use flag
+                        help='Enable Schedule C classification task')
 
     args = parser.parse_args()
 
@@ -315,6 +334,19 @@ if __name__ == '__main__':
             print(f"[WARN] Failed to parse --hgt_samples argument: {e}. Using default.")
             hgt_samples_dict = None # Fallback to default in DataModule init
 
+    # --- Construct MTL Weights Dictionary ---
+    mtl_weights = {}
+    if args.mtl_weight_global > 0:
+        mtl_weights['global'] = args.mtl_weight_global
+    if args.mtl_weight_user > 0:
+        mtl_weights['user'] = args.mtl_weight_user
+    # Add scheduleC weight only if the label is used AND weight > 0
+    if args.use_scheduleC_label and args.mtl_weight_scheduleC > 0:
+        mtl_weights['scheduleC'] = args.mtl_weight_scheduleC
+    print(f"Using MTL weights: {mtl_weights}")
+    if not mtl_weights:
+        print("[WARN] No MTL weights > 0 specified. Model might not train effectively.")
+
     # --- Run Training --- 
     train_advanced(
         data_path=args.data_path,
@@ -326,10 +358,11 @@ if __name__ == '__main__':
         model_config=model_config,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        mtl_weights={'global': args.mtl_weight_global, 'user': args.mtl_weight_user},
+        mtl_weights=mtl_weights,
         focal_loss_alpha=args.focal_alpha,
         focal_loss_gamma=args.focal_gamma,
         accelerator=args.accelerator,
         precision=args.precision,
         hgt_num_samples=hgt_samples_dict, # Pass parsed dict or None
+        use_scheduleC_label=args.use_scheduleC_label,
     ) 

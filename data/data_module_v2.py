@@ -55,7 +55,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                  test_ratio: float = 0.1,
                  use_sequence_encoder: bool = True,
                  use_text_encoder: bool = True,
-                 use_gnn_encoder: bool = True
+                 use_gnn_encoder: bool = True,
+                 use_scheduleC_label: bool = False
                  ):
         super().__init__()
         self.transactions_df = transactions_df.copy()
@@ -69,24 +70,39 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         self.use_sequence_encoder = use_sequence_encoder
         self.use_text_encoder = use_text_encoder
         self.use_gnn_encoder = use_gnn_encoder
+        self.use_scheduleC_label = use_scheduleC_label
+
+        # Define known base node types
+        self.node_types_in_graph = ['transaction', 'merchant', 'category']
+        # Add new node types if GNN is used
+        if self.use_gnn_encoder:
+            self.node_types_in_graph.extend(['mcc', 'sic'])
 
         # Store/Create HGT sampling config
         self.num_hgt_layers = num_hgt_layers
         self.hgt_num_samples = hgt_num_samples
-        if self.hgt_num_samples is None:
+        if self.hgt_num_samples is None and self.use_gnn_encoder:
             # Simple default: Sample 15 neighbors in first layer, 10 in second
             default_samples_per_layer = [15, 10]
-            # Define KNOWN node types used in the graph
-            node_types_in_graph = ['transaction', 'merchant', 'category'] 
-            self.hgt_num_samples = {ntype: default_samples_per_layer[:self.num_hgt_layers] for ntype in node_types_in_graph}
-            print(f"[WARN] hgt_num_samples not provided. Using default based on num_hgt_layers={self.num_hgt_layers}: {self.hgt_num_samples}")
-        else:
-            for ntype, samples in self.hgt_num_samples.items():
-                if len(samples) != self.num_hgt_layers:
-                    raise ValueError(f"Length of hgt_num_samples for '{ntype}' ({len(samples)}) must match num_hgt_layers ({self.num_hgt_layers})")
-        
-        print(f"Initializing TransactionDataModuleV2 (HGTLoader)...")
+            # Use the defined node types list
+            self.hgt_num_samples = {ntype: default_samples_per_layer[:self.num_hgt_layers] for ntype in self.node_types_in_graph}
+            print(f"[WARN] hgt_num_samples not provided. Using default based on num_hgt_layers={self.num_hgt_layers} "
+                  f"for node types {self.node_types_in_graph}: {self.hgt_num_samples}")
+        elif self.hgt_num_samples is not None and self.use_gnn_encoder:
+             # Validate provided samples
+             for ntype in self.node_types_in_graph:
+                  if ntype not in self.hgt_num_samples:
+                      print(f"[WARN] User-provided hgt_num_samples missing node type '{ntype}'. Setting samples to [0]*{self.num_hgt_layers}.")
+                      self.hgt_num_samples[ntype] = [0] * self.num_hgt_layers
+                  elif len(self.hgt_num_samples[ntype]) != self.num_hgt_layers:
+                      raise ValueError(f"Length of user-provided hgt_num_samples for '{ntype}' ({len(self.hgt_num_samples[ntype])}) "
+                                       f"must match num_hgt_layers ({self.num_hgt_layers})")
+        elif not self.use_gnn_encoder:
+             self.hgt_num_samples = {} # No sampling needed if GNN is off
+
+        print(f"Initializing TransactionDataModuleV2 (HGTLoader={self.use_gnn_encoder})...")
         print(f"  Modality Flags: GNN={self.use_gnn_encoder}, Sequence={self.use_sequence_encoder}, Text={self.use_text_encoder}")
+        print(f"  Optional Label: ScheduleC={self.use_scheduleC_label}")
 
         # Placeholders
         self.tokenizer = None
