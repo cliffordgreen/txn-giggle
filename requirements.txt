@@ -9,4 +9,9 @@ scikit-learn>=1.0.0
 torchmetrics>=1.0.0
 networkx>=3.0
 torch-sparse
-accelerate 
+accelerate
+wandb
+
+# Added for MAML
+learn2learn
+PyYAML 

@@ -231,11 +231,20 @@ class MAMLTransactionDataModule(pl.LightningDataModule):
         # Convert labels to integer type
         try:
             self.transactions_df[self.maml_label_column] = self.transactions_df[self.maml_label_column].astype(int)
+            # Calculate number of classes based on max value + 1 (assuming 0-based)
+            # Filter out potential negative fill values (-1)
+            valid_labels = self.transactions_df[self.maml_label_column][self.transactions_df[self.maml_label_column] >= 0]
+            if not valid_labels.empty:
+                 self.num_maml_classes = valid_labels.max() + 1
+            else:
+                 self.num_maml_classes = 0
+            print(f"Calculated num_maml_classes (int): {self.num_maml_classes}")
         except ValueError:
             print(f"[WARN] Could not convert MAML label column '{self.maml_label_column}' to int. Attempting factorization.")
             codes, uniques = pd.factorize(self.transactions_df[self.maml_label_column].astype(str), sort=True)
             self.transactions_df[self.maml_label_column] = codes
-            print(f"Factorized '{self.maml_label_column}' into {len(uniques)} codes.")
+            self.num_maml_classes = len(uniques)
+            print(f"Factorized '{self.maml_label_column}' into {self.num_maml_classes} codes.")
 
 
         # --- 2. Get Unique Users and Split ---
@@ -254,9 +263,20 @@ class MAMLTransactionDataModule(pl.LightningDataModule):
         )
 
         # Adjust val ratio relative to the remaining users
-        val_ratio_adjusted = self.hparams.meta_val_ratio / (1.0 - self.hparams.meta_test_ratio)
-        if val_ratio_adjusted >= 1.0: # Handle edge case where test ratio is large
-            print("[WARN] meta_test_ratio is high, resulting in 0 validation users based on adjusted ratio. Setting val ratio to 0.")
+        # Ensure minimum 1 validation user if ratio > 0 and train_val has users
+        if len(train_val_users) > 0 and self.hparams.meta_val_ratio > 0 and (1.0 - self.hparams.meta_test_ratio) > 0:
+             val_ratio_adjusted = self.hparams.meta_val_ratio / (1.0 - self.hparams.meta_test_ratio)
+             # Ensure at least 1 user for validation if possible and requested
+             num_val_users = max(1, int(len(train_val_users) * val_ratio_adjusted))
+             # Ensure val users doesn't exceed total available minus 1 for training
+             num_val_users = min(num_val_users, max(0, len(train_val_users) - 1))
+        else:
+             val_ratio_adjusted = 0 # No validation split possible/requested
+             num_val_users = 0
+
+        if val_ratio_adjusted >= 1.0 or num_val_users == 0: # Handle edge case or impossibility
+            if val_ratio_adjusted > 0: # Only warn if validation was expected
+                 print("[WARN] Not enough users to create validation split based on ratios. Assigning all remaining to train.")
             self.meta_train_users = train_val_users
             self.meta_val_users = np.array([]) # Empty array
         elif len(train_val_users) < 2 : # Need at least 2 users to split into train/val

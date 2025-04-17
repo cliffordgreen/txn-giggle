@@ -3,6 +3,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
+import numpy as np
 
 # Import components from other files in the 'models' directory
 from .hgt_encoder import HGT
@@ -28,13 +29,20 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                  mtl_weights: Dict[str, float] = {'global': 0.5, 'user': 0.5}, # Can include 'scheduleC'
                  focal_loss_alpha: float = 0.25,
                  focal_loss_gamma: float = 2.0,
-                 # Add DataFrame reference (Optional, might not be needed if graph contains all)
-                 transactions_df_ref: Optional[pd.DataFrame] = None
+                 # --- MAML Specific Config ---
+                 use_maml: bool = False, # Flag to enable MAML mode
+                 inner_lr: float = 0.01, # Inner loop learning rate
+                 adaptation_steps: int = 1, # K_adapt: Inner loop adaptation steps
+                 maml_head_label_type: str = 'user', # Which head/label to adapt ('user' or 'global')
+                 # Optional reference to full data (needed for efficient MAML feature fetching)
+                 # <<< MODIFIED: Expecting the raw DataFrame for MAML feature fetching >>>
+                 full_data_ref: Optional[pd.DataFrame] = None, # Raw transactions_df
                  ):
         super().__init__()
         # Store simple hyperparameters automatically
         self.save_hyperparameters('learning_rate', 'weight_decay',
-                                'mtl_weights', 'focal_loss_alpha', 'focal_loss_gamma')
+                                'mtl_weights', 'focal_loss_alpha', 'focal_loss_gamma',
+                                'use_maml', 'inner_lr', 'adaptation_steps', 'maml_head_label_type')
         # Store complex configs manually (needed if loading from checkpoint)
         self._model_config = model_config
         self._graph_config = model_config.get('graph_encoder_params', {}) # Handle missing key
@@ -52,9 +60,9 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         self.use_scheduleC_head = num_scheduleC_classes > 0
 
         # Store references (NOT saved as hparams)
-        self._transactions_df_ref = transactions_df_ref
-        # Reference to full graph might be needed if labels aren't passed in batch (depends on loader)
-        # self._full_graph_data_ref = None # Set by train script if needed
+        self._full_data_ref = full_data_ref # Store reference for MAML feature fetching
+        if self.hparams.use_maml and self._full_data_ref is None:
+             print("[WARN] MAML mode enabled but full_data_ref (raw DataFrame) was not provided to the model. Feature fetching will fail.")
 
         # <<< Store modality flags from config >>>
         self.use_gnn_encoder = model_config.get('use_gnn_encoder', True)
@@ -358,7 +366,157 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
         return global_logits, user_specific_logits, scheduleC_logits # Return all three
 
-    # _get_labels_for_batch helper removed
+    def _get_features_for_indices(self, transaction_indices: torch.Tensor) -> Tuple[Optional[HeteroData], Optional[Any], Optional[List[str]], Optional[torch.Tensor]]:
+        """
+        Fetches input features for specific transaction indices FROM THE STORED RAW DATAFRAME.
+        Crucial for MAML where support/query sets are defined by indices.
+
+        Args:
+            transaction_indices: Tensor of *original* DataFrame indices.
+
+        Returns:
+            Tuple containing:
+                - graph_batch: None (GNN feature fetching not implemented for MAML)
+                - sequence_batch: Dict with basic sequence features (or None if disabled/failed)
+                - text_batch: List of combined raw text strings (or None if failed)
+                - user_ids: Tensor of user ID codes (or None if failed)
+        """
+        if self._full_data_ref is None:
+            print("[ERROR] _get_features_for_indices: _full_data_ref (raw DataFrame) is None. Cannot fetch features.")
+            return None, None, None, None
+
+        if transaction_indices is None or transaction_indices.numel() == 0:
+             print("[WARN] _get_features_for_indices: Received empty or None indices.")
+             return None, None, None, None
+
+        # Ensure indices are on CPU and numpy for DataFrame indexing
+        try:
+             indices_np = transaction_indices.cpu().numpy()
+             # Retrieve corresponding rows from the original DataFrame
+             df_slice = self._full_data_ref.iloc[indices_np]
+        except IndexError as e:
+             max_idx = self._full_data_ref.index.max()
+             offending_indices = indices_np[indices_np > max_idx]
+             print(f"[ERROR] _get_features_for_indices: IndexError during DataFrame lookup. Max df index: {max_idx}. Offending input indices > max: {offending_indices}. Error: {e}")
+             return None, None, None, None
+        except Exception as e:
+             print(f"[ERROR] _get_features_for_indices: Error during DataFrame lookup for indices {indices_np}: {e}")
+             return None, None, None, None
+
+        # print(f"[DEBUG] _get_features_for_indices: Fetched {len(df_slice)} rows for {len(indices_np)} indices.")
+
+        graph_batch = None # GNN features skipped for MAML
+        sequence_batch = None
+        text_batch = None
+        user_ids = None
+
+        try:
+            # 1. User IDs (Assuming 'user_id_code' was added during DataModule setup/preprocessing)
+            # It's safer if the DataModule adds this column to the original df passed here
+            if 'user_id_code' in df_slice.columns:
+                user_ids = torch.tensor(df_slice['user_id_code'].values, dtype=torch.long)
+            else:
+                print("[WARN] _get_features_for_indices: 'user_id_code' column not found in _full_data_ref. User embedding will be missing.")
+
+            # 2. Text Data
+            if self.use_text_encoder:
+                # Combine text columns present in the dataframe slice
+                text_cols_to_use = [col for col in ['raw_description', 'memo', 'merchant_name'] if col in df_slice.columns]
+                if text_cols_to_use:
+                    # Fill NaNs just in case, concatenate, convert to list
+                    text_batch = df_slice[text_cols_to_use].fillna('').astype(str).apply(' || '.join, axis=1).tolist()
+                else:
+                    print("[WARN] _get_features_for_indices: No standard text columns found for text encoder.")
+                    text_batch = ['' for _ in range(len(df_slice))] # Return empty strings
+
+            # 3. Sequence Data (Basic Implementation)
+            if self.use_sequence_encoder:
+                # WARNING: This uses a simplified feature set, likely incompatible with pre-trained TFT.
+                # Consider disabling sequence encoder for MAML (`--use_sequence False`)
+                # unless this preprocessing is adapted.
+                required_seq_cols = ['amount', 'timestamp'] # Need amount and timestamp
+                if all(col in df_slice.columns for col in required_seq_cols):
+                    # Basic features: amount, hour_sin, hour_cos, day_sin, day_cos
+                    # Note: This doesn't create sequences of past transactions, just features of the indexed ones.
+                    # A true sequential input for MAML would require more complex logic here.
+                    amount = torch.tensor(df_slice['amount'].fillna(0.0).values, dtype=torch.float).unsqueeze(1)
+                    timestamps = pd.to_datetime(df_slice['timestamp'], errors='coerce')
+                    hour = timestamps.dt.hour.fillna(0).astype(int)
+                    day = timestamps.dt.weekday.fillna(0).astype(int)
+                    hour_sin = torch.tensor(np.sin(2 * np.pi * hour / 24), dtype=torch.float).unsqueeze(1)
+                    hour_cos = torch.tensor(np.cos(2 * np.pi * hour / 24), dtype=torch.float).unsqueeze(1)
+                    day_sin = torch.tensor(np.sin(2 * np.pi * day / 7), dtype=torch.float).unsqueeze(1)
+                    day_cos = torch.tensor(np.cos(2 * np.pi * day / 7), dtype=torch.float).unsqueeze(1)
+
+                    # Combine features - Shape: [batch_size, num_features]
+                    seq_features = torch.cat([amount, hour_sin, hour_cos, day_sin, day_cos], dim=1)
+
+                    # Package for compatibility (even though it's not really a sequence)
+                    sequence_batch = {
+                        # Treat each transaction as a sequence of length 1
+                        'sequences': seq_features.unsqueeze(1), # Shape: [batch_size, 1, num_features]
+                        'lengths': torch.ones(len(df_slice), dtype=torch.long)
+                    }
+                    # print("[WARN] _get_features_for_indices: Using simplified, non-sequential features for sequence_batch in MAML.")
+                else:
+                    print("[WARN] _get_features_for_indices: Missing required columns for sequence features (amount, timestamp). Skipping.")
+
+        except KeyError as e:
+             print(f"[ERROR] _get_features_for_indices: KeyError during feature extraction for indices {indices_np}. Missing column? Error: {e}")
+             return None, None, None, None
+        except Exception as e:
+            print(f"[ERROR] _get_features_for_indices: Failed during feature extraction: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None, None
+
+        # Return fetched features (Graph is None)
+        return graph_batch, sequence_batch, text_batch, user_ids
+
+    def get_fused_features(self,
+                           graph_batch: Optional[HeteroData] = None,
+                           sequence_batch: Optional[Any] = None,
+                           text_batch: Optional[List[str]] = None,
+                           user_ids: Optional[torch.Tensor] = None,
+                           batch_size: Optional[int] = None
+                           ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Fetches fused features from the model.
+
+        Args:
+            graph_batch: HeteroData object containing graph data.
+            sequence_batch: Dict containing sequence data.
+            text_batch: List of text strings.
+            user_ids: Tensor of user IDs.
+            batch_size: Optional batch size for slicing GNN output.
+
+        Returns:
+            Tuple containing:
+                - global_logits: Tensor of global class logits.
+                - user_specific_logits: Tensor of user-specific class logits.
+                - scheduleC_logits: Tensor of schedule C class logits.
+        """
+        # Ensure all inputs are on the correct device
+        device = self.device
+        if graph_batch:
+            graph_batch = graph_batch.to(device)
+        if sequence_batch:
+            sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in sequence_batch.items()}
+        if text_batch:
+            text_batch = [t.to(device) for t in text_batch]
+        if user_ids:
+            user_ids = user_ids.to(device)
+
+        # Forward pass through the model
+        global_logits, user_specific_logits, scheduleC_logits = self(
+            graph_batch=graph_batch,
+            sequence_batch=sequence_batch,
+            text_batch=text_batch,
+            user_ids=user_ids,
+            batch_size=batch_size
+        )
+
+        return global_logits, user_specific_logits, scheduleC_logits
 
     def _calculate_mtl_loss(self,
                               global_logits: Optional[torch.Tensor], global_target: Optional[torch.Tensor],

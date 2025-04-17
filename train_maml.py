@@ -5,6 +5,7 @@ import argparse
 import os
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+import yaml # <<< Import YAML
 
 # Import your custom modules
 from models.advanced_transaction_classifier import AdvancedTransactionCategorizationModel # Assuming MAML modifications
@@ -46,76 +47,104 @@ def main(args):
         meta_test_ratio=args.meta_test_ratio,
         seed=args.seed
     )
-    # Run setup to split users and prepare datasets
-    # Setup is implicitly called by the Trainer, but can be called manually:
-    # maml_dm.setup()
+    # --- Setup DataModule FIRST to get data-dependent config values ---
+    print("Setting up MAML DataModule to derive config...")
+    try:
+        maml_dm.setup(stage='fit') # Call setup explicitly
+        # <<< Add preprocessing step for user_id_code if MAMLDataModule doesn't do it >>>
+        # This ensures the original DataFrame passed to the model has the necessary code
+        if 'user_id_code' not in transactions_df.columns and hasattr(maml_dm, 'user_id_column') and maml_dm.user_id_column in transactions_df.columns:
+            print("Adding 'user_id_code' to DataFrame for model reference...")
+            user_codes, _ = pd.factorize(transactions_df[maml_dm.user_id_column], sort=True)
+            transactions_df['user_id_code'] = user_codes
+
+        print("MAML DataModule setup complete.")
+    except Exception as e:
+        print(f"[ERROR] Failed during MAML DataModule setup: {e}")
+        import traceback
+        traceback.print_exc()
+        return
 
     # --- 3. Initialize Model (Configured for MAML) ---
-    # TODO: Define model_config based on your architecture needs
-    # This needs careful construction based on the actual feature dimensions
-    # derived from the data processing (e.g., in a full pipeline)
-    # For now, using placeholders - replace with actual values.
-    print("Configuring model...")
+    print("Configuring model with values derived from data...")
 
-    # Placeholder: Get necessary dims/counts from DataModule after setup
-    # These would typically be determined *after* processing the data fully
-    # in a setup phase that calculates them (like in DataModuleV2).
-    # Here, we'll use dummy values or rely on defaults in the model.
-    # maml_dm.setup() # Call setup if needed to calculate these
-    # num_users = maml_dm.num_users
-    # num_user_classes = maml_dm.num_user_classes # Based on maml_label_column?
-    # num_global_classes = maml_dm.num_global_classes
-    # metadata = maml_dm.metadata # If graph features are involved
+    # Get necessary dims/counts from the setup DataModule instance
+    num_users = maml_dm.num_users
+    # Use the number of classes calculated for the specific MAML target label
+    num_maml_target_classes = maml_dm.num_maml_classes
+    # NOTE: Other config parts (GNN, sequence, text encoders, global classes) are
+    #       still using placeholders below. This assumes they are either:
+    #       a) Not used (base model is frozen and features fetched separately)
+    #       b) Loaded from a pre-trained checkpoint where these configs don't matter
+    #       c) Will be loaded/configured through a more robust config system.
+    #       For MAML adapting only the user head, num_users and num_user_classes are most critical.
 
-    # Example Placeholder Configuration (Replace with actual derived values)
-    model_config = {
-        'use_gnn_encoder': args.use_gnn,
-        'use_sequence_encoder': args.use_sequence,
-        'use_text_encoder': args.use_text,
-        'num_users': 1000, # Placeholder - should come from data
-        'user_embed_dim': 64,
-        'num_global_classes': 20, # Placeholder
-        'num_user_classes': 10, # Placeholder - Corresponds to user_label_col cardinality
-        'graph_encoder_params': { # Only if use_gnn is True
-            'in_channels': -1,
-            'hidden_channels': 64,
-            'out_channels': 64,
-            'metadata': ([('transaction', 'merchant'), ('merchant', 'category'), ...], # Placeholder
-                         [('transaction', 'to', 'merchant'), ...]), # Placeholder
-            'num_heads': 4,
-            'num_layers': 2
-        },
-        'sequence_encoder_params': { # Only if use_sequence is True
-             'output_dim': 64,
-             'tft_params': {
-                # Required TFT params like time_idx, target, group_ids etc.
-                # Need to be configured based on MAML data structure/features
-             },
-        },
-        'text_encoder_params': { # Only if use_text is True
-             'model_name': 'ProsusAI/finbert',
-             'projection_dim': 64
-        },
-        'fusion_params': {
-             'hidden_dim': 128,
-             'output_dim': 128 # This feeds into the MAML head
-        }
-        # Add MAML specific flags IF they are part of model_config
-        # 'use_maml': True # Better to pass directly as argument
-    }
+    # --- Load Base Config from YAML --- 
+    print(f"Loading base model configuration from: {args.config_path}")
+    try:
+        with open(args.config_path, 'r') as f:
+            base_config = yaml.safe_load(f)
+        print("Base model configuration loaded successfully.")
+    except FileNotFoundError:
+        print(f"[WARN] Base configuration file not found at {args.config_path}. Using command-line args and defaults only.")
+        base_config = {} # Start with empty dict if file not found
+    except Exception as e:
+        print(f"[ERROR] Failed to load or parse base config file {args.config_path}: {e}")
+        return # Exit if config loading fails
+
+    # --- Construct Final Model Config --- 
+    # Start with base config, then override with dynamic/essential values
+    model_config = base_config.copy()
+
+    # Override specific keys with data-derived or essential MAML values
+    model_config['use_gnn_encoder'] = args.use_gnn
+    model_config['use_sequence_encoder'] = args.use_sequence
+    model_config['use_text_encoder'] = args.use_text
+    model_config['num_users'] = num_users
+    model_config['user_embed_dim'] = model_config.get('user_embed_dim', 64) # Keep configurable
+    model_config['num_user_classes'] = num_maml_target_classes # Set user classes based on MAML target
+    model_config['num_global_classes'] = 0 # Assume global head is not adapted/used in MAML
+
+    # Ensure sub-dictionaries exist if needed based on flags
+    if args.use_gnn and 'graph_encoder_params' not in model_config: model_config['graph_encoder_params'] = {}
+    if args.use_sequence and 'sequence_encoder_params' not in model_config: model_config['sequence_encoder_params'] = {}
+    if args.use_text and 'text_encoder_params' not in model_config: model_config['text_encoder_params'] = {}
+    if 'fusion_params' not in model_config: model_config['fusion_params'] = {}
+
+    # Example: Update projection dim if text encoder is used
+    if args.use_text:
+        model_config['text_encoder_params']['finetune_text_encoder'] = False # Override, typically false for MAML
+        # Add other necessary text_encoder defaults if not in YAML
+        if 'model_name' not in model_config['text_encoder_params']: model_config['text_encoder_params']['model_name'] = 'ProsusAI/finbert'
+
+    # Remove placeholder/dummy values that might have been in the original script's example
+    # The base_config loaded from YAML should contain the correct parameters.
+    if args.use_gnn:
+        # Remove potentially incorrect dummy metadata if loaded config doesn't have it
+        model_config['graph_encoder_params'].pop('metadata', None)
+        # GNN metadata should ideally be derived *within* the model or DataModule
+        # based on the actual graph structure if GNN is truly used in MAML base.
+        print("[WARN] GNN usage in MAML base model is complex. Ensure config and feature fetching align or disable GNN.")
+
+    print(f"Final Model Config: {model_config}")
 
     print("Initializing AdvancedTransactionCategorizationModel for MAML...")
+    # Ensure the MAML target head type matches the config
+    maml_target_label = 'user' if args.user_label_col else 'global'
+
     model = AdvancedTransactionCategorizationModel(
         model_config=model_config,
         learning_rate=args.meta_lr, # Use meta_lr for the outer loop optimizer
         weight_decay=args.weight_decay,
         focal_loss_alpha=args.focal_alpha,
         focal_loss_gamma=args.focal_gamma,
-        # Add MAML specific hyperparameters
+        # MAML specific hyperparameters
         use_maml=True,
         inner_lr=args.inner_lr,
         adaptation_steps=args.adaptation_steps,
-        maml_head_label_type='user' # Assuming MAML adapts the user_specific_head
+        maml_head_label_type=maml_target_label,
+        # <<< Pass the raw DataFrame >>>
+        full_data_ref=transactions_df
     )
 
     # --- 4. Configure Trainer --- 
@@ -259,6 +288,9 @@ if __name__ == '__main__':
     # parser.add_argument('--grad_clip', type=float, default=0.0, help='Gradient clipping value. 0 to disable. (Manual handling needed for MAML)')
     parser.add_argument('--run_test', action='store_true', help='Run testing phase after training.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
+
+    # <<< Add config path argument >>>
+    parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML base model configuration file.')
 
     args = parser.parse_args()
     main(args) 
