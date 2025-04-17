@@ -75,4 +75,85 @@ The model is designed to achieve high accuracy and F1 scores by leveraging:
 
 ## License
 
-MIT License 
+MIT License
+
+## Standard Training (Multi-Task Learning)
+
+To train the model using the standard multi-task learning setup (predicting both global and user-specific categories simultaneously if configured), use the `train.py` script.
+
+```bash
+python train.py \\
+    --data_path path/to/your/transactions.csv \\
+    --config_path path/to/your/model_config.yaml \\
+    --user_id_col user_id \\
+    --global_label_col category_id \\
+    --user_label_col user_category_id \\
+    --timestamp_col books_create_timestamp \\
+    --text_cols raw_description memo merchant_name \\
+    --amount_col amount \\
+    --batch_size 64 \\
+    --max_epochs 100 \\
+    --learning_rate 1e-4 \\
+    --weight_decay 1e-5 \\
+    --accelerator gpu \\
+    --devices 1 \\
+    --log_dir ./training_logs \\
+    --experiment_name standard_training_run \\
+    --logger tensorboard \\
+    # Add other relevant arguments from train.py
+```
+
+Refer to `train.py --help` for a full list of arguments and their descriptions. The model configuration (encoder details, fusion parameters, etc.) is primarily controlled via the YAML file specified by `--config_path`.
+
+
+## Meta-Learning for Cold-Start Adaptation (MAML)
+
+To address the user-specific cold-start problem (adapting the model quickly to new users with few transactions), this project implements Model-Agnostic Meta-Learning (MAML). The goal is to learn a model initialization (specifically for the user-specific classification head) that can be rapidly fine-tuned using a small support set (K-shot) of transactions from a new user.
+
+The meta-learning process is handled by the `train_maml.py` script and the `data/maml_data_module.py` data loader.
+
+### MAML Training Usage
+
+The `train_maml.py` script orchestrates the meta-training process. It requires a dataset and MAML-specific hyperparameters.
+
+```bash
+python train_maml.py \\
+    --data_path path/to/your/transactions.csv \\
+    --user_id_col user_id \\
+    --user_label_col user_category_id \\
+    --timestamp_col books_create_timestamp \\
+    --k_shot 5 \\
+    --q_query 10 \\
+    --meta_batch_size 16 \\
+    --inner_lr 0.01 \\
+    --adaptation_steps 1 \\
+    --meta_lr 1e-4 \\
+    --max_epochs 50 \\
+    --accelerator gpu \\
+    --devices 1 \\
+    --log_dir ./maml_logs \\
+    --experiment_name maml_training_run \\
+    # Specify which base encoders to use if applicable (defaults may vary)
+    # --use_sequence \\
+    # --use_text \\
+    # Add other relevant arguments from train_maml.py --help
+```
+
+**Key MAML Arguments:**
+
+*   `--data_path`: Path to the transaction data (CSV format expected).
+*   `--user_id_col`: Column containing unique user identifiers.
+*   `--user_label_col`: Column containing the user-specific labels that the MAML head will adapt to (e.g., `user_category_id`).
+*   `--k_shot`: Number of support examples per user task (K).
+*   `--q_query`: Number of query examples per user task (Q). Used for calculating the meta-loss.
+*   `--meta_batch_size`: Number of user tasks to process in each meta-batch.
+*   `--inner_lr`: Learning rate for the inner loop adaptation steps.
+*   `--adaptation_steps`: Number of gradient steps performed in the inner loop for each task.
+*   `--meta_lr`: Learning rate for the outer loop meta-optimizer (updates the initial head parameters).
+
+Refer to `train_maml.py --help` for all available arguments. Note that the base model configuration (encoders, fusion) is currently defined with placeholders within `train_maml.py` and should be adjusted based on your specific data and requirements. Ideally, this would load from a config file similar to the standard training script.
+
+**Important:** MAML training requires the `learn2learn` library. Ensure it's installed (`pip install learn2learn`).
+
+
+## Evaluation 
