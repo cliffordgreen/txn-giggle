@@ -124,7 +124,21 @@ def main(args):
         model_config['graph_encoder_params'].pop('metadata', None)
         # GNN metadata should ideally be derived *within* the model or DataModule
         # based on the actual graph structure if GNN is truly used in MAML base.
-        print("[WARN] GNN usage in MAML base model is complex. Ensure config and feature fetching align or disable GNN.")
+        # <<< UPDATED: Load metadata if path provided >>>
+        if args.metadata_path and os.path.exists(args.metadata_path):
+             try:
+                  print(f"Loading pre-computed metadata from: {args.metadata_path}")
+                  loaded_metadata = torch.load(args.metadata_path)
+                  model_config['graph_encoder_params']['metadata'] = loaded_metadata
+                  print("Metadata loaded successfully.")
+             except Exception as e:
+                  print(f"[ERROR] Failed to load metadata from {args.metadata_path}: {e}")
+                  # Decide whether to exit or proceed without GNN
+                  print("[WARN] Proceeding without GNN due to metadata loading error.")
+                  model_config['use_gnn_encoder'] = False
+        elif args.use_gnn:
+             print(f"[WARN] --use_gnn=True but no valid --metadata_path ('{args.metadata_path}') provided. Disabling GNN.")
+             model_config['use_gnn_encoder'] = False
 
     print(f"Final Model Config: {model_config}")
 
@@ -321,6 +335,8 @@ if __name__ == '__main__':
 
     # <<< Add config path argument >>>
     parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML base model configuration file.')
+    # <<< Add metadata path argument >>>
+    parser.add_argument('--metadata_path', type=str, default='config/graph_metadata.pt', help='Path to pre-computed graph metadata file (.pt).')
 
     # Add an argument parser option for the checkpoint path
     parser.add_argument('--load_pretrained_ckpt', type=str, default=None, help='Path to a pre-trained model checkpoint to initialize MAML.')
