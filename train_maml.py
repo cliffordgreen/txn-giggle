@@ -147,6 +147,24 @@ def main(args):
         full_data_ref=transactions_df
     )
 
+    # --- Load Pre-trained Checkpoint (Non-Strictly) BEFORE training --- 
+    if args.load_pretrained_ckpt:
+        if os.path.exists(args.load_pretrained_ckpt):
+            print(f"Loading weights MANUALLY from pre-trained checkpoint (strict=False): {args.load_pretrained_ckpt}")
+            try:
+                # Load checkpoint data
+                checkpoint = torch.load(args.load_pretrained_ckpt, map_location=model.device)
+                # Load state dict non-strictly
+                missing_keys, unexpected_keys = model.load_state_dict(checkpoint['state_dict'], strict=False)
+                if missing_keys: print(f"[WARN] Checkpoint load missing keys: {missing_keys}")
+                if unexpected_keys: print(f"[INFO] Checkpoint load ignored unexpected keys: {unexpected_keys}")
+                print("Manual non-strict weight loading finished.")
+            except Exception as e:
+                 print(f"[ERROR] Failed to manually load checkpoint {args.load_pretrained_ckpt}: {e}")
+                 print("[WARN] Proceeding without loading pre-trained weights.")
+        else:
+            print(f"[WARN] Pre-trained checkpoint not found at: {args.load_pretrained_ckpt}. Starting from scratch.")
+
     # --- 4. Configure Trainer --- 
     print("Configuring PyTorch Lightning Trainer...")
 
@@ -206,17 +224,19 @@ def main(args):
     # --- 5. Start Meta-Training ---
     print("--- Starting Meta-Training --- ")
     # Check if a pretrained checkpoint path is provided
-    fit_kwargs = {}
-    if args.load_pretrained_ckpt:
-        if os.path.exists(args.load_pretrained_ckpt):
-            print(f"Loading weights from pre-trained checkpoint: {args.load_pretrained_ckpt}")
-            fit_kwargs['ckpt_path'] = args.load_pretrained_ckpt
-        else:
-            print(f"[WARN] Pre-trained checkpoint not found at: {args.load_pretrained_ckpt}. Starting from scratch.")
+    # --- REMOVED: Loading is now done manually above --- 
+    # fit_kwargs = {}
+    # if args.load_pretrained_ckpt:
+    #     if os.path.exists(args.load_pretrained_ckpt):
+    #         print(f"Loading weights from pre-trained checkpoint: {args.load_pretrained_ckpt}")
+    #         fit_kwargs['ckpt_path'] = args.load_pretrained_ckpt
+    #     else:
+    #         print(f"[WARN] Pre-trained checkpoint not found at: {args.load_pretrained_ckpt}. Starting from scratch.")
 
     try:
         # Pass ckpt_path to trainer.fit if provided
-        trainer.fit(model, datamodule=maml_dm, **fit_kwargs)
+        # --- MODIFIED: Removed ckpt_path from fit call --- 
+        trainer.fit(model, datamodule=maml_dm)
         print("--- Meta-Training Finished --- ")
     except Exception as e:
         print(f"[ERROR] Training failed: {e}")
