@@ -43,7 +43,24 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         self.save_hyperparameters('learning_rate', 'weight_decay',
                                 'mtl_weights', 'focal_loss_alpha', 'focal_loss_gamma',
                                 'use_maml', 'inner_lr', 'adaptation_steps', 'maml_head_label_type')
-        # Store complex configs manually (needed if loading from checkpoint)
+
+        # <<< FIX: Explicitly set use_maml AFTER save_hyperparameters >>>
+        # This ensures the value passed during init isn't overwritten by potential
+        # checkpoint hparam loading during save_hyperparameters call.
+        self.hparams.use_maml = use_maml # Use the argument passed to __init__
+
+        # --- MAML Setup --- 
+        if self.hparams.use_maml:
+             print("[INFO] MAML Mode Enabled.")
+             self.automatic_optimization = False # Essential for MAML's manual optimization
+             # Check if the target MAML head exists
+             if self.hparams.maml_head_label_type == 'user' and model_config.get('num_user_classes', 0) == 0:
+                  raise ValueError("MAML target is 'user', but num_user_classes is 0 in model_config.")
+             if self.hparams.maml_head_label_type == 'global' and model_config.get('num_global_classes', 0) == 0:
+                  raise ValueError("MAML target is 'global', but num_global_classes is 0 in model_config.")
+             print(f"[INFO] MAML will adapt the '{self.hparams.maml_head_label_type}' head.")
+
+        # Store complex configs manually
         self._model_config = model_config
         self._graph_config = model_config.get('graph_encoder_params', {}) # Handle missing key
         self._sequence_config = model_config.get('sequence_encoder_params', {})
@@ -211,6 +228,13 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                  num_classes=num_scheduleC_classes
              )
              print("[INFO] Schedule C Focal Loss Initialized.")
+
+        # Store complex configs manually (needed if loading from checkpoint)
+        self._model_config = model_config
+        self._graph_config = model_config.get('graph_encoder_params', {}) # Handle missing key
+        self._sequence_config = model_config.get('sequence_encoder_params', {})
+        self._text_config = model_config.get('text_encoder_params', {})
+        self._fusion_config = model_config.get('fusion_params', {})
 
     def forward(self,
                 graph_batch: Optional[HeteroData] = None,
