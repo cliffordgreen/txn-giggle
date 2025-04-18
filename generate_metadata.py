@@ -61,21 +61,30 @@ def main(args):
     try:
         metadata = data_module.full_graph_data.metadata()
         print(f"Successfully extracted metadata: {metadata}")
+        if hasattr(data_module, 'node_feature_dims') and data_module.node_feature_dims:
+             node_dims = data_module.node_feature_dims
+             print(f"Successfully extracted node_feature_dims: {node_dims}")
+        else:
+             print("[ERROR] Could not extract 'node_feature_dims' from DataModuleV2.")
+             return
     except Exception as e:
-        print(f"[ERROR] Failed to extract metadata from graph: {e}")
+        print(f"[ERROR] Failed to extract metadata or node_dims from graph: {e}")
         return
 
-    # --- 5. Save Metadata ---
+    # --- 5. Save Metadata & Node Dims ---
     output_path = args.output_path
-    print(f"Saving metadata to: {output_path}")
+    print(f"Saving metadata and node_dims to: {output_path}")
+    data_to_save = {
+        'metadata': metadata,
+        'node_feature_dims': node_dims
+    }
     try:
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        torch.save(metadata, output_path)
-        print("Metadata saved successfully.")
+        torch.save(data_to_save, output_path)
+        print("Metadata and node_dims saved successfully.")
     except Exception as e:
-        print(f"[ERROR] Failed to save metadata to {output_path}: {e}")
-        return
+        print(f"[ERROR] Failed to save data to {output_path}: {e}")
 
     print("--- Metadata Generation Finished ---")
 

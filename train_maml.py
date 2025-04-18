@@ -124,15 +124,28 @@ def main(args):
         model_config['graph_encoder_params'].pop('metadata', None)
         # GNN metadata should ideally be derived *within* the model or DataModule
         # based on the actual graph structure if GNN is truly used in MAML base.
-        # <<< UPDATED: Load metadata if path provided >>>
+        # <<< UPDATED: Load metadata AND node_dims if path provided >>>
         if args.metadata_path and os.path.exists(args.metadata_path):
              try:
-                  print(f"Loading pre-computed metadata from: {args.metadata_path}")
-                  loaded_metadata = torch.load(args.metadata_path)
-                  model_config['graph_encoder_params']['metadata'] = loaded_metadata
-                  print("Metadata loaded successfully.")
+                  print(f"Loading pre-computed metadata and node dims from: {args.metadata_path}")
+                  # <<< Load the dictionary >>>
+                  loaded_data = torch.load(args.metadata_path)
+                  # <<< Unpack metadata and node_dims >>>
+                  loaded_metadata = loaded_data.get('metadata')
+                  loaded_node_dims = loaded_data.get('node_feature_dims')
+
+                  if loaded_metadata and loaded_node_dims:
+                       # Ensure graph_encoder_params exists
+                       if 'graph_encoder_params' not in model_config: model_config['graph_encoder_params'] = {}
+                       model_config['graph_encoder_params']['metadata'] = loaded_metadata
+                       # <<< Set in_channels >>>
+                       model_config['graph_encoder_params']['in_channels'] = loaded_node_dims
+                       print("Metadata and node_feature_dims loaded successfully.")
+                       print(f"  Loaded node_feature_dims: {loaded_node_dims}") # Debug print
+                  else:
+                       raise ValueError("Loaded file missing 'metadata' or 'node_feature_dims' keys.")
              except Exception as e:
-                  print(f"[ERROR] Failed to load metadata from {args.metadata_path}: {e}")
+                  print(f"[ERROR] Failed to load metadata/node_dims from {args.metadata_path}: {e}")
                   # Decide whether to exit or proceed without GNN
                   print("[WARN] Proceeding without GNN due to metadata loading error.")
                   model_config['use_gnn_encoder'] = False
