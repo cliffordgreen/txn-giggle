@@ -940,9 +940,11 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
                 # --- Inner Loop Adaptation ---
                 learner = l2l.clone_module(original_head)
-                inner_optimizer = torch.optim.SGD(learner.parameters(), lr=self.hparams.inner_lr)
+                # --- REMOVE Standard Inner Optimizer ---
+                # inner_optimizer = torch.optim.SGD(learner.parameters(), lr=self.hparams.inner_lr)
 
                 for _ in range(self.hparams.adaptation_steps):
+                    # 1. Get features
                     graph_batch_supp, seq_batch_supp, text_batch_supp, user_ids_supp = self._get_features_for_indices(support_indices)
                     with torch.no_grad():
                         support_fused = self.get_fused_features(
@@ -951,11 +953,24 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                             batch_size=len(support_indices)
                         )
                     if support_fused is None: print(f"[WARN] Inner Loop: Could not get fused features for support set. Skipping adapt step."); break
+                    
+                    # 2. Calculate loss with adapted learner
                     support_preds = learner(support_fused)
                     inner_loss = loss_fn(support_preds, support_labels)
-                    inner_optimizer.zero_grad()
-                    inner_loss.backward()
-                    inner_optimizer.step()
+
+                    # 3. Adapt the learner using learn2learn utilities (FOMAML style)
+                    # Calculate gradients w.r.t. learner's parameters
+                    grads = torch.autograd.grad(inner_loss, 
+                                                learner.parameters(), 
+                                                create_graph=False) # create_graph=False for FOMAML
+                    
+                    # Manually update the learner's parameters
+                    l2l.optim.utils.update_module(learner, updates=grads, lr=self.hparams.inner_lr)
+                    
+                    # No inner_optimizer step needed
+                    # inner_optimizer.zero_grad()
+                    # inner_loss.backward()
+                    # inner_optimizer.step()
 
                 # --- Outer Loop Evaluation ---
                 graph_batch_qry, seq_batch_qry, text_batch_qry, user_ids_qry = self._get_features_for_indices(query_indices)
