@@ -103,11 +103,20 @@ class MAMLTaskDataset(Dataset):
         if not query_pool_indices_rel:
             # Should not happen due to __init__ filtering (needs K+1)
              print(f"[WARN] User {user_id} has no samples left for query set after taking K_shot={self.K_shot}.")
-             query_indices_rel = []
-        elif self.Q_query == -1 or self.Q_query >= len(query_pool_indices_rel):
-            # Use all remaining if Q_query is -1 or larger than available
-            query_indices_rel = query_pool_indices_rel
+             # Return empty tensors of the expected query size if possible?
+             # For simplicity, we might rely on upstream filtering or error handling if this occurs.
+             query_indices_rel = [] # Keep as empty list, handle potential downstream errors
+        elif self.Q_query == -1:
+             # Using -1 for Q_query is problematic with default collate_fn
+             # Returning all remaining - requires custom collate or will likely error
+             print("[WARN] Q_query=-1 used. Default collate_fn will likely fail. Consider fixed Q_query or custom collate.")
+             query_indices_rel = query_pool_indices_rel
+        elif len(query_pool_indices_rel) < self.Q_query:
+            # <<< FIX: Sample with replacement if pool is too small >>>
+            print(f"[WARN] User {user_id}: Query pool ({len(query_pool_indices_rel)}) < Q_query ({self.Q_query}). Sampling with replacement.")
+            query_indices_rel = random.choices(query_pool_indices_rel, k=self.Q_query)
         else:
+            # <<< Standard case: Sample without replacement >>>
             query_indices_rel = random.sample(query_pool_indices_rel, self.Q_query)
 
 
