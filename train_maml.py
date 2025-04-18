@@ -222,7 +222,8 @@ def main(args):
             monitor='train/meta_outer_loss', # <<< Monitor training loss instead of validation
             patience=args.early_stopping_patience,
             mode='min', # <<< Mode should be 'min' for loss
-            verbose=True
+            verbose=True,
+            check_finite=False # <<< Add this to prevent crash if metric not available initially
         )
         callbacks.append(early_stopping_callback)
 
@@ -243,9 +244,11 @@ def main(args):
         # Checkpointing is handled by the callback
         enable_checkpointing=True,
         # Progress bar
-        enable_progress_bar=True
+        enable_progress_bar=True,
         # MAML requires manual optimization handled within the LightningModule
         # automatic_optimization=False # This should be set *inside* the LightningModule
+        # <<< Disable validation sanity check >>>
+        num_sanity_val_steps=0
     )
 
     # --- 5. Start Meta-Training ---
