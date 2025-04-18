@@ -122,8 +122,13 @@ class MAMLTaskDataset(Dataset):
 
         # --- Get Original DataFrame Indices and Labels ---
         # Retrieve data using the relative indices obtained from sampling
-        support_df_slice = self.df_filtered.loc[support_indices_rel]
-        query_df_slice = self.df_filtered.loc[query_indices_rel]
+        # Add a check for empty query_indices_rel before accessing .loc
+        if not query_indices_rel:
+             support_df_slice = self.df_filtered.loc[support_indices_rel]
+             query_df_slice = pd.DataFrame(columns=self.df_filtered.columns) # Empty DataFrame
+        else:
+             support_df_slice = self.df_filtered.loc[support_indices_rel]
+             query_df_slice = self.df_filtered.loc[query_indices_rel]
 
         # Extract original indices (important for model to fetch correct features)
         support_original_indices = torch.tensor(support_df_slice['original_index'].values, dtype=torch.long)
@@ -133,7 +138,35 @@ class MAMLTaskDataset(Dataset):
         support_labels = torch.tensor(support_df_slice[self.label_column].values, dtype=torch.long)
         query_labels = torch.tensor(query_df_slice[self.label_column].values, dtype=torch.long)
 
-        # Basic check
+        # --- Defensive Check & Padding/Truncation for Query Set Size --- 
+        # Ensure query tensors match Q_query size, except when Q_query is -1
+        expected_q_len = -1
+        if self.Q_query != -1:
+             expected_q_len = self.Q_query
+
+        if expected_q_len != -1 and query_original_indices.shape[0] != expected_q_len:
+             print(f"[DEBUG] User {user_id}: Adjusting query tensor size. Initial size: {query_original_indices.shape[0]}, Expected: {expected_q_len}")
+             if query_original_indices.numel() == 0: # If empty due to some error
+                  # Pad with dummy values (e.g., -1 index, -1 label)
+                  query_original_indices = torch.full((expected_q_len,), -1, dtype=torch.long)
+                  query_labels = torch.full((expected_q_len,), -1, dtype=torch.long)
+                  print(f"[WARN] User {user_id}: Query tensors were empty, padding to size {expected_q_len} with -1.")
+             elif query_original_indices.shape[0] < expected_q_len:
+                  # Pad by repeating the last element (simple padding strategy)
+                  num_pad = expected_q_len - query_original_indices.shape[0]
+                  last_idx = query_original_indices[-1].unsqueeze(0).repeat(num_pad)
+                  last_lbl = query_labels[-1].unsqueeze(0).repeat(num_pad)
+                  query_original_indices = torch.cat([query_original_indices, last_idx], dim=0)
+                  query_labels = torch.cat([query_labels, last_lbl], dim=0)
+                  print(f"[DEBUG] User {user_id}: Padded query tensors to size {expected_q_len}.")
+             else: # query_original_indices.shape[0] > expected_q_len (Shouldn't happen with current logic, but handle)
+                  # Truncate
+                  query_original_indices = query_original_indices[:expected_q_len]
+                  query_labels = query_labels[:expected_q_len]
+                  print(f"[WARN] User {user_id}: Truncated query tensors to size {expected_q_len}.")
+
+
+        # Basic check (redundant after padding/truncation but keep for sanity)
         if len(support_original_indices) != self.K_shot and len(user_data_indices) >= self.K_shot :
              print(f"[WARN] Mismatch in support set size for user {user_id}. Expected {self.K_shot}, Got {len(support_original_indices)}")
         if self.Q_query != -1 and len(query_original_indices) != min(self.Q_query, len(query_pool_indices_rel)) and query_pool_indices_rel:

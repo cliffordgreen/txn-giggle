@@ -219,9 +219,9 @@ def main(args):
 
     if args.early_stopping_patience > 0:
         early_stopping_callback = EarlyStopping(
-            monitor='val/meta_query_acc', # Monitor meta-validation query accuracy
+            monitor='train/meta_outer_loss', # <<< Monitor training loss instead of validation
             patience=args.early_stopping_patience,
-            mode='max',
+            mode='min', # <<< Mode should be 'min' for loss
             verbose=True
         )
         callbacks.append(early_stopping_callback)
