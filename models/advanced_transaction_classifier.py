@@ -524,27 +524,160 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                 - user_specific_logits: Tensor of user-specific class logits.
                 - scheduleC_logits: Tensor of schedule C class logits.
         """
-        # Ensure all inputs are on the correct device
+        # Ensure other inputs are on the correct device
         device = self.device
-        if graph_batch:
+        if graph_batch is not None and hasattr(graph_batch, 'to'): # Check if graph_batch can be moved
             graph_batch = graph_batch.to(device)
-        if sequence_batch:
+        if sequence_batch is not None:
             sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in sequence_batch.items()}
-        if text_batch:
-            text_batch = [t.to(device) for t in text_batch]
-        if user_ids:
+        if user_ids is not None:
             user_ids = user_ids.to(device)
 
-        # Forward pass through the model
-        global_logits, user_specific_logits, scheduleC_logits = self(
-            graph_batch=graph_batch,
-            sequence_batch=sequence_batch,
-            text_batch=text_batch,
-            user_ids=user_ids,
-            batch_size=batch_size
-        )
+        embeddings_to_fuse = {}
+        graph_embed = None
 
-        return global_logits, user_specific_logits, scheduleC_logits
+        # --- 1. Graph Encoding ---
+        if self.graph_encoder and graph_batch:
+            try:
+                # Pass both x_dict and edge_index_dict
+                node_embeddings_dict = self.graph_encoder(graph_batch.x_dict, graph_batch.edge_index_dict)
+
+                if 'transaction' in node_embeddings_dict:
+                     if batch_size is None:
+                          if user_ids is not None: batch_size = user_ids.shape[0]
+                          # Add fallback using maybe _raw_text length if text_encoder is on?
+                          elif self.use_text_encoder and text_batch is not None: batch_size = len(text_batch)
+                          else: raise ValueError("Forward pass needs batch_size if graph_batch is provided.")
+
+                     num_nodes_in_batch_output = node_embeddings_dict['transaction'].shape[0]
+                     if batch_size > num_nodes_in_batch_output:
+                         print(f"[WARN] Forward: batch_size ({batch_size}) > GNN output nodes ({num_nodes_in_batch_output}). Slicing available nodes.")
+                         graph_embed = node_embeddings_dict['transaction'][:num_nodes_in_batch_output]
+                     elif batch_size > 0:
+                          graph_embed = node_embeddings_dict['transaction'][:batch_size]
+                     # else: batch_size might be 0, graph_embed remains None
+
+                     if graph_embed is not None and graph_embed.shape[0] > 0: # Check size > 0
+                         embeddings_to_fuse['graph'] = graph_embed.to(self.device)
+                     elif batch_size > 0: # Only warn if batch_size was expected to be > 0
+                          print("[WARN] Forward: HGT 'transaction' embedding is None or empty after slicing.")
+
+                else:
+                    print("[WARN] Forward: HGT output missing 'transaction' embeddings.")
+            except Exception as e:
+                print(f"[ERROR] HGT Encoder forward failed: {e}")
+                import traceback
+                traceback.print_exc() # Print full traceback for GNN errors
+
+        # --- 2. Sequence Encoding ---
+        if self.sequence_encoder and sequence_batch is not None:
+            try:
+                seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
+                if seq_embed is not None and seq_embed.shape[0] > 0:
+                    # Ensure batch size matches graph if graph is used
+                    if graph_embed is not None and seq_embed.shape[0] != graph_embed.shape[0]:
+                         print(f"[ERROR] Forward: Sequence batch size ({seq_embed.shape[0]}) mismatch with Graph ({graph_embed.shape[0]})")
+                    else:
+                        embeddings_to_fuse['sequence'] = seq_embed.to(self.device)
+                elif graph_embed is not None and graph_embed.shape[0] > 0: # Check if expected based on graph
+                    print("[WARN] Forward: TFT output is None or empty.")
+            except Exception as e:
+                print(f"[ERROR] TFT Encoder forward failed: {e}")
+
+        # --- 3. Text Encoding ---
+        if self.text_encoder and text_batch is not None:
+            try:
+                text_embed = self.text_encoder(text_batch)
+                if text_embed is not None and text_embed.shape[0] > 0:
+                    # Ensure batch size matches graph if graph is used
+                    ref_shape = graph_embed.shape[0] if graph_embed is not None else (seq_embed.shape[0] if 'sequence' in embeddings_to_fuse else None)
+                    if ref_shape is not None and text_embed.shape[0] != ref_shape:
+                         print(f"[ERROR] Forward: Text batch size ({text_embed.shape[0]}) mismatch with reference ({ref_shape})")
+                    else:
+                         embeddings_to_fuse['text'] = text_embed.to(self.device)
+                elif ref_shape is not None and ref_shape > 0: # Check if expected
+                    print("[WARN] Forward: FinBERT output is None or empty.")
+
+            except Exception as e:
+                print(f"[ERROR] FinBERT Encoder forward failed: {e}")
+
+        # --- 4. User Embedding ---
+        if self.user_embedding and user_ids is not None:
+             # Check if num_users > 0 before trying to embed
+            if self.user_embedding.num_embeddings > 0:
+                try:
+                    # Clamp user_ids to be safe
+                    user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
+                    user_embed = self.user_embedding(user_ids_clamped.to(self.device))
+                    if user_embed is not None and user_embed.shape[0] > 0:
+                        # Ensure batch size matches graph if graph is used
+                        ref_shape = graph_embed.shape[0] if graph_embed is not None else (embeddings_to_fuse.get('sequence', embeddings_to_fuse.get('text', None)).shape[0] if embeddings_to_fuse else None)
+                        if ref_shape is not None and user_embed.shape[0] != ref_shape:
+                            print(f"[ERROR] Forward: User ID batch size ({user_embed.shape[0]}) mismatch with reference ({ref_shape})")
+                        else:
+                            embeddings_to_fuse['user'] = user_embed.to(self.device)
+                    elif ref_shape is not None and ref_shape > 0: # Check if expected
+                         print("[WARN] Forward: User embedding is None or empty.")
+                except Exception as e:
+                    print(f"[ERROR] User Embedding forward failed: {e}")
+            else:
+                print("[WARN] Forward: Skipping user embedding as num_users is 0.")
+
+
+        # --- Pre-Fusion Checks ---
+        if not embeddings_to_fuse:
+            print("[ERROR] Forward: No embeddings available for fusion.")
+            return None, None, None # Return three Nones
+
+        ref_batch_size = None
+        first_key = next(iter(embeddings_to_fuse))
+        ref_batch_size = embeddings_to_fuse[first_key].shape[0]
+
+        if ref_batch_size == 0:
+             print("[WARN] Forward: Fusion input batch size is 0. Returning None.")
+             return None, None, None
+
+        for name, emb in embeddings_to_fuse.items():
+             if emb.shape[0] != ref_batch_size:
+                  print(f"[ERROR] Forward: Mismatched batch size for {name}: {emb.shape[0]} vs {ref_batch_size}. Skipping fusion.")
+                  return None, None, None
+             if emb.device != self.device:
+                  print(f"[ERROR] Forward: Embedding {name} is on wrong device: {emb.device} vs {self.device}. Skipping fusion.")
+                  return None, None, None
+
+        # --- 5. Fusion ---
+        fused_representation = None
+        try:
+            fused_representation, _ = self.fusion_module(embeddings_to_fuse)
+        except Exception as e:
+             print(f"[ERROR] Fusion module forward failed: {e}")
+             return None, None, None # Return Nones if fusion fails
+
+        # --- 6. Classify ---
+        global_logits = None
+        user_specific_logits = None
+        scheduleC_logits = None # Initialize
+
+        if fused_representation is None:
+             print("[ERROR] Forward: Fused representation is None after fusion module.")
+             return None, None, None
+
+        try:
+            if self.global_head:
+                 global_logits = self.global_head(fused_representation)
+            if self.user_specific_head:
+                 user_specific_logits = self.user_specific_head(fused_representation)
+            # <<< Conditional Schedule C Classification >>>
+            if self.scheduleC_head:
+                 scheduleC_logits = self.scheduleC_head(fused_representation)
+        except Exception as e:
+             print(f"[ERROR] Classifier head forward failed: {e}")
+             # Return Nones based on which heads exist
+             return (None if self.global_head else global_logits,
+                     None if self.user_specific_head else user_specific_logits,
+                     None if self.scheduleC_head else scheduleC_logits)
+
+        return global_logits, user_specific_logits, scheduleC_logits # Return all three
 
     def _calculate_mtl_loss(self,
                               global_logits: Optional[torch.Tensor], global_target: Optional[torch.Tensor],

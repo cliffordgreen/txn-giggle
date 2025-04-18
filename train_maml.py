@@ -31,6 +31,16 @@ def main(args):
         print(f"[ERROR] Failed to load data: {e}")
         return
 
+    # <<< Add user_id_code preprocessing step HERE >>>
+    # This ensures the column exists before passing df to DataModule and Model
+    print("Adding 'user_id_code' to main DataFrame...")
+    if args.user_id_col not in transactions_df.columns:
+        print(f"[ERROR] Cannot create 'user_id_code': Specified user ID column '{args.user_id_col}' not found.")
+        return
+    user_codes, _ = pd.factorize(transactions_df[args.user_id_col], sort=True)
+    transactions_df['user_id_code'] = user_codes
+    print("'user_id_code' column added.")
+
     # --- 2. Initialize MAML DataModule ---
     print("Initializing MAMLTransactionDataModule...")
     maml_dm = MAMLTransactionDataModule(
@@ -51,12 +61,11 @@ def main(args):
     print("Setting up MAML DataModule to derive config...")
     try:
         maml_dm.setup(stage='fit') # Call setup explicitly
-        # <<< Add preprocessing step for user_id_code if MAMLDataModule doesn't do it >>>
-        # This ensures the original DataFrame passed to the model has the necessary code
-        if 'user_id_code' not in transactions_df.columns and hasattr(maml_dm, 'user_id_column') and maml_dm.user_id_column in transactions_df.columns:
-            print("Adding 'user_id_code' to DataFrame for model reference...")
-            user_codes, _ = pd.factorize(transactions_df[maml_dm.user_id_column], sort=True)
-            transactions_df['user_id_code'] = user_codes
+        # <<< REMOVE preprocessing step from here - moved earlier >>>
+        # if 'user_id_code' not in transactions_df.columns and hasattr(maml_dm, 'user_id_column') and maml_dm.user_id_column in transactions_df.columns:
+        #     print("Adding 'user_id_code' to DataFrame for model reference...")
+        #     user_codes, _ = pd.factorize(transactions_df[maml_dm.user_id_column], sort=True)
+        #     transactions_df['user_id_code'] = user_codes
 
         print("MAML DataModule setup complete.")
     except Exception as e:
