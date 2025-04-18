@@ -71,20 +71,18 @@ def main(args):
         print(f"[ERROR] Failed to extract metadata or node_dims from graph: {e}")
         return
 
-    # --- 5. Save Metadata & Node Dims ---
+    # --- 5. Save Full Graph Data ---
     output_path = args.output_path
-    print(f"Saving metadata and node_dims to: {output_path}")
-    data_to_save = {
-        'metadata': metadata,
-        'node_feature_dims': node_dims
-    }
+    print(f"Saving full graph data object to: {output_path}")
+    # Save the entire HeteroData object
+    data_to_save = data_module.full_graph_data
     try:
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         torch.save(data_to_save, output_path)
-        print("Metadata and node_dims saved successfully.")
+        print("Full graph data saved successfully.")
     except Exception as e:
-        print(f"[ERROR] Failed to save data to {output_path}: {e}")
+        print(f"[ERROR] Failed to save graph data to {output_path}: {e}")
 
     print("--- Metadata Generation Finished ---")
 

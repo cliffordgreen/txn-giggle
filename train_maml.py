@@ -101,6 +101,31 @@ def main(args):
         print(f"[ERROR] Failed to load or parse base config file {args.config_path}: {e}")
         return # Exit if config loading fails
 
+    # --- Load Full Graph Data --- 
+    full_graph_data = None
+    loaded_metadata = None
+    loaded_node_dims = None
+    if args.use_gnn: # Only load graph if GNN is intended to be used
+        if args.graph_data_path and os.path.exists(args.graph_data_path):
+            print(f"Loading full graph data from: {args.graph_data_path}")
+            try:
+                full_graph_data = torch.load(args.graph_data_path)
+                if not hasattr(full_graph_data, 'metadata') or not hasattr(full_graph_data, 'x_dict'):
+                     raise TypeError("Loaded object is not a valid graph data object with metadata/x_dict.")
+                # Extract metadata and node dims for config
+                loaded_metadata = full_graph_data.metadata()
+                loaded_node_dims = {node_type: data.x.shape[1] for node_type, data in full_graph_data.items() if hasattr(data, 'x')}
+                print(f"Graph data loaded. Metadata: {loaded_metadata}")
+                print(f"Graph node dims: {loaded_node_dims}")
+            except Exception as e:
+                print(f"[ERROR] Failed to load graph data from {args.graph_data_path}: {e}. Disabling GNN.")
+                args.use_gnn = False # Disable GNN if loading fails
+                full_graph_data = None # Ensure it's None
+        else:
+            print(f"[WARN] --use_gnn=True but --graph_data_path ('{args.graph_data_path}') not found or invalid. Disabling GNN.")
+            args.use_gnn = False # Disable GNN if path invalid
+            model_config['use_gnn_encoder'] = False # Ensure config reflects this
+
     # --- Construct Final Model Config --- 
     # Start with base config, then override with dynamic/essential values
     model_config = base_config.copy()
@@ -115,7 +140,16 @@ def main(args):
     model_config['num_global_classes'] = 0 # Assume global head is not adapted/used in MAML
 
     # Ensure sub-dictionaries exist if needed based on flags
-    if args.use_gnn and 'graph_encoder_params' not in model_config: model_config['graph_encoder_params'] = {}
+    if args.use_gnn and loaded_metadata and loaded_node_dims:
+        print("Updating model config with loaded GNN metadata and node dims...")
+        if 'graph_encoder_params' not in model_config: model_config['graph_encoder_params'] = {}
+        model_config['graph_encoder_params']['metadata'] = loaded_metadata
+        model_config['graph_encoder_params']['in_channels'] = loaded_node_dims
+    elif 'graph_encoder_params' in model_config: # Remove graph params if GNN disabled
+         if not args.use_gnn:
+              print("Removing graph_encoder_params from config as GNN is disabled.")
+              del model_config['graph_encoder_params']
+
     if args.use_sequence and 'sequence_encoder_params' not in model_config: model_config['sequence_encoder_params'] = {}
     if args.use_text and 'text_encoder_params' not in model_config: model_config['text_encoder_params'] = {}
     if 'fusion_params' not in model_config: model_config['fusion_params'] = {}
@@ -126,43 +160,7 @@ def main(args):
         # Add other necessary text_encoder defaults if not in YAML
         if 'model_name' not in model_config['text_encoder_params']: model_config['text_encoder_params']['model_name'] = 'ProsusAI/finbert'
 
-    # Remove placeholder/dummy values that might have been in the original script's example
-    # The base_config loaded from YAML should contain the correct parameters.
-    if args.use_gnn:
-        # Remove potentially incorrect dummy metadata if loaded config doesn't have it
-        model_config['graph_encoder_params'].pop('metadata', None)
-        # GNN metadata should ideally be derived *within* the model or DataModule
-        # based on the actual graph structure if GNN is truly used in MAML base.
-        # <<< UPDATED: Load metadata AND node_dims if path provided >>>
-        if args.metadata_path and os.path.exists(args.metadata_path):
-             try:
-                  print(f"Loading pre-computed metadata and node dims from: {args.metadata_path}")
-                  # <<< Load the dictionary >>>
-                  loaded_data = torch.load(args.metadata_path)
-                  # <<< Unpack metadata and node_dims >>>
-                  loaded_metadata = loaded_data.get('metadata')
-                  loaded_node_dims = loaded_data.get('node_feature_dims')
-
-                  if loaded_metadata and loaded_node_dims:
-                       # Ensure graph_encoder_params exists
-                       if 'graph_encoder_params' not in model_config: model_config['graph_encoder_params'] = {}
-                       model_config['graph_encoder_params']['metadata'] = loaded_metadata
-                       # <<< Set in_channels >>>
-                       model_config['graph_encoder_params']['in_channels'] = loaded_node_dims
-                       print("Metadata and node_feature_dims loaded successfully.")
-                       print(f"  Loaded node_feature_dims: {loaded_node_dims}") # Debug print
-                  else:
-                       raise ValueError("Loaded file missing 'metadata' or 'node_feature_dims' keys.")
-             except Exception as e:
-                  print(f"[ERROR] Failed to load metadata/node_dims from {args.metadata_path}: {e}")
-                  # Decide whether to exit or proceed without GNN
-                  print("[WARN] Proceeding without GNN due to metadata loading error.")
-                  model_config['use_gnn_encoder'] = False
-        elif args.use_gnn:
-             print(f"[WARN] --use_gnn=True but no valid --metadata_path ('{args.metadata_path}') provided. Disabling GNN.")
-             model_config['use_gnn_encoder'] = False
-
-    print(f"Final Model Config: {model_config}")
+    print(f"Final Model Config (before model init): {model_config}")
 
     print("Initializing AdvancedTransactionCategorizationModel for MAML...")
     # Ensure the MAML target head type matches the config
@@ -179,8 +177,8 @@ def main(args):
         inner_lr=args.inner_lr,
         adaptation_steps=args.adaptation_steps,
         maml_head_label_type=maml_target_label,
-        # <<< Pass the raw DataFrame >>>
-        full_data_ref=transactions_df
+        # <<< Pass the loaded graph data object >>>
+        full_data_ref=full_graph_data
     )
 
     # --- Load Pre-trained Checkpoint (Non-Strictly) BEFORE training --- 
@@ -360,8 +358,8 @@ if __name__ == '__main__':
 
     # <<< Add config path argument >>>
     parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML base model configuration file.')
-    # <<< Add metadata path argument >>>
-    parser.add_argument('--metadata_path', type=str, default='config/graph_metadata.pt', help='Path to pre-computed graph metadata file (.pt).')
+    # <<< Change metadata_path to graph_data_path >>>
+    parser.add_argument('--graph_data_path', type=str, default='config/graph_data.pt', help='Path to pre-computed graph data file (.pt) containing features and metadata.')
 
     # Add an argument parser option for the checkpoint path
     parser.add_argument('--load_pretrained_ckpt', type=str, default=None, help='Path to a pre-trained model checkpoint to initialize MAML.')
