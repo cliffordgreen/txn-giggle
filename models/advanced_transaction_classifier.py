@@ -49,8 +49,11 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         # checkpoint hparam loading during save_hyperparameters call.
         self.hparams.use_maml = use_maml # Use the argument passed to __init__
 
+        # <<< Store flag reliably for runtime checks >>>
+        self._use_maml_runtime_flag = use_maml
+
         # --- MAML Setup --- 
-        if self.hparams.use_maml:
+        if self._use_maml_runtime_flag:
              print("[INFO] MAML Mode Enabled.")
              self.automatic_optimization = False # Essential for MAML's manual optimization
              # Check if the target MAML head exists
@@ -78,7 +81,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
         # Store references (NOT saved as hparams)
         self._full_data_ref = full_data_ref # Store reference for MAML feature fetching
-        if self.hparams.use_maml and self._full_data_ref is None:
+        if self._use_maml_runtime_flag and self._full_data_ref is None:
              print("[WARN] MAML mode enabled but full_data_ref (raw DataFrame) was not provided to the model. Feature fetching will fail.")
 
         # <<< Store modality flags from config >>>
@@ -864,13 +867,104 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
     # --- Standard Lightning Hooks ---
     def training_step(self, batch: Any, batch_idx: int) -> Optional[torch.Tensor]:
-        return self._step(batch, batch_idx, stage='train')
+        # <<< Use reliable runtime flag for dispatch >>>
+        if self._use_maml_runtime_flag:
+            # Ensure batch is structured correctly if default collate was used
+            if isinstance(batch, dict) and 'support' in batch and 'query' in batch:
+                 # Reconstruct list of tasks if collated
+                 try:
+                     num_tasks = len(batch['user_id']) # Assuming user_id marks tasks
+                     batch_of_tasks = []
+                     for i in range(num_tasks):
+                          # Check if indices/labels are tensors or lists of tensors
+                          # Adapt access based on how collate_fn might structure it
+                          support_indices = batch['support'][0][i] if isinstance(batch['support'][0], list) else batch['support'][0][i] # Adapt slice/index
+                          support_labels = batch['support'][1][i] if isinstance(batch['support'][1], list) else batch['support'][1][i] # Adapt slice/index
+                          query_indices = batch['query'][0][i] if isinstance(batch['query'][0], list) else batch['query'][0][i]   # Adapt slice/index
+                          query_labels = batch['query'][1][i] if isinstance(batch['query'][1], list) else batch['query'][1][i]    # Adapt slice/index
+                          user_id = batch['user_id'][i] # Assume user_id is indexable
+
+                          task = {
+                              'support': (support_indices, support_labels),
+                              'query': (query_indices, query_labels),
+                              'user_id': user_id
+                          }
+                          batch_of_tasks.append(task)
+                     return self.meta_training_step(batch_of_tasks, batch_idx) # Pass reconstructed list
+                 except Exception as e:
+                      print(f"[ERROR] Failed to reconstruct MAML batch in training_step: {e}")
+                      print(f"Batch type: {type(batch)}, Batch keys: {batch.keys() if isinstance(batch, dict) else 'N/A'}")
+                      return None # Skip batch if reconstruction fails
+            elif isinstance(batch, list): # Already a list of tasks
+                 return self.meta_training_step(batch, batch_idx)
+            else:
+                 print(f"[ERROR] training_step: Unexpected batch type for MAML: {type(batch)}")
+                 return None
+        else:
+            # Call renamed standard step method
+            return self._standard_step(batch, batch_idx, stage='train')
 
     def validation_step(self, batch: Any, batch_idx: int) -> None:
-        self._step(batch, batch_idx, stage='val')
+        stage = 'val'
+        # <<< Use reliable runtime flag for dispatch >>>
+        if self._use_maml_runtime_flag:
+             # Similar batch restructuring logic as training_step if needed
+             if isinstance(batch, dict) and 'support' in batch and 'query' in batch:
+                  try:
+                      num_tasks = len(batch['user_id'])
+                      batch_of_tasks = []
+                      for i in range(num_tasks):
+                           # Simplified reconstruction (adapt based on actual collate behavior)
+                           support_indices = batch['support'][0][i]
+                           support_labels = batch['support'][1][i]
+                           query_indices = batch['query'][0][i]
+                           query_labels = batch['query'][1][i]
+                           user_id = batch['user_id'][i]
+                           batch_of_tasks.append({
+                               'support': (support_indices, support_labels),
+                               'query': (query_indices, query_labels),
+                               'user_id': user_id
+                           })
+                      self._meta_eval_step(batch_of_tasks, batch_idx, stage=stage)
+                  except Exception as e:
+                       print(f"[ERROR] Failed to reconstruct MAML batch in validation_step: {e}")
+             elif isinstance(batch, list):
+                  self._meta_eval_step(batch, batch_idx, stage=stage)
+             else: print(f"[ERROR] {stage}_step: Unexpected batch type for MAML: {type(batch)}")
+        else:
+            # Call renamed standard step method
+            self._standard_step(batch, batch_idx, stage=stage)
 
     def test_step(self, batch: Any, batch_idx: int) -> None:
-        self._step(batch, batch_idx, stage='test')
+        stage = 'test'
+        # <<< Use reliable runtime flag for dispatch >>>
+        if self._use_maml_runtime_flag:
+             # Similar batch restructuring logic as training_step if needed
+             if isinstance(batch, dict) and 'support' in batch and 'query' in batch:
+                  try:
+                     num_tasks = len(batch['user_id'])
+                     batch_of_tasks = []
+                     for i in range(num_tasks):
+                          # Simplified reconstruction (adapt based on actual collate behavior)
+                          support_indices = batch['support'][0][i]
+                          support_labels = batch['support'][1][i]
+                          query_indices = batch['query'][0][i]
+                          query_labels = batch['query'][1][i]
+                          user_id = batch['user_id'][i]
+                          batch_of_tasks.append({
+                              'support': (support_indices, support_labels),
+                              'query': (query_indices, query_labels),
+                              'user_id': user_id
+                          })
+                     self._meta_eval_step(batch_of_tasks, batch_idx, stage=stage)
+                  except Exception as e:
+                      print(f"[ERROR] Failed to reconstruct MAML batch in test_step: {e}")
+             elif isinstance(batch, list):
+                  self._meta_eval_step(batch, batch_idx, stage=stage)
+             else: print(f"[ERROR] {stage}_step: Unexpected batch type for MAML: {type(batch)}")
+        else:
+            # Call renamed standard step method
+            self._standard_step(batch, batch_idx, stage=stage)
 
     def configure_optimizers(self):
         # TODO: Implement differential LR (e.g., lower LR for text encoder) if needed
