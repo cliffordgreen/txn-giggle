@@ -4,6 +4,7 @@ import pytorch_lightning as pl
 from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
 import numpy as np
+import learn2learn as l2l
 
 # Import components from other files in the 'models' directory
 from .hgt_encoder import HGT
@@ -869,19 +870,23 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
     def training_step(self, batch: Any, batch_idx: int) -> Optional[torch.Tensor]:
         # <<< Use reliable runtime flag for dispatch >>>
         if self._use_maml_runtime_flag:
-            # Ensure batch is structured correctly if default collate was used
+            meta_optimizer = self.optimizers() # Get meta-optimizer for manual update
+            meta_optimizer.zero_grad()
+
+            # --- Process Batch of Tasks --- 
+            batch_of_tasks = None
+            # Handle potential collation by default DataLoader
             if isinstance(batch, dict) and 'support' in batch and 'query' in batch:
                  # Reconstruct list of tasks if collated
                  try:
                      num_tasks = len(batch['user_id']) # Assuming user_id marks tasks
-                     batch_of_tasks = []
+                     reconstructed_batch = []
                      for i in range(num_tasks):
-                          # Check if indices/labels are tensors or lists of tensors
                           # Adapt access based on how collate_fn might structure it
-                          support_indices = batch['support'][0][i] if isinstance(batch['support'][0], list) else batch['support'][0][i] # Adapt slice/index
-                          support_labels = batch['support'][1][i] if isinstance(batch['support'][1], list) else batch['support'][1][i] # Adapt slice/index
-                          query_indices = batch['query'][0][i] if isinstance(batch['query'][0], list) else batch['query'][0][i]   # Adapt slice/index
-                          query_labels = batch['query'][1][i] if isinstance(batch['query'][1], list) else batch['query'][1][i]    # Adapt slice/index
+                          support_indices = batch['support'][0][i] # Assuming first dim is batch
+                          support_labels = batch['support'][1][i]
+                          query_indices = batch['query'][0][i]
+                          query_labels = batch['query'][1][i]
                           user_id = batch['user_id'][i] # Assume user_id is indexable
 
                           task = {
@@ -889,17 +894,99 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                               'query': (query_indices, query_labels),
                               'user_id': user_id
                           }
-                          batch_of_tasks.append(task)
-                     return self.meta_training_step(batch_of_tasks, batch_idx) # Pass reconstructed list
+                          reconstructed_batch.append(task)
+                     batch_of_tasks = reconstructed_batch # Use reconstructed list
                  except Exception as e:
                       print(f"[ERROR] Failed to reconstruct MAML batch in training_step: {e}")
                       print(f"Batch type: {type(batch)}, Batch keys: {batch.keys() if isinstance(batch, dict) else 'N/A'}")
                       return None # Skip batch if reconstruction fails
             elif isinstance(batch, list): # Already a list of tasks
-                 return self.meta_training_step(batch, batch_idx)
+                 batch_of_tasks = batch
             else:
                  print(f"[ERROR] training_step: Unexpected batch type for MAML: {type(batch)}")
                  return None
+
+            if batch_of_tasks is None: return None # Exit if batch processing failed
+
+            # --- MAML Inner/Outer Loop Logic (Moved here from non-existent meta_training_step) --- 
+            total_outer_loss = 0.0
+            avg_query_acc = 0.0
+            tasks_processed = 0
+
+            target_head_attr = f"{self.hparams.maml_head_label_type}_head"
+            target_loss_attr = f"focal_loss_{self.hparams.maml_head_label_type}"
+            if not hasattr(self, target_head_attr) or getattr(self, target_head_attr) is None:
+                print(f"[ERROR] MAML target head '{target_head_attr}' not found or is None.")
+                return None
+            if not hasattr(self, target_loss_attr) or getattr(self, target_loss_attr) is None:
+                print(f"[ERROR] MAML target loss '{target_loss_attr}' not found or is None.")
+                return None
+
+            original_head = getattr(self, target_head_attr)
+            loss_fn = getattr(self, target_loss_attr)
+
+            for task_data in batch_of_tasks:
+                support_indices, support_labels = task_data['support']
+                query_indices, query_labels = task_data['query']
+
+                support_labels = support_labels.to(self.device)
+                query_labels = query_labels.to(self.device)
+
+                if support_indices.numel() == 0 or query_indices.numel() == 0:
+                    print(f"[WARN] Skipping task for user {task_data.get('user_id', 'Unknown')} due to empty support/query indices.")
+                    continue
+
+                # --- Inner Loop Adaptation ---
+                learner = l2l.clone_module(original_head)
+                inner_optimizer = torch.optim.SGD(learner.parameters(), lr=self.hparams.inner_lr)
+
+                for _ in range(self.hparams.adaptation_steps):
+                    graph_batch_supp, seq_batch_supp, text_batch_supp, user_ids_supp = self._get_features_for_indices(support_indices)
+                    with torch.no_grad():
+                        support_fused = self.get_fused_features(
+                            graph_batch=graph_batch_supp, sequence_batch=seq_batch_supp,
+                            text_batch=text_batch_supp, user_ids=user_ids_supp,
+                            batch_size=len(support_indices)
+                        )
+                    if support_fused is None: print(f"[WARN] Inner Loop: Could not get fused features for support set. Skipping adapt step."); break
+                    support_preds = learner(support_fused)
+                    inner_loss = loss_fn(support_preds, support_labels)
+                    inner_optimizer.zero_grad()
+                    inner_loss.backward()
+                    inner_optimizer.step()
+
+                # --- Outer Loop Evaluation ---
+                graph_batch_qry, seq_batch_qry, text_batch_qry, user_ids_qry = self._get_features_for_indices(query_indices)
+                with torch.no_grad():
+                    query_fused = self.get_fused_features(
+                        graph_batch=graph_batch_qry, sequence_batch=seq_batch_qry,
+                        text_batch=text_batch_qry, user_ids=user_ids_qry,
+                        batch_size=len(query_indices)
+                    )
+                    if query_fused is None: print(f"[WARN] Outer Loop: Could not get fused features for query set. Skipping task."); continue
+                    query_preds = learner(query_fused)
+                    outer_loss = loss_fn(query_preds, query_labels)
+
+                # --- Accumulate Results --- 
+                if not torch.isnan(outer_loss).any() and not torch.isinf(outer_loss).any():
+                     total_outer_loss += outer_loss
+                     avg_query_acc += self._calculate_accuracy(query_preds, query_labels)
+                     tasks_processed += 1
+                else:
+                     print(f"[WARN] Outer loss is NaN/Inf for user {task_data.get('user_id', 'Unknown')}. Skipping task.")
+
+            # --- Meta-Update --- 
+            if tasks_processed > 0:
+                avg_outer_loss = total_outer_loss / tasks_processed
+                avg_query_acc /= tasks_processed
+                self.manual_backward(avg_outer_loss) # Calculate gradients for original_head
+                meta_optimizer.step() # Update original_head
+                self.log(f'train/meta_outer_loss', avg_outer_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=tasks_processed, sync_dist=True)
+                self.log(f'train/meta_query_acc', avg_query_acc, on_step=False, on_epoch=True, prog_bar=True, batch_size=tasks_processed, sync_dist=True)
+                return avg_outer_loss
+            else:
+                print("[WARN] No tasks processed in meta-batch. Skipping meta-update.")
+                return None # No loss to return
         else:
             # Call renamed standard step method
             return self._standard_step(batch, batch_idx, stage='train')
