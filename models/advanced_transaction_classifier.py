@@ -913,7 +913,9 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             avg_query_acc = 0.0
             tasks_processed = 0
 
-            target_head_attr = f"{self.hparams.maml_head_label_type}_head"
+            # <<< FIX: Correct attribute name construction >>>
+            target_head_attr = f"{self.hparams.maml_head_label_type}_specific_head"
+            # Loss name seems correct already
             target_loss_attr = f"focal_loss_{self.hparams.maml_head_label_type}"
             if not hasattr(self, target_head_attr) or getattr(self, target_head_attr) is None:
                 print(f"[ERROR] MAML target head '{target_head_attr}' not found or is None.")
@@ -1016,6 +1018,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                   except Exception as e:
                        print(f"[ERROR] Failed to reconstruct MAML batch in validation_step: {e}")
              elif isinstance(batch, list):
+                  # <<< FIX: Pass correct target head attribute name here too >>>
                   self._meta_eval_step(batch, batch_idx, stage=stage)
              else: print(f"[ERROR] {stage}_step: Unexpected batch type for MAML: {type(batch)}")
         else:
@@ -1047,6 +1050,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                   except Exception as e:
                       print(f"[ERROR] Failed to reconstruct MAML batch in test_step: {e}")
              elif isinstance(batch, list):
+                  # <<< FIX: Pass correct target head attribute name here too >>>
                   self._meta_eval_step(batch, batch_idx, stage=stage)
              else: print(f"[ERROR] {stage}_step: Unexpected batch type for MAML: {type(batch)}")
         else:
