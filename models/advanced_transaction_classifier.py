@@ -501,6 +501,85 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         # Return fetched features (Graph is None)
         return graph_batch, sequence_batch, text_batch, user_ids
 
+    def _get_fused_representation(self,
+                                  graph_batch: Optional[HeteroData] = None,
+                                  sequence_batch: Optional[Any] = None,
+                                  text_batch: Optional[List[str]] = None,
+                                  user_ids: Optional[torch.Tensor] = None,
+                                  batch_size: Optional[int] = None
+                                 ) -> Optional[torch.Tensor]:
+        """Internal helper to run encoders and fusion module, returning only the fused tensor."""
+        # Ensure inputs other than text are on the correct device
+        device = self.device
+        if graph_batch is not None and hasattr(graph_batch, 'to'): graph_batch = graph_batch.to(device)
+        if sequence_batch is not None: sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in sequence_batch.items()}
+        if user_ids is not None: user_ids = user_ids.to(device)
+
+        embeddings_to_fuse = {}
+        graph_embed = None
+
+        # --- 1. Graph Encoding --- (Skipped if self.graph_encoder is None)
+        if self.graph_encoder and graph_batch:
+            try:
+                node_embeddings_dict = self.graph_encoder(graph_batch.x_dict, graph_batch.edge_index_dict)
+                if 'transaction' in node_embeddings_dict:
+                    tx_embeds = node_embeddings_dict['transaction']
+                    current_bs = batch_size if batch_size is not None else (user_ids.shape[0] if user_ids is not None else (len(text_batch) if text_batch is not None else tx_embeds.shape[0]))
+                    num_nodes_in_batch_output = tx_embeds.shape[0]
+                    effective_bs = min(current_bs, num_nodes_in_batch_output)
+                    if effective_bs > 0:
+                        graph_embed = tx_embeds[:effective_bs]
+                        if graph_embed.shape[0] > 0: embeddings_to_fuse['graph'] = graph_embed # Move to device handled above
+                    # Optional: Add warning if effective_bs < current_bs
+                # else: print("[WARN] Fuse: HGT output missing 'transaction' embeddings.") # Reduce noise
+            except Exception as e: print(f"[ERROR] Fuse (Graph): {e}")
+
+        # --- 2. Sequence Encoding --- (Skipped if self.sequence_encoder is None)
+        if self.sequence_encoder and sequence_batch is not None:
+            try:
+                seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
+                if seq_embed is not None and seq_embed.shape[0] > 0:
+                    # Basic batch size check
+                    ref_len = graph_embed.shape[0] if graph_embed is not None else (len(text_batch) if text_batch else None)
+                    if ref_len is not None and seq_embed.shape[0] != ref_len: pass # Mismatch handled in fusion check
+                    embeddings_to_fuse['sequence'] = seq_embed # Move to device handled above
+            except Exception as e: print(f"[ERROR] Fuse (Sequence): {e}")
+
+        # --- 3. Text Encoding --- (Skipped if self.text_encoder is None)
+        if self.text_encoder and text_batch is not None:
+             if text_batch: # Ensure not empty
+                 try:
+                     text_embed = self.text_encoder(text_batch) # Encoder handles device placement
+                     if text_embed is not None and text_embed.shape[0] > 0:
+                          embeddings_to_fuse['text'] = text_embed
+                 except Exception as e: print(f"[ERROR] Fuse (Text): {e}")
+
+        # --- 4. User Embedding --- (Skipped if self.user_embedding is None)
+        if self.user_embedding and user_ids is not None:
+            if self.user_embedding.num_embeddings > 0:
+                try:
+                    user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
+                    user_embed = self.user_embedding(user_ids_clamped) # Move to device handled above
+                    if user_embed is not None and user_embed.shape[0] > 0: embeddings_to_fuse['user'] = user_embed
+                except Exception as e: print(f"[ERROR] Fuse (User): {e}")
+
+        # --- Pre-Fusion Checks & Fusion --- 
+        if not embeddings_to_fuse: return None
+
+        expected_bs = None
+        for name, emb in embeddings_to_fuse.items():
+            current_bs = emb.shape[0]
+            if expected_bs is None: expected_bs = current_bs
+            elif current_bs != expected_bs: print(f"[ERROR] Fuse: Mismatched batch sizes {name}:{current_bs} vs {expected_bs}"); return None
+            if emb.device != self.device: print(f"[ERROR] Fuse: {name} on wrong device {emb.device}"); return None
+        if expected_bs == 0: return None
+
+        try:
+            fused_representation, _ = self.fusion_module(embeddings_to_fuse)
+            return fused_representation
+        except Exception as e:
+             print(f"[ERROR] Fusion module failed: {e}"); return None
+
     def get_fused_features(self,
                            graph_batch: Optional[HeteroData] = None,
                            sequence_batch: Optional[Any] = None,
@@ -1079,12 +1158,12 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                 for _ in range(self.hparams.adaptation_steps):
                     # 1. Get features
                     graph_batch_supp, seq_batch_supp, text_batch_supp, user_ids_supp = self._get_features_for_indices(support_indices)
-                    with torch.no_grad():
-                        support_fused = self.get_fused_features(
-                            graph_batch=graph_batch_supp, sequence_batch=seq_batch_supp,
-                            text_batch=text_batch_supp, user_ids=user_ids_supp,
-                            batch_size=len(support_indices)
-                        )
+                    # <<< Use _get_fused_representation >>>
+                    support_fused = self._get_fused_representation(
+                        graph_batch=graph_batch_supp, sequence_batch=seq_batch_supp,
+                        text_batch=text_batch_supp, user_ids=user_ids_supp,
+                        batch_size=len(support_indices)
+                    )
                     if support_fused is None: print(f"[WARN] Inner Loop: Could not get fused features for support set. Skipping adapt step."); break
                     
                     # 2. Calculate loss with adapted learner
@@ -1107,13 +1186,16 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
                 # --- Outer Loop Evaluation ---
                 graph_batch_qry, seq_batch_qry, text_batch_qry, user_ids_qry = self._get_features_for_indices(query_indices)
+                # <<< Use _get_fused_representation >>>
+                query_fused = self._get_fused_representation(
+                    graph_batch=graph_batch_qry, sequence_batch=seq_batch_qry,
+                    text_batch=text_batch_qry, user_ids=user_ids_qry,
+                    batch_size=len(query_indices)
+                )
+                if query_fused is None: print(f"[WARN] Outer Loop: Could not get fused features for query set. Skipping task."); continue
+                
+                # <<< No grad needed for query evaluation only >>>
                 with torch.no_grad():
-                    query_fused = self.get_fused_features(
-                        graph_batch=graph_batch_qry, sequence_batch=seq_batch_qry,
-                        text_batch=text_batch_qry, user_ids=user_ids_qry,
-                        batch_size=len(query_indices)
-                    )
-                    if query_fused is None: print(f"[WARN] Outer Loop: Could not get fused features for query set. Skipping task."); continue
                     query_preds = learner(query_fused)
                     outer_loss = loss_fn(query_preds, query_labels)
 
