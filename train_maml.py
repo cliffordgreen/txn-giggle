@@ -5,129 +5,74 @@ import argparse
 import os
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-import yaml # <<< Import YAML
+import yaml
 
 # Import your custom modules
 from models.advanced_transaction_classifier import AdvancedTransactionCategorizationModel # Assuming MAML modifications
-from data.maml_data_module import MAMLTransactionDataModule
+from data.maml_data_module import MAMLTransactionDataModule # Assuming you rename the file or class
 
 def main(args):
-    print("--- Starting MAML Training Script ---")
+    print("--- Starting MAML Training Script (Using Refactored DataModule) ---")
     print(f"Arguments: {args}")
 
     # Set seed for reproducibility
     pl.seed_everything(args.seed, workers=True)
 
-    # --- 1. Load Data ---
-    print(f"Loading transaction data from: {args.data_path}")
-    try:
-        transactions_df = pd.read_csv(args.data_path)
-        # Optional: Add basic data validation here (e.g., check required columns)
-        print(f"Loaded DataFrame with shape: {transactions_df.shape}")
-    except FileNotFoundError:
-        print(f"[ERROR] Data file not found at {args.data_path}")
-        return
-    except Exception as e:
-        print(f"[ERROR] Failed to load data: {e}")
-        return
-
-    # <<< Add user_id_code preprocessing step HERE >>>
-    # This ensures the column exists before passing df to DataModule and Model
-    print("Adding 'user_id_code' to main DataFrame...")
-    if args.user_id_col not in transactions_df.columns:
-        print(f"[ERROR] Cannot create 'user_id_code': Specified user ID column '{args.user_id_col}' not found.")
-        return
-    user_codes, _ = pd.factorize(transactions_df[args.user_id_col], sort=True)
-    transactions_df['user_id_code'] = user_codes
-    print("'user_id_code' column added.")
-
-    # --- 2. Initialize MAML DataModule ---
-    print("Initializing MAMLTransactionDataModule...")
-    maml_dm = MAMLTransactionDataModule(
-        transactions_df=transactions_df,
-        user_id_column=args.user_id_col,
-        label_column=args.global_label_col, # Base label
-        user_label_column=args.user_label_col, # User-specific label for MAML adaptation
-        timestamp_column=args.timestamp_col,
-        K_shot=args.k_shot,
-        Q_query=args.q_query,
-        meta_batch_size=args.meta_batch_size,
-        num_workers=args.num_workers,
-        meta_val_ratio=args.meta_val_ratio,
-        meta_test_ratio=args.meta_test_ratio,
-        seed=args.seed
-    )
-    # --- Setup DataModule FIRST to get data-dependent config values ---
-    print("Setting up MAML DataModule to derive config...")
-    try:
-        maml_dm.setup(stage='fit') # Call setup explicitly
-        # <<< REMOVE preprocessing step from here - moved earlier >>>
-        # if 'user_id_code' not in transactions_df.columns and hasattr(maml_dm, 'user_id_column') and maml_dm.user_id_column in transactions_df.columns:
-        #     print("Adding 'user_id_code' to DataFrame for model reference...")
-        #     user_codes, _ = pd.factorize(transactions_df[maml_dm.user_id_column], sort=True)
-        #     transactions_df['user_id_code'] = user_codes
-
-        print("MAML DataModule setup complete.")
-    except Exception as e:
-        print(f"[ERROR] Failed during MAML DataModule setup: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
-    # --- 3. Initialize Model (Configured for MAML) ---
-    print("Configuring model with values derived from data...")
-
-    # Get necessary dims/counts from the setup DataModule instance
-    num_users = maml_dm.num_users
-    # Use the number of classes calculated for the specific MAML target label
-    num_maml_target_classes = maml_dm.num_maml_classes
-    # NOTE: Other config parts (GNN, sequence, text encoders, global classes) are
-    #       still using placeholders below. This assumes they are either:
-    #       a) Not used (base model is frozen and features fetched separately)
-    #       b) Loaded from a pre-trained checkpoint where these configs don't matter
-    #       c) Will be loaded/configured through a more robust config system.
-    #       For MAML adapting only the user head, num_users and num_user_classes are most critical.
-
-    # --- Load Base Config from YAML --- 
+    # --- 1. Load Base Configuration ---
     print(f"Loading base model configuration from: {args.config_path}")
     try:
         with open(args.config_path, 'r') as f:
             base_config = yaml.safe_load(f)
         print("Base model configuration loaded successfully.")
     except FileNotFoundError:
-        print(f"[WARN] Base configuration file not found at {args.config_path}. Using command-line args and defaults only.")
+        print(f"[WARN] Base configuration file not found at {args.config_path}. Using defaults/command-line args only.")
         base_config = {} # Start with empty dict if file not found
     except Exception as e:
         print(f"[ERROR] Failed to load or parse base config file {args.config_path}: {e}")
-        return # Exit if config loading fails
+        return
 
-    # --- Load Full Graph Data --- 
-    full_graph_data = None
-    loaded_metadata = None
-    loaded_node_dims = None
-    if args.use_gnn: # Only load graph if GNN is intended to be used
-        if args.graph_data_path and os.path.exists(args.graph_data_path):
-            print(f"Loading full graph data from: {args.graph_data_path}")
-            try:
-                full_graph_data = torch.load(args.graph_data_path)
-                if not hasattr(full_graph_data, 'metadata') or not hasattr(full_graph_data, 'x_dict'):
-                     raise TypeError("Loaded object is not a valid graph data object with metadata/x_dict.")
-                # Extract metadata and node dims for config
-                loaded_metadata = full_graph_data.metadata()
-                loaded_node_dims = {node_type: data.x.shape[1] for node_type, data in full_graph_data.items() if hasattr(data, 'x')}
-                print(f"Graph data loaded. Metadata: {loaded_metadata}")
-                print(f"Graph node dims: {loaded_node_dims}")
-            except Exception as e:
-                print(f"[ERROR] Failed to load graph data from {args.graph_data_path}: {e}. Disabling GNN.")
-                args.use_gnn = False # Disable GNN if loading fails
-                full_graph_data = None # Ensure it's None
-        else:
-            print(f"[WARN] --use_gnn=True but --graph_data_path ('{args.graph_data_path}') not found or invalid. Disabling GNN.")
-            args.use_gnn = False # Disable GNN if path invalid
-            model_config['use_gnn_encoder'] = False # Ensure config reflects this
+    # --- 2. Initialize MAML DataModule (V2 - Loads Graph) ---
+    print("Initializing MAMLTransactionDataModule (V2)...")
+    # NOTE: We no longer pass the DataFrame directly here.
+    # The DataModule will load the graph file specified by graph_data_path.
+    maml_dm = MAMLTransactionDataModule( # Use the refactored class name
+        graph_data_path=args.graph_data_path, # Pass the path to the pre-built graph
+        user_id_column=args.user_id_col,
+        label_column=args.global_label_col, # Base label (if needed)
+        user_label_column=args.user_label_col, # User-specific label for MAML adaptation
+        # timestamp_column=args.timestamp_col, # Timestamp handling now inside DataModule/build_graph
+        K_shot=args.k_shot,
+        Q_query=args.q_query,
+        meta_batch_size=args.meta_batch_size,
+        num_workers=args.num_workers,
+        meta_val_ratio=args.meta_val_ratio,
+        meta_test_ratio=args.meta_test_ratio,
+        seed=args.seed,
+        # Pass modality flags if needed by DataModule init/setup
+        use_sequence_encoder=args.use_sequence,
+        use_text_encoder=args.use_text,
+        use_gnn_encoder=args.use_gnn
+    )
 
-    # --- Construct Final Model Config --- 
-    # Start with base config, then override with dynamic/essential values
+    # --- Setup DataModule FIRST to get data-dependent config values ---
+    print("Setting up MAML DataModule (V2) to derive config and process graph...")
+    try:
+        maml_dm.setup(stage='fit') # Call setup explicitly
+        print("MAML DataModule (V2) setup complete.")
+    except Exception as e:
+        print(f"[ERROR] Failed during MAML DataModule (V2) setup: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # --- 3. Initialize Model (Configured for MAML) ---
+    print("Configuring model with values derived from DataModule...")
+
+    # Get necessary dims/counts from the setup DataModule instance
+    num_users = maml_dm.num_users # Should still be calculated during user split
+    num_maml_target_classes = maml_dm.num_maml_classes # Should be calculated during label processing
+
+    # --- Construct Final Model Config ---
     model_config = base_config.copy()
 
     # Override specific keys with data-derived or essential MAML values
@@ -139,57 +84,93 @@ def main(args):
     model_config['num_user_classes'] = num_maml_target_classes # Set user classes based on MAML target
     model_config['num_global_classes'] = 0 # Assume global head is not adapted/used in MAML
 
-    # Ensure sub-dictionaries exist if needed based on flags
-    if args.use_gnn and loaded_metadata and loaded_node_dims:
-        print("Updating model config with loaded GNN metadata and node dims...")
-        if 'graph_encoder_params' not in model_config: model_config['graph_encoder_params'] = {}
-        model_config['graph_encoder_params']['metadata'] = loaded_metadata
-        model_config['graph_encoder_params']['in_channels'] = loaded_node_dims
-    elif 'graph_encoder_params' in model_config: # Remove graph params if GNN disabled
-         if not args.use_gnn:
-              print("Removing graph_encoder_params from config as GNN is disabled.")
-              del model_config['graph_encoder_params']
+    # Add/Update sub-configs based on DataModule results and flags
+    if args.use_gnn:
+        if not hasattr(maml_dm, 'node_feature_dims') or not maml_dm.node_feature_dims:
+             print("[WARN] GNN enabled, but DataModule did not provide node_feature_dims. Check DataModule setup.")
+             # Fallback or default? For now, let model init handle potential errors.
+        else:
+             print("Updating model config with GNN parameters from DataModule...")
+             if 'graph_encoder_params' not in model_config: model_config['graph_encoder_params'] = {}
+             # Metadata should ideally be saved with the graph, loaded by DataModule, and passed here
+             if hasattr(maml_dm, 'graph_metadata') and maml_dm.graph_metadata:
+                 model_config['graph_encoder_params']['metadata'] = maml_dm.graph_metadata
+             else:
+                 print("[WARN] DataModule did not provide graph_metadata. Model might fail if metadata is required.")
+             # Use scaled dimensions
+             model_config['graph_encoder_params']['in_channels'] = maml_dm.node_feature_dims
+             # Add edge dims if used by GNN model architecture
+             if hasattr(maml_dm, 'edge_feature_dims') and maml_dm.edge_feature_dims:
+                  model_config['graph_encoder_params']['edge_input_dims'] = maml_dm.edge_feature_dims
 
-    if args.use_sequence and 'sequence_encoder_params' not in model_config: model_config['sequence_encoder_params'] = {}
-    if args.use_text and 'text_encoder_params' not in model_config: model_config['text_encoder_params'] = {}
-    if 'fusion_params' not in model_config: model_config['fusion_params'] = {}
 
-    # Example: Update projection dim if text encoder is used
+    if args.use_sequence:
+         if 'sequence_encoder_params' not in model_config: model_config['sequence_encoder_params'] = {}
+         # Pass sequence dimension if needed by model (e.g. TFT wrapper needs output_dim)
+         if hasattr(maml_dm, 'sequence_feature_dim'):
+              # Assuming sequence_encoder takes raw sequence dim as input, not output
+              # This might need adjustment based on TFTWrapper specifics.
+              # model_config['sequence_encoder_params']['input_dim'] = maml_dm.sequence_feature_dim
+              pass # Adjust as needed based on sequence model config
+
     if args.use_text:
-        model_config['text_encoder_params']['finetune_text_encoder'] = False # Override, typically false for MAML
-        # Add other necessary text_encoder defaults if not in YAML
+        if 'text_encoder_params' not in model_config: model_config['text_encoder_params'] = {}
+        model_config['text_encoder_params']['finetune'] = False # Override, typically false for MAML
         if 'model_name' not in model_config['text_encoder_params']: model_config['text_encoder_params']['model_name'] = 'ProsusAI/finbert'
+        # Pass text model name if needed for tokenization alignment
+        model_config['text_encoder_params']['model_name'] = maml_dm.text_model_name
+
+    if 'fusion_params' not in model_config: model_config['fusion_params'] = {}
 
     print(f"Final Model Config (before model init): {model_config}")
 
     print("Initializing AdvancedTransactionCategorizationModel for MAML...")
-    # Ensure the MAML target head type matches the config
-    maml_target_label = 'user' if args.user_label_col else 'global'
+    maml_target_label = 'user' if args.user_label_col else 'global' # Should match DataModule target
 
+    # Loading PROCESSED graph data for MAML feature fetching...
+    processed_graph_path = 'config/processed_graph_data.pt' # Or wherever you save it
+    if not os.path.exists(processed_graph_path):
+        raise FileNotFoundError(f"Processed graph not found at {processed_graph_path}. Run the processing step first.")
+    processed_graph_data = torch.load(processed_graph_path)
+    print("Processed graph loaded.")
+
+    # <<< REMOVED: full_data_ref=full_graph_data >>>
+    # The model now gets features via MAMLTaskDataset indices and DataModule's graph ref
     model = AdvancedTransactionCategorizationModel(
         model_config=model_config,
-        learning_rate=args.meta_lr, # Use meta_lr for the outer loop optimizer
+        learning_rate=args.meta_lr,
         weight_decay=args.weight_decay,
         focal_loss_alpha=args.focal_alpha,
         focal_loss_gamma=args.focal_gamma,
-        # MAML specific hyperparameters
         use_maml=True,
         inner_lr=args.inner_lr,
         adaptation_steps=args.adaptation_steps,
         maml_head_label_type=maml_target_label,
-        # <<< Pass the loaded graph data object >>>
-        full_data_ref=full_graph_data
+        # <<< ADD: Pass reference to the loaded graph data from DataModule >>>
+        # This is needed for _get_features_for_indices in MAML mode
+        full_data_ref=processed_graph_data
     )
 
-    # --- Load Pre-trained Checkpoint (Non-Strictly) BEFORE training --- 
+    # --- Load Pre-trained Checkpoint (Manual, Non-Strict) ---
     if args.load_pretrained_ckpt:
         if os.path.exists(args.load_pretrained_ckpt):
             print(f"Loading weights MANUALLY from pre-trained checkpoint (strict=False): {args.load_pretrained_ckpt}")
             try:
-                # Load checkpoint data
                 checkpoint = torch.load(args.load_pretrained_ckpt, map_location=model.device)
-                # Load state dict non-strictly
+                # --- Checkpoint Loading Adaptation ---
+                # The state dict might need adjustment if keys changed due to refactoring
+                # (e.g., if GNN class name changed, keys might be different).
+                # Basic non-strict loading:
                 missing_keys, unexpected_keys = model.load_state_dict(checkpoint['state_dict'], strict=False)
+
+                # Advanced: Remap keys if needed (example)
+                # state_dict = checkpoint['state_dict']
+                # new_state_dict = {}
+                # for key, value in state_dict.items():
+                #     new_key = key # Modify key if needed, e.g., replace old GNN name
+                #     new_state_dict[new_key] = value
+                # missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+
                 if missing_keys: print(f"[WARN] Checkpoint load missing keys: {missing_keys}")
                 if unexpected_keys: print(f"[INFO] Checkpoint load ignored unexpected keys: {unexpected_keys}")
                 print("Manual non-strict weight loading finished.")
@@ -199,25 +180,30 @@ def main(args):
         else:
             print(f"[WARN] Pre-trained checkpoint not found at: {args.load_pretrained_ckpt}. Starting from scratch.")
 
-    # --- 4. Configure Trainer --- 
-    print("Configuring PyTorch Lightning Trainer...")
 
+    # --- 4. Configure Trainer ( Largely unchanged ) ---
+    print("Configuring PyTorch Lightning Trainer...")
     # Logger
     logger = None
     if args.logger == 'tensorboard':
         logger = TensorBoardLogger(args.log_dir, name=args.experiment_name)
     elif args.logger == 'wandb':
-        logger = WandbLogger(project=args.wandb_project, name=args.experiment_name, log_model=True)
-        # Watch model - BE CAREFUL with MAML due to manual optimization
-        # logger.watch(model, log='all', log_freq=100)
-    print(f"Using logger: {args.logger}")
+        # Ensure wandb is installed: pip install wandb
+        try:
+             logger = WandbLogger(project=args.wandb_project, name=args.experiment_name, log_model=True)
+        except ImportError:
+             print("[WARN] wandb logger selected but wandb is not installed. Disabling logger. Install with: pip install wandb")
+             logger = None # Disable logger if import fails
+    print(f"Using logger: {'wandb' if logger else args.logger}")
 
     # Callbacks
     callbacks = []
+    # Monitor meta-validation query accuracy (ensure metric name matches model logging)
+    checkpoint_monitor_metric = f'val/meta_query_acc_{maml_target_label}' # More specific monitor metric name
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(args.log_dir, args.experiment_name, 'checkpoints'),
-        filename='{epoch}-{step}-{val_meta_acc:.4f}', # Log meta-validation accuracy
-        monitor='val/meta_query_acc', # Monitor meta-validation query accuracy
+        filename=f'{{epoch}}-{{step}}-{{{checkpoint_monitor_metric}:.4f}}', # Use updated metric name
+        monitor=checkpoint_monitor_metric,
         mode='max',
         save_top_k=args.save_top_k,
         save_last=True
@@ -225,12 +211,14 @@ def main(args):
     callbacks.append(checkpoint_callback)
 
     if args.early_stopping_patience > 0:
+        # Monitor meta-training outer loop loss (ensure metric name matches model logging)
+        early_stop_monitor_metric = 'train/meta_outer_loss'
         early_stopping_callback = EarlyStopping(
-            monitor='train/meta_outer_loss', # <<< Monitor training loss instead of validation
+            monitor=early_stop_monitor_metric,
             patience=args.early_stopping_patience,
-            mode='min', # <<< Mode should be 'min' for loss
+            mode='min',
             verbose=True,
-            check_finite=False # <<< Add this to prevent crash if metric not available initially
+            check_finite=True # Re-enable check_finite, MAML loss should be valid
         )
         callbacks.append(early_stopping_callback)
 
@@ -244,63 +232,54 @@ def main(args):
         precision=args.precision,
         logger=logger,
         callbacks=callbacks,
-        # MAML requires manual optimization, so gradient clipping handled manually if needed
-        # gradient_clip_val=args.grad_clip, 
         log_every_n_steps=args.log_every_n_steps,
-        deterministic=True, # Ensure reproducibility
-        # Checkpointing is handled by the callback
+        deterministic=True,
         enable_checkpointing=True,
-        # Progress bar
         enable_progress_bar=True,
-        # MAML requires manual optimization handled within the LightningModule
-        # automatic_optimization=False # This should be set *inside* the LightningModule
-        # <<< Disable validation sanity check >>>
-        num_sanity_val_steps=0
+        num_sanity_val_steps=0 # Keep disabled for MAML
     )
 
     # --- 5. Start Meta-Training ---
     print("--- Starting Meta-Training --- ")
-    # Check if a pretrained checkpoint path is provided
-    # --- REMOVED: Loading is now done manually above --- 
-    # fit_kwargs = {}
-    # if args.load_pretrained_ckpt:
-    #     if os.path.exists(args.load_pretrained_ckpt):
-    #         print(f"Loading weights from pre-trained checkpoint: {args.load_pretrained_ckpt}")
-    #         fit_kwargs['ckpt_path'] = args.load_pretrained_ckpt
-    #     else:
-    #         print(f"[WARN] Pre-trained checkpoint not found at: {args.load_pretrained_ckpt}. Starting from scratch.")
-
     try:
-        # Pass ckpt_path to trainer.fit if provided
-        # --- MODIFIED: Removed ckpt_path from fit call --- 
-        trainer.fit(model, datamodule=maml_dm)
+        trainer.fit(model, datamodule=maml_dm) # Pass the refactored datamodule
         print("--- Meta-Training Finished --- ")
     except Exception as e:
         print(f"[ERROR] Training failed: {e}")
         import traceback
         traceback.print_exc()
-        return # Exit if training fails
+        return
 
     # --- 6. Start Meta-Testing (Optional) ---
     if args.run_test:
         print("--- Starting Meta-Testing --- ")
-        # Load best model checkpoint if needed
         best_model_path = checkpoint_callback.best_model_path
-        if best_model_path:
+        if best_model_path and os.path.exists(best_model_path):
             print(f"Loading best model from: {best_model_path}")
-            # Pass hparams_file=None if hyperparameters are saved in checkpoint
-            # Ensure model class can load MAML hparams correctly
-            test_model = AdvancedTransactionCategorizationModel.load_from_checkpoint(
-                 best_model_path, 
-                 # Pass necessary args if not saved in hparams
-                 # model_config=model_config, 
-                 # use_maml=True, inner_lr=args.inner_lr, ... 
-                 hparams_file=None 
-            )
-            trainer.test(test_model, datamodule=maml_dm)
+            try:
+                 # Reloading might require passing the graph_data_ref again if it's not saved in hparams
+                 # It's safer to reload hparams and pass the reference explicitly if needed.
+                 test_model = AdvancedTransactionCategorizationModel.load_from_checkpoint(
+                     best_model_path,
+                     hparams_file=None, # Assuming hparams saved in checkpoint
+                     # Provide essential arguments NOT saved in hparams, including the graph ref
+                     full_data_ref=processed_graph_data # Pass the loaded processed graph again
+                 )
+                 # Ensure the test datamodule is set up
+                 maml_dm.setup('test')
+                 trainer.test(test_model, datamodule=maml_dm)
+            except Exception as e:
+                 print(f"[ERROR] Failed to load best model or run test: {e}")
+                 traceback.print_exc()
         else:
-            print("[WARN] No best model checkpoint found. Testing with last trained model.")
-            trainer.test(model, datamodule=maml_dm) # Test with the model state after fit
+            print("[WARN] No best model checkpoint found or path invalid. Testing with last trained model.")
+            try:
+                 # Ensure the test datamodule is set up
+                 maml_dm.setup('test')
+                 trainer.test(model, datamodule=maml_dm) # Test with the model state after fit
+            except Exception as e:
+                 print(f"[ERROR] Failed to run test with last model: {e}")
+                 traceback.print_exc()
         print("--- Meta-Testing Finished --- ")
     else:
         print("Skipping meta-testing.")
@@ -309,18 +288,20 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='MAML Training Script for Transaction Categorization')
+    parser = argparse.ArgumentParser(description='MAML Training Script for Transaction Categorization (V2 - Refactored Data)')
 
     # --- Data Args ---
-    parser.add_argument('--data_path', type=str, required=True, help='Path to the transaction CSV file.')
-    parser.add_argument('--user_id_col', type=str, default='user_id', help='Column name for user IDs.')
-    parser.add_argument('--global_label_col', type=str, default='category_id', help='Column name for global category labels.')
+    # <<< REMOVED: data_path (now implied by graph_data_path) >>>
+    # parser.add_argument('--data_path', type=str, required=True, help='Path to the transaction CSV file.')
+    parser.add_argument('--graph_data_path', type=str, default='config/graph_data.pt', help='Path to the pre-built graph data file (.pt). Run build_graph.py first.')
+    parser.add_argument('--user_id_col', type=str, default='user_id', help='Column name for user IDs (used for splitting).')
+    parser.add_argument('--global_label_col', type=str, default='category_id', help='Column name for global category labels (if needed).')
     parser.add_argument('--user_label_col', type=str, default='user_category_id', help='Column name for user-specific category labels (MAML target).')
-    parser.add_argument('--timestamp_col', type=str, default='books_create_timestamp', help='Column name for timestamps.')
+    # parser.add_argument('--timestamp_col', type=str, default='books_create_timestamp', help='Column name for timestamps (used internally by DataModule).') # Handled internally
 
     # --- MAML DataModule Args ---
     parser.add_argument('--k_shot', type=int, default=5, help='Number of support examples per task (K).')
-    parser.add_argument('--q_query', type=int, default=10, help='Number of query examples per task (Q). -1 for all remaining.')
+    parser.add_argument('--q_query', type=int, default=10, help='Number of query examples per task (Q).')
     parser.add_argument('--meta_batch_size', type=int, default=16, help='Number of tasks per meta-batch.')
     parser.add_argument('--meta_val_ratio', type=float, default=0.15, help='Fraction of users for meta-validation.')
     parser.add_argument('--meta_test_ratio', type=float, default=0.15, help='Fraction of users for meta-testing.')
@@ -330,11 +311,11 @@ if __name__ == '__main__':
     parser.add_argument('--adaptation_steps', type=int, default=1, help='Number of gradient steps in the inner loop.')
     parser.add_argument('--meta_lr', type=float, default=1e-4, help='Learning rate for the outer loop (meta-optimizer).')
 
-    # --- Base Model Config Args (Placeholders - adjust as needed) ---
+    # --- Base Model Config Args ---
+    parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML base model configuration file.')
     parser.add_argument('--use_gnn', action='store_true', help='Flag to enable GNN encoder.')
     parser.add_argument('--use_sequence', action='store_true', help='Flag to enable sequence encoder.')
     parser.add_argument('--use_text', action='store_true', help='Flag to enable text encoder.')
-    # Add more args here to build model_config if not using a separate config file
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for meta-optimizer.')
     parser.add_argument('--focal_alpha', type=float, default=0.25, help='Alpha parameter for Focal Loss.')
     parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for Focal Loss.')
@@ -352,17 +333,16 @@ if __name__ == '__main__':
     parser.add_argument('--save_top_k', type=int, default=1, help='Save top K model checkpoints based on monitor metric.')
     parser.add_argument('--early_stopping_patience', type=int, default=10, help='Patience for early stopping. 0 to disable.')
     parser.add_argument('--log_every_n_steps', type=int, default=10, help='Log metrics every N training steps.')
-    # parser.add_argument('--grad_clip', type=float, default=0.0, help='Gradient clipping value. 0 to disable. (Manual handling needed for MAML)')
     parser.add_argument('--run_test', action='store_true', help='Run testing phase after training.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
-
-    # <<< Add config path argument >>>
-    parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML base model configuration file.')
-    # <<< Change metadata_path to graph_data_path >>>
-    parser.add_argument('--graph_data_path', type=str, default='config/graph_data.pt', help='Path to pre-computed graph data file (.pt) containing features and metadata.')
-
-    # Add an argument parser option for the checkpoint path
     parser.add_argument('--load_pretrained_ckpt', type=str, default=None, help='Path to a pre-trained model checkpoint to initialize MAML.')
 
     args = parser.parse_args()
+
+    # --- Add check for graph_data_path ---
+    if args.use_gnn and not os.path.exists(args.graph_data_path):
+         print(f"[ERROR] --use_gnn is True, but the graph data file '{args.graph_data_path}' was not found.")
+         print("Please run 'python build_graph.py --data_path <your_raw_data.csv> --output_path {args.graph_data_path}' first.")
+         exit(1) # Exit if graph is needed but not found
+
     main(args) 
