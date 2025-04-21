@@ -873,3 +873,37 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                   reconstructed_batch.append(task)
              return reconstructed_batch
          except Exception as e: print(f"[ERROR] Failed to reconstruct MAML batch: {e}"); traceback.print_exc(); return None
+
+    def _calculate_accuracy_numerator_denominator(self, logits: Optional[torch.Tensor], targets: Optional[torch.Tensor]) -> Tuple[float, int]:
+        """Helper to calculate sum of correct predictions and number of valid samples."""
+        if logits is None or targets is None or logits.shape[0] == 0 or targets.shape[0] == 0:
+             return 0.0, 0
+        if logits.shape[0] != targets.shape[0]:
+             print(f"[WARN] Accuracy calc: Logits batch ({logits.shape[0]}) != Targets batch ({targets.shape[0]})")
+             return 0.0, 0
+
+        # Ensure targets are on the same device as logits FOR COMPARISON
+        targets_dev = targets.to(logits.device)
+
+        # Check if targets contain only ignored values (e.g., -1)
+        valid_mask = targets_dev >= 0 # Assuming negative values are ignored
+        valid_targets = targets_dev[valid_mask]
+
+        if valid_targets.numel() == 0:
+            return 0.0, 0 # No valid targets to calculate accuracy on
+
+        logits_valid = logits[valid_mask]
+
+        if logits_valid.shape[0] == 0: # Double check after filtering
+             return 0.0, 0
+
+        with torch.no_grad():
+            preds = torch.argmax(logits_valid, dim=1)
+            # Clamp targets based on the number of classes in logits AFTER filtering
+            num_classes = logits_valid.shape[1]
+            # Ensure targets are long type for comparison
+            targets_clamped = torch.clamp(valid_targets.long(), 0, num_classes - 1)
+            correct_sum = (preds == targets_clamped).float().sum().item()
+            num_valid_samples = valid_targets.numel()
+
+        return correct_sum, num_valid_samples
