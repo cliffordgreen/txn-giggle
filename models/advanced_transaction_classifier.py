@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import learn2learn as l2l
 import logging
+import traceback # Added for detailed error printing
 
 # Import components from other files in the 'models' directory
 from .hgt_encoder import HGT
@@ -21,6 +22,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
     """ Multi-modal transaction categorization using HGT, TFT, FinBERT,
         User Embeddings, Attention Fusion, Focal Loss, and MTL.
         Includes optional Schedule C prediction head.
+        Includes MAML adaptation capability.
     """
     def __init__(self,
                  # Config Dictionaries
@@ -41,28 +43,31 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                  ):
         super().__init__()
         # Store simple hyperparameters automatically
+        # <<< FIX: Use different key for MAML outer loop LR >>>
         self.save_hyperparameters('learning_rate', 'weight_decay',
                                 'mtl_weights', 'focal_loss_alpha', 'focal_loss_gamma',
                                 'use_maml', 'inner_lr', 'adaptation_steps', 'maml_head_label_type')
 
-        # <<< FIX: Explicitly set use_maml AFTER save_hyperparameters >>>
-        # This ensures the value passed during init isn't overwritten by potential
-        # checkpoint hparam loading during save_hyperparameters call.
-        self.hparams.use_maml = use_maml # Use the argument passed to __init__
-
         # <<< Store flag reliably for runtime checks >>>
+        # Set the runtime flag based on the init argument *after* hparams are saved/loaded
         self._use_maml_runtime_flag = use_maml
+        self.hparams.use_maml = use_maml # Ensure hparams also reflects the init value
 
-        # --- MAML Setup --- 
+        # --- MAML Setup ---
         if self._use_maml_runtime_flag:
              print("[INFO] MAML Mode Enabled.")
              self.automatic_optimization = False # Essential for MAML's manual optimization
              # Check if the target MAML head exists
-             if self.hparams.maml_head_label_type == 'user' and model_config.get('num_user_classes', 0) == 0:
-                  raise ValueError("MAML target is 'user', but num_user_classes is 0 in model_config.")
-             if self.hparams.maml_head_label_type == 'global' and model_config.get('num_global_classes', 0) == 0:
-                  raise ValueError("MAML target is 'global', but num_global_classes is 0 in model_config.")
+             maml_target_head_classes_key = f"num_{self.hparams.maml_head_label_type}_classes"
+             if model_config.get(maml_target_head_classes_key, 0) == 0:
+                  raise ValueError(f"MAML target is '{self.hparams.maml_head_label_type}', but {maml_target_head_classes_key} is 0 in model_config.")
              print(f"[INFO] MAML will adapt the '{self.hparams.maml_head_label_type}' head.")
+             # Check if full_data_ref is provided for MAML feature fetching
+             if full_data_ref is None:
+                  print("[WARN] MAML mode enabled but full_data_ref (processed graph) was not provided. Feature fetching will fail.")
+        else:
+             print("[INFO] MAML Mode Disabled.")
+
 
         # Store complex configs manually
         self._model_config = model_config
@@ -82,8 +87,6 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
         # Store references (NOT saved as hparams)
         self._full_data_ref = full_data_ref # Store reference for MAML feature fetching
-        if self._use_maml_runtime_flag and self._full_data_ref is None:
-             print("[WARN] MAML mode enabled but full_data_ref (raw DataFrame) was not provided to the model. Feature fetching will fail.")
 
         # <<< Store modality flags from config >>>
         self.use_gnn_encoder = model_config.get('use_gnn_encoder', True)
@@ -104,8 +107,11 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                  # <<< Pass metadata from config >>>
                  hgt_metadata = self._graph_config['metadata']
                  print(f"[INFO] Initializing HGT with metadata: Nodes={hgt_metadata[0]}, Edges={hgt_metadata[1]}")
+                 # <<< Get input dims from config if provided >>>
+                 # HGT can infer input dim if set to -1 and node features are heterogeneous
+                 in_channels_config = self._graph_config.get('in_channels', -1)
                  self.graph_encoder = HGT(
-                    in_channels=self._graph_config.get('in_channels', -1), # HGT can infer if -1
+                    in_channels=in_channels_config, # Use config value or -1 for inference
                     hidden_channels=self._graph_config.get('hidden_channels', 64),
                     out_channels=self._graph_config.get('out_channels', 64),
                     metadata=hgt_metadata,
@@ -128,6 +134,8 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                  self.sequence_encoder = PytorchForecastingTFTWrapper(
                     output_dim=self._sequence_config.get('output_dim', 64), # Provide default
                     tft_params=self._sequence_config.get('tft_params', {}),
+                    # Pass sequence feature dimension if TFT requires it
+                    # input_dim=model_config.get('sequence_feature_dim', None), # Example
                     embedding_source_key=self._sequence_config.get('embedding_source_key', 'encoder_variables')
                  )
                  seq_out_dim = self.sequence_encoder.get_output_dim()
@@ -153,8 +161,13 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         else:
              print("[INFO] Text Encoder is disabled via config.")
 
-        self.user_embedding = nn.Embedding(num_users, user_embed_dim)
-        print(f"[INFO] User Embedding Initialized. Num Users: {num_users}, Output Dim: {user_embed_dim}")
+        self.user_embedding = None # Initialize
+        if num_users > 0 and user_embed_dim > 0:
+             self.user_embedding = nn.Embedding(num_users, user_embed_dim)
+             print(f"[INFO] User Embedding Initialized. Num Users: {num_users}, Output Dim: {user_embed_dim}")
+        else:
+             print(f"[INFO] User Embedding skipped (num_users={num_users}, user_embed_dim={user_embed_dim}).")
+             user_embed_dim = 0 # Ensure dim is 0 if not used
 
         # --- 2. Fusion Module ---
         fusion_input_dims = {}
@@ -164,37 +177,35 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
              fusion_input_dims['sequence'] = seq_out_dim
         if self.use_text_encoder and self.text_encoder:
              fusion_input_dims['text'] = text_out_dim
-        # Always include user embedding if num_users > 0
-        if num_users > 0:
+        # Always include user embedding if it exists
+        if self.user_embedding:
             fusion_input_dims['user'] = user_embed_dim
-        else:
-            print("[WARN] num_users is 0. User embedding will not be used in fusion.")
 
         if not fusion_input_dims:
             raise ValueError("No modalities are enabled or configured correctly. At least one encoder (graph, sequence, text) or user embedding must be active.")
         if not self._fusion_config:
              raise ValueError("'fusion_params' missing from model_config, cannot initialize fusion module.")
 
+        fusion_output_dim = self._fusion_config.get('output_dim', 128) # Get output dim or default
         self.fusion_module = AttentionFusion(
             modality_dims=fusion_input_dims,
             hidden_dim=self._fusion_config.get('hidden_dim', 128), # Provide default
-            output_dim=self._fusion_config.get('output_dim', 128), # Provide default
+            output_dim=fusion_output_dim, # Use derived output dim
             dropout=self._fusion_config.get('dropout', 0.1)
         )
-        fused_dim = self._fusion_config['output_dim']
-        print(f"[INFO] Attention Fusion Initialized. Input Dims: {fusion_input_dims}, Output Dim: {fused_dim}")
+        print(f"[INFO] Attention Fusion Initialized. Input Dims: {fusion_input_dims}, Output Dim: {fusion_output_dim}")
 
         # --- 3. Classification Heads ---
         self.global_head = None
         if num_global_classes > 0:
-             self.global_head = nn.Linear(fused_dim, num_global_classes)
+             self.global_head = nn.Linear(fusion_output_dim, num_global_classes)
              print(f"[INFO] Global Classifier Initialized: Output Classes={num_global_classes}")
         else:
              print("[INFO] Global classification head skipped (num_global_classes=0).")
 
         self.user_specific_head = None
         if num_user_classes > 0:
-             self.user_specific_head = nn.Linear(fused_dim, num_user_classes)
+             self.user_specific_head = nn.Linear(fusion_output_dim, num_user_classes)
              print(f"[INFO] User Classifier Initialized: Output Classes={num_user_classes}")
         else:
              print("[INFO] User classification head skipped (num_user_classes=0).")
@@ -202,7 +213,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         # <<< Conditional Schedule C Head >>>
         self.scheduleC_head = None
         if self.use_scheduleC_head:
-             self.scheduleC_head = nn.Linear(fused_dim, num_scheduleC_classes)
+             self.scheduleC_head = nn.Linear(fusion_output_dim, num_scheduleC_classes)
              print(f"[INFO] Schedule C Classifier Initialized: Output Classes={num_scheduleC_classes}")
         else:
              print("[INFO] Schedule C classification head skipped (num_scheduleC_classes=0).")
@@ -212,7 +223,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         if self.global_head:
              self.focal_loss_global = FocalLoss(
                  alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma,
-                 num_classes=num_global_classes
+                 num_classes=num_global_classes # Use actual number of classes
              )
              print("[INFO] Global Focal Loss Initialized.")
 
@@ -220,7 +231,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         if self.user_specific_head:
              self.focal_loss_user = FocalLoss(
                  alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma,
-                 num_classes=num_user_classes
+                 num_classes=num_user_classes # Use actual number of classes
              )
              print("[INFO] User Focal Loss Initialized.")
 
@@ -229,17 +240,11 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         if self.scheduleC_head:
              self.focal_loss_scheduleC = FocalLoss(
                  alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma,
-                 num_classes=num_scheduleC_classes
+                 num_classes=num_scheduleC_classes # Use actual number of classes
              )
              print("[INFO] Schedule C Focal Loss Initialized.")
 
-        # Store complex configs manually (needed if loading from checkpoint)
-        self._model_config = model_config
-        self._graph_config = model_config.get('graph_encoder_params', {}) # Handle missing key
-        self._sequence_config = model_config.get('sequence_encoder_params', {})
-        self._text_config = model_config.get('text_encoder_params', {})
-        self._fusion_config = model_config.get('fusion_params', {})
-
+    # --- Forward Pass (No MAML logic here) ---
     def forward(self,
                 graph_batch: Optional[HeteroData] = None,
                 sequence_batch: Optional[Any] = None,
@@ -258,21 +263,36 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                 node_embeddings_dict = self.graph_encoder(graph_batch.x_dict, graph_batch.edge_index_dict)
 
                 if 'transaction' in node_embeddings_dict:
+                     # Try to infer batch size if not provided (e.g., from user_ids or text_batch)
                      if batch_size is None:
                           if user_ids is not None: batch_size = user_ids.shape[0]
-                          # Add fallback using maybe _raw_text length if text_encoder is on?
-                          elif self.use_text_encoder and text_batch is not None: batch_size = len(text_batch)
-                          else: raise ValueError("Forward pass needs batch_size if graph_batch is provided.")
+                          elif text_batch is not None: batch_size = len(text_batch)
+                          else:
+                              # Check if graph_batch has 'input_id' or 'batch_size' from NeighborLoader
+                              if hasattr(graph_batch['transaction'], 'input_id'):
+                                   batch_size = graph_batch['transaction'].input_id.shape[0]
+                              elif hasattr(graph_batch['transaction'], 'batch_size'):
+                                   batch_size = graph_batch['transaction'].batch_size
+                              else:
+                                   # As a last resort, use the number of transaction nodes if forward is called outside Lightning context
+                                   batch_size = graph_batch['transaction'].num_nodes
+                                   # print("[WARN] Forward: batch_size not provided and cannot be inferred reliably. Using num_nodes as fallback.")
 
-                     num_nodes_in_batch_output = node_embeddings_dict['transaction'].shape[0]
-                     if batch_size > num_nodes_in_batch_output:
-                         print(f"[WARN] Forward: batch_size ({batch_size}) > GNN output nodes ({num_nodes_in_batch_output}). Slicing available nodes.")
-                         graph_embed = node_embeddings_dict['transaction'][:num_nodes_in_batch_output]
-                     elif batch_size > 0:
-                          graph_embed = node_embeddings_dict['transaction'][:batch_size]
-                     # else: batch_size might be 0, graph_embed remains None
+                     # Determine the number of nodes to slice based on the inferred/provided batch_size
+                     # HGT output size might not match input batch_size directly due to sampling
+                     num_nodes_in_output = node_embeddings_dict['transaction'].shape[0]
 
-                     if graph_embed is not None and graph_embed.shape[0] > 0: # Check size > 0
+                     # Slice based on the minimum of expected batch size and available nodes
+                     slice_len = min(batch_size, num_nodes_in_output) if batch_size is not None else num_nodes_in_output
+
+                     if slice_len > 0:
+                         graph_embed = node_embeddings_dict['transaction'][:slice_len]
+                         if batch_size is not None and slice_len < batch_size:
+                             print(f"[WARN] Forward: Sliced GNN output to {slice_len} nodes (expected {batch_size}).")
+                     else:
+                         graph_embed = None # No nodes to slice
+
+                     if graph_embed is not None:
                          embeddings_to_fuse['graph'] = graph_embed.to(self.device)
                      elif batch_size > 0: # Only warn if batch_size was expected to be > 0
                           print("[WARN] Forward: HGT 'transaction' embedding is None or empty after slicing.")
@@ -281,7 +301,6 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                     print("[WARN] Forward: HGT output missing 'transaction' embeddings.")
             except Exception as e:
                 print(f"[ERROR] HGT Encoder forward failed: {e}")
-                import traceback
                 traceback.print_exc() # Print full traceback for GNN errors
 
         # --- 2. Sequence Encoding ---
@@ -289,54 +308,44 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             try:
                 seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
                 if seq_embed is not None and seq_embed.shape[0] > 0:
-                    # Ensure batch size matches graph if graph is used
-                    if graph_embed is not None and seq_embed.shape[0] != graph_embed.shape[0]:
-                         print(f"[ERROR] Forward: Sequence batch size ({seq_embed.shape[0]}) mismatch with Graph ({graph_embed.shape[0]})")
-                    else:
-                        embeddings_to_fuse['sequence'] = seq_embed.to(self.device)
-                elif graph_embed is not None and graph_embed.shape[0] > 0: # Check if expected based on graph
+                    # Basic batch size check (more robust checks in fusion stage)
+                    # if graph_embed is not None and seq_embed.shape[0] != graph_embed.shape[0]:
+                    #      print(f"[WARN] Forward: Sequence batch size ({seq_embed.shape[0]}) mismatch with Graph ({graph_embed.shape[0]})")
+                    embeddings_to_fuse['sequence'] = seq_embed.to(self.device)
+                elif batch_size is not None and batch_size > 0: # Check if expected based on batch size
                     print("[WARN] Forward: TFT output is None or empty.")
             except Exception as e:
                 print(f"[ERROR] TFT Encoder forward failed: {e}")
+                traceback.print_exc()
 
         # --- 3. Text Encoding ---
         if self.text_encoder and text_batch is not None:
             try:
-                text_embed = self.text_encoder(text_batch)
-                if text_embed is not None and text_embed.shape[0] > 0:
-                    # Ensure batch size matches graph if graph is used
-                    ref_shape = graph_embed.shape[0] if graph_embed is not None else (seq_embed.shape[0] if 'sequence' in embeddings_to_fuse else None)
-                    if ref_shape is not None and text_embed.shape[0] != ref_shape:
-                         print(f"[ERROR] Forward: Text batch size ({text_embed.shape[0]}) mismatch with reference ({ref_shape})")
-                    else:
+                # Ensure text_batch is not empty
+                if text_batch:
+                     text_embed = self.text_encoder(text_batch)
+                     if text_embed is not None and text_embed.shape[0] > 0:
                          embeddings_to_fuse['text'] = text_embed.to(self.device)
-                elif ref_shape is not None and ref_shape > 0: # Check if expected
-                    print("[WARN] Forward: FinBERT output is None or empty.")
-
+                     elif batch_size is not None and batch_size > 0: # Check if expected
+                         print("[WARN] Forward: FinBERT output is None or empty.")
+                else:
+                     print("[WARN] Forward: Received empty text_batch list.")
             except Exception as e:
                 print(f"[ERROR] FinBERT Encoder forward failed: {e}")
+                traceback.print_exc()
 
         # --- 4. User Embedding ---
         if self.user_embedding and user_ids is not None:
-             # Check if num_users > 0 before trying to embed
-            if self.user_embedding.num_embeddings > 0:
-                try:
-                    # Clamp user_ids to be safe
-                    user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
-                    user_embed = self.user_embedding(user_ids_clamped.to(self.device))
-                    if user_embed is not None and user_embed.shape[0] > 0:
-                        # Ensure batch size matches graph if graph is used
-                        ref_shape = graph_embed.shape[0] if graph_embed is not None else (embeddings_to_fuse.get('sequence', embeddings_to_fuse.get('text', None)).shape[0] if embeddings_to_fuse else None)
-                        if ref_shape is not None and user_embed.shape[0] != ref_shape:
-                            print(f"[ERROR] Forward: User ID batch size ({user_embed.shape[0]}) mismatch with reference ({ref_shape})")
-                        else:
-                            embeddings_to_fuse['user'] = user_embed.to(self.device)
-                    elif ref_shape is not None and ref_shape > 0: # Check if expected
-                         print("[WARN] Forward: User embedding is None or empty.")
-                except Exception as e:
-                    print(f"[ERROR] User Embedding forward failed: {e}")
-            else:
-                print("[WARN] Forward: Skipping user embedding as num_users is 0.")
+             try:
+                 user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
+                 user_embed = self.user_embedding(user_ids_clamped.to(self.device))
+                 if user_embed is not None and user_embed.shape[0] > 0:
+                     embeddings_to_fuse['user'] = user_embed.to(self.device)
+                 elif batch_size is not None and batch_size > 0: # Check if expected
+                      print("[WARN] Forward: User embedding is None or empty.")
+             except Exception as e:
+                 print(f"[ERROR] User Embedding forward failed: {e}")
+                 traceback.print_exc()
 
 
         # --- Pre-Fusion Checks ---
@@ -344,14 +353,14 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             print("[ERROR] Forward: No embeddings available for fusion.")
             return None, None, None # Return three Nones
 
-        ref_batch_size = None
-        first_key = next(iter(embeddings_to_fuse))
-        ref_batch_size = embeddings_to_fuse[first_key].shape[0]
+        # Determine reference batch size from the first available embedding
+        ref_batch_size = next(iter(embeddings_to_fuse.values())).shape[0]
 
         if ref_batch_size == 0:
              print("[WARN] Forward: Fusion input batch size is 0. Returning None.")
              return None, None, None
 
+        # Check consistency of batch sizes and device
         for name, emb in embeddings_to_fuse.items():
              if emb.shape[0] != ref_batch_size:
                   print(f"[ERROR] Forward: Mismatched batch size for {name}: {emb.shape[0]} vs {ref_batch_size}. Skipping fusion.")
@@ -366,6 +375,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             fused_representation, _ = self.fusion_module(embeddings_to_fuse)
         except Exception as e:
              print(f"[ERROR] Fusion module forward failed: {e}")
+             traceback.print_exc()
              return None, None, None # Return Nones if fusion fails
 
         # --- 6. Classify ---
@@ -387,6 +397,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                  scheduleC_logits = self.scheduleC_head(fused_representation)
         except Exception as e:
              print(f"[ERROR] Classifier head forward failed: {e}")
+             traceback.print_exc()
              # Return Nones based on which heads exist
              return (None if self.global_head else global_logits,
                      None if self.user_specific_head else user_specific_logits,
@@ -394,27 +405,17 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
         return global_logits, user_specific_logits, scheduleC_logits # Return all three
 
+    # --- MAML Specific Methods ---
     def _get_features_for_indices(self, transaction_indices: torch.Tensor
                                  ) -> Tuple[Optional[HeteroData], Optional[Any], Optional[List[str]], Optional[torch.Tensor]]:
         """
-        Fetches input features for specific transaction indices.
-        For MAML, assumes self._full_data_ref is the full HeteroData graph.
-        Performs on-the-fly k-hop subgraph sampling around transaction_indices.
-
-        Args:
-            transaction_indices: Tensor of *original* DataFrame indices corresponding to nodes in the graph.
-
-        Returns:
-            Tuple containing:
-                - graph_batch: A HeteroData object representing the sampled subgraph (or None).
-                - sequence_batch: Dict with sequence features for seed nodes (or None).
-                - text_batch: List of text strings for seed nodes (or None).
-                - user_ids: Tensor of user ID codes for seed nodes (or None).
+        Fetches input features for specific transaction indices from self._full_data_ref.
+        Performs k-hop subgraph sampling for GNN if enabled.
+        Retrieves sequence and text data for the specified indices.
         """
         if self._full_data_ref is None or not isinstance(self._full_data_ref, HeteroData):
-            print("[ERROR] _get_features_for_indices: _full_data_ref is None or not a HeteroData object. Cannot fetch features.")
+            print("[ERROR] _get_features_for_indices: _full_data_ref (processed graph) is None or invalid.")
             return None, None, None, None
-
         full_graph = self._full_data_ref
 
         if transaction_indices is None or transaction_indices.numel() == 0:
@@ -422,7 +423,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
              return None, None, None, None
 
         indices_np = transaction_indices.cpu().numpy()
-        device = self.device
+        device = self.device # Target device for some outputs (user_ids)
 
         # --- Initialize outputs ---
         graph_batch = None # Will hold the sampled subgraph
@@ -431,328 +432,208 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         user_ids = None
 
         try:
-            # Check node existence for safety
+            # Check node existence for safety against transaction indices
             num_tx_nodes = full_graph['transaction'].num_nodes
             if np.any(indices_np >= num_tx_nodes):
                  offending_indices = indices_np[indices_np >= num_tx_nodes]
                  print(f"[ERROR] _get_features_for_indices: Indices out of bounds. Max tx node index: {num_tx_nodes-1}. Offending: {offending_indices}")
+                 # Filter out invalid indices? Or return error? Returning error for now.
                  return None, None, None, None
 
-            # --- 1. Subgraph Sampling --- 
-            # Configuration for sampling
-            k_hops = 2  # Sampling depth - adjust based on performance requirements
-            
+            # --- 1. Subgraph Sampling (if GNN enabled) ---
             if self.use_gnn_encoder:
                 try:
-                    # Create new HeteroData object for the sampled subgraph
-                    graph_batch = HeteroData()
-                    
-                    # Store metadata about seed nodes for easy recovery later
-                    # Keep transaction_indices as tensor for easier indexing
-                    seed_indices = torch.from_numpy(indices_np).to(torch.long)
-                    
-                    # ----- Step 1: Find k-hop neighbors for transaction seed nodes -----
-                    # Start with seed nodes
-                    sampled_nodes = {'transaction': {idx.item() for idx in seed_indices}}
-                    
-                    # Track visited edges to avoid duplicates
-                    sampled_edges = {etype: set() for etype in full_graph.edge_types}
-                    
-                    # Track edge attributes separately by original edge index
-                    edge_attr_indices = {etype: [] for etype in full_graph.edge_types}
-                    
-                    # Breadth-first collection of neighbors up to k_hops
-                    current_frontier = {'transaction': sampled_nodes['transaction'].copy()}
-                    
-                    # Initialize collections for nodes of other types
-                    for node_type in full_graph.node_types:
-                        if node_type != 'transaction':
-                            sampled_nodes[node_type] = set()
-                            current_frontier[node_type] = set()
-                    
-                    # Perform k-hop neighborhood sampling
-                    for hop in range(k_hops):
-                        next_frontier = {node_type: set() for node_type in full_graph.node_types}
-                        
-                        # For each edge type, find connected nodes
-                        for edge_type in full_graph.edge_types:
-                            src_type, rel_type, dst_type = edge_type
-                            
-                            # If we have nodes of this type in our frontier
-                            if current_frontier[src_type]:
-                                # Get edge index for this edge type
-                                edge_index = full_graph[edge_type].edge_index
-                                
-                                # For each node in the frontier, find its neighbors
-                                for src_idx in current_frontier[src_type]:
-                                    # Find edges where this node is the source
-                                    edge_mask = (edge_index[0] == src_idx)
-                                    
-                                    # Get edge indices for later attribute retrieval
-                                    if hasattr(full_graph[edge_type], 'edge_attr') and full_graph[edge_type].edge_attr is not None:
-                                        orig_edge_indices = torch.nonzero(edge_mask).squeeze(-1)
-                                        edge_attr_indices[edge_type].extend(orig_edge_indices.cpu().tolist())
-                                    
-                                    dst_indices = edge_index[1][edge_mask].cpu().numpy()
-                                    
-                                    # Add neighboring nodes to sampled nodes and next frontier
-                                    for dst_idx in dst_indices:
-                                        dst_idx_int = dst_idx.item() if isinstance(dst_idx, (torch.Tensor, np.integer)) else int(dst_idx)
-                                        sampled_nodes[dst_type].add(dst_idx_int)
-                                        next_frontier[dst_type].add(dst_idx_int)
-                                        
-                                        # Track this edge
-                                        edge_tuple = (src_idx, dst_idx_int)
-                                        sampled_edges[edge_type].add(edge_tuple)
-                            
-                            # Also collect reverse edges if they exist
-                            # This ensures we have a complete neighborhood in both directions
-                            rev_edge_type = (dst_type, f"rev_{rel_type}", src_type)
-                            if rev_edge_type in full_graph.edge_types:
-                                # If we have nodes of this type in our frontier
-                                if current_frontier[dst_type]:
-                                    # Get edge index for this reverse edge type
-                                    edge_index = full_graph[rev_edge_type].edge_index
-                                    
-                                    # For each node in the frontier, find its neighbors
-                                    for dst_idx in current_frontier[dst_type]:
-                                        # Find edges where this node is the source
-                                        edge_mask = (edge_index[0] == dst_idx)
-                                        
-                                        # Get edge indices for later attribute retrieval
-                                        if hasattr(full_graph[rev_edge_type], 'edge_attr') and full_graph[rev_edge_type].edge_attr is not None:
-                                            orig_edge_indices = torch.nonzero(edge_mask).squeeze(-1)
-                                        # Add neighboring nodes to sampled nodes and next frontier
-                                        for src_idx in src_indices:
-                                            src_idx_int = src_idx.item() if isinstance(src_idx, (torch.Tensor, np.integer)) else int(src_idx)
-                                            sampled_nodes[src_type].add(src_idx_int)
-                                            next_frontier[src_type].add(src_idx_int)
-                                            
-                                            # Track this edge
-                                            edge_tuple = (dst_idx, src_idx_int)
-                                            sampled_edges[rev_edge_type].add(edge_tuple)
-                        
-                        # Update the frontier for the next hop
-                        current_frontier = next_frontier
-                        
-                        # Early stopping if no new nodes were found
-                        if sum(len(nodes) for nodes in next_frontier.values()) == 0:
-                            break
+                    # Configuration for sampling - consider making these configurable
+                    k_hops = self._graph_config.get('maml_sampling_hops', 2) # Default to 2 hops
+                    num_neighbors = self._graph_config.get('maml_sampling_neighbors', [15, 10]) # Neighbors per hop
+                    if len(num_neighbors) != k_hops:
+                         print(f"[WARN] MAML sampling: num_neighbors length ({len(num_neighbors)}) != k_hops ({k_hops}). Adjusting.")
+                         if len(num_neighbors) > k_hops: num_neighbors = num_neighbors[:k_hops]
+                         else: num_neighbors = num_neighbors + [num_neighbors[-1]] * (k_hops - len(num_neighbors)) # Repeat last
 
-                    # ----- Step 2: Extract features for sampled nodes and create mapping -----
-                    # Convert sets to sorted lists for consistent indexing
-                    node_maps = {}  # Map from original index to new contiguous index
-                    
-                    for node_type in sampled_nodes:
-                        sorted_nodes = sorted(list(sampled_nodes[node_type]))
-                        num_nodes = len(sorted_nodes)
-                        
-                        if num_nodes == 0:
-                            # Skip empty node types
-                            continue
-                        
-                        # Create mapping from original to new indices
-                        node_maps[node_type] = {orig_idx: new_idx for new_idx, orig_idx in enumerate(sorted_nodes)}
-                        
-                        # Set number of nodes in the sampled graph
-                        graph_batch[node_type].num_nodes = num_nodes
-                        
-                        # Copy node features if they exist
-                        if hasattr(full_graph[node_type], 'x'):
-                            # Get feature tensor for sampled nodes
-                            node_indices_tensor = torch.tensor(sorted_nodes, dtype=torch.long)
-                            node_features = full_graph[node_type].x[node_indices_tensor]
-                            graph_batch[node_type].x = node_features
-                        
-                        # Copy any other node attributes that might be needed
-                        for attr_name, attr_value in full_graph[node_type]:
-                            if attr_name not in ['x', 'num_nodes'] and torch.is_tensor(attr_value):
-                                try:
-                                    # Check if it's per-node data
-                                    if attr_value.size(0) == full_graph[node_type].num_nodes:
-                                        node_indices_tensor = torch.tensor(sorted_nodes, dtype=torch.long)
-                                        graph_batch[node_type][attr_name] = attr_value[node_indices_tensor]
-                                except Exception as e_attr:
-                                    print(f"[WARN] Failed to copy node attribute {attr_name} for {node_type}: {e_attr}")
-                    
-                    # For seed transaction nodes, store their new indices for easy mapping later
-                    # This is crucial for knowing which embeddings to extract from GNN output
-                    if 'transaction' in node_maps:
-                        seed_map = {orig_idx: node_maps['transaction'].get(orig_idx)
-                                  for orig_idx in seed_indices.tolist()}
-                        # Store seed indices in new indexing scheme
-                        seed_idx_in_sample = torch.tensor([seed_map[idx.item()] for idx in seed_indices
-                                                       if idx.item() in seed_map], dtype=torch.long)
-                        # Store this mapping within the HeteroData object for later reference
-                        graph_batch['transaction'].seed_idx_in_sample = seed_idx_in_sample
-                    
-                    # ----- Step 3: Extract and remap edge indices -----
-                    for edge_type, edge_tuples in sampled_edges.items():
-                        src_type, _, dst_type = edge_type
-                        
-                        # Skip if either node type is empty
-                        if src_type not in node_maps or dst_type not in node_maps:
-                            continue
-                        
-                        # Create new edge indices, remapping node indices to be contiguous
-                        new_edge_indices = []
-                        
-                        for src_idx, dst_idx in edge_tuples:
-                            if src_idx in node_maps[src_type] and dst_idx in node_maps[dst_type]:
-                                new_src_idx = node_maps[src_type][src_idx]
-                                new_dst_idx = node_maps[dst_type][dst_idx]
-                                new_edge_indices.append((new_src_idx, new_dst_idx))
-                        
-                        if new_edge_indices:
-                            # Convert to tensor and store in the edge index
-                            new_edge_tensor = torch.tensor(new_edge_indices, dtype=torch.long).t().contiguous()
-                            graph_batch[edge_type].edge_index = new_edge_tensor
-                            
-                            # If there are edge features, copy them too
-                            if hasattr(full_graph[edge_type], 'edge_attr') and full_graph[edge_type].edge_attr is not None:
-                                # This requires finding the original edge index position
-                                # and can be complex - omitting for simplicity
-                                # Would need to map (src, dst) in new index to original edge index
-                                pass
-                    
-                    print(f"[INFO] Sampled subgraph: {sum(len(nodes) for nodes in sampled_nodes.values())} nodes, {sum(len(edges) for edges in sampled_edges.values())} edges.")
-                
+                    # Use NeighborSampler for efficient k-hop sampling
+                    from torch_geometric.loader import NeighborSampler
+
+                    # Ensure indices are on CPU for sampler
+                    seed_nodes_tensor = torch.from_numpy(indices_np).to('cpu').long()
+
+                    # Need input_nodes format: (node_type, tensor_of_indices)
+                    sampler = NeighborSampler(data=full_graph,
+                                              num_neighbors=num_neighbors,
+                                              input_nodes=('transaction', seed_nodes_tensor),
+                                              # batch_size defaults to sampling all seeds at once
+                                              # Other args like shuffle, num_workers usually not needed here
+                                             )
+                    # Sample the subgraph
+                    # This returns batch_size, n_id (node ids in the sampled graph), adjs (edge info)
+                    # We only need the first sample (as batch_size covers all seed nodes)
+                    # sampled_data = next(iter(sampler)) # Get the single sampled subgraph data
+
+                    # Reconstruct HeteroData from sampler output (simplified approach)
+                    # Note: PyG versions might offer direct subgraph extraction. This is manual.
+                    # Get all nodes involved in the k-hop neighborhood
+                    # Extracting node features and edge indices requires careful mapping
+                    # Let's try a simpler approach first: just extract features for seed nodes
+                    # If GNN needs neighborhood, NeighborSampler approach is better.
+
+                    # --- Simplified Feature Extraction for MAML GNN ---
+                    # Option A: Pass the full graph and let forward handle slicing (less efficient)
+                    # Option B: Extract only seed node features (no neighborhood aggregation)
+                    # Option C: Implement proper subgraph extraction (complex)
+
+                    # Choosing Option A for simplicity now, assuming forward pass handles slicing.
+                    # If performance is an issue, revisit subgraph sampling.
+                    graph_batch = full_graph # Pass the reference to the full graph
+                    # Store seed indices directly for forward pass slicing
+                    graph_batch.seed_indices_maml = seed_nodes_tensor
+
                 except Exception as e_sample:
-                    print(f"[ERROR] Subgraph sampling failed: {e_sample}")
-                    import traceback
+                    print(f"[ERROR] Subgraph sampling/preparation failed: {e_sample}")
                     traceback.print_exc()
-                    graph_batch = None
+                    graph_batch = None # Fallback to None if sampling fails
+            # else: graph_batch remains None if GNN not used
 
-            # --- 2. Fetch Features ONLY for SEED nodes (transaction_indices) --- 
+            # --- 2. Fetch Features ONLY for SEED nodes (transaction_indices) ---
             # User IDs
-            if 'transaction' in full_graph.node_types and hasattr(full_graph['transaction'], 'user_id_code'):
-                user_ids = full_graph['transaction'].user_id_code[indices_np].to(device)
+            if 'user_id_code' in full_graph['transaction']:
+                 user_ids = full_graph['transaction'].user_id_code[indices_np].to(device)
             else:
                  print("[WARN] _get_features_for_indices: 'user_id_code' not found in graph['transaction'].")
 
-            # Text Data
-            if self.use_text_encoder and 'transaction' in full_graph.node_types and hasattr(full_graph['transaction'], '_raw_text'):
-                full_raw_text = full_graph['transaction']._raw_text
-                # Ensure indices are valid for the list length
-                max_text_idx = len(full_raw_text) - 1
-                if np.any(indices_np > max_text_idx):
-                     offending_indices = indices_np[indices_np > max_text_idx]
-                     print(f"[ERROR] _get_features_for_indices: Indices out of bounds for _raw_text. Max text index: {max_text_idx}. Offending: {offending_indices}")
-                     text_batch = ['' for _ in indices_np] # Return empty strings on error
-                else:
-                     text_batch = [full_raw_text[i] for i in indices_np]
-            elif self.use_text_encoder:
-                 print("[WARN] _get_features_for_indices: Text enabled but '_raw_text' not found in graph['transaction'].")
-                 text_batch = ['' for _ in indices_np]
+            # Text Data (Uses keys like '_raw_description', '_raw_memo')
+            if self.use_text_encoder:
+                 # Combine relevant raw text fields for the target indices
+                 combined_texts = []
+                 text_keys = [k for k in full_graph['transaction'].keys() if k.startswith('_raw_')]
+                 if not text_keys:
+                      print("[WARN] _get_features_for_indices: Text enabled but no '_raw_' fields found.")
+                      text_batch = [""] * len(indices_np) # Return empty strings
+                 else:
+                     # Iterate through each requested index
+                     for i in indices_np:
+                          entry_texts = []
+                          for key in text_keys:
+                               try:
+                                    # Access the list stored on the node and get the specific item
+                                    text_list = full_graph['transaction'][key]
+                                    entry_texts.append(str(text_list[i])) # Ensure string conversion
+                               except IndexError:
+                                    print(f"[ERROR] Index {i} out of bounds for text list '{key}' (len {len(text_list)}).")
+                                    entry_texts.append("") # Append empty string on error
+                               except Exception as e_text:
+                                    print(f"[ERROR] Failed accessing text for index {i}, key '{key}': {e_text}")
+                                    entry_texts.append("")
+                          # Simple concatenation with space separator
+                          combined_texts.append(" ".join(filter(None, entry_texts)).strip())
+                     text_batch = combined_texts
+
 
             # Sequence Data
-            if self.use_sequence_encoder and 'transaction' in full_graph.node_types and hasattr(full_graph['transaction'], 'seq_features'):
-                # Assuming DataModuleV2 stored padded sequences and lengths
-                seq_feat = full_graph['transaction'].seq_features[indices_np]
-                seq_len = full_graph['transaction'].seq_lengths[indices_np]
-                sequence_batch = {'sequences': seq_feat, 'lengths': seq_len}
-                if hasattr(full_graph['transaction'], 'seq_cat_features'):
-                     sequence_batch['seq_cat_features'] = full_graph['transaction'].seq_cat_features[indices_np]
-            elif self.use_sequence_encoder:
-                 print("[WARN] _get_features_for_indices: Sequence enabled but 'seq_features' not found in graph['transaction'].")
+            if self.use_sequence_encoder:
+                 if 'seq_features' in full_graph['transaction'] and 'seq_lengths' in full_graph['transaction']:
+                      seq_feat = full_graph['transaction'].seq_features[indices_np]
+                      seq_len = full_graph['transaction'].seq_lengths[indices_np]
+                      sequence_batch = {'sequences': seq_feat, 'lengths': seq_len}
+                      # Add categorical features if they exist
+                      if 'seq_cat_features' in full_graph['transaction']:
+                           sequence_batch['seq_cat_features'] = full_graph['transaction'].seq_cat_features[indices_np]
+                 else:
+                      print("[WARN] _get_features_for_indices: Sequence enabled but 'seq_features'/'seq_lengths' not found.")
+
 
         except Exception as e:
-            print(f"[ERROR] _get_features_for_indices: Failed during feature extraction from graph: {e}")
-            import traceback
+            print(f"[ERROR] _get_features_for_indices: Failed during feature extraction: {e}")
             traceback.print_exc()
             return None, None, None, None
 
-        # Store the original transaction indices in the graph_batch for reference
-        if graph_batch is not None:
-            graph_batch.seed_indices = seed_indices
-            
-        # Return features (graph_batch instead of graph_node_features/agg_neighbors)
+        # Return features
         return graph_batch, sequence_batch, text_batch, user_ids
 
 
     def _get_fused_representation(self,
-                                  # <<< Accept graph_batch (HeteroData subgraph) >>>
-                                  graph_batch: Optional[HeteroData] = None,
+                                  # <<< Accepts full graph ref + seed indices OR a pre-sampled subgraph >>>
+                                  graph_batch: Optional[HeteroData] = None, # Can be full graph or subgraph
+                                  seed_indices_for_graph: Optional[torch.Tensor] = None, # Indices if graph_batch is full graph
                                   sequence_batch: Optional[Any] = None,
                                   text_batch: Optional[List[str]] = None,
-                                  user_ids: Optional[torch.Tensor] = None,
-                                  batch_size: Optional[int] = None # Now derived from seed nodes
+                                  user_ids: Optional[torch.Tensor] = None
                                  ) -> Optional[torch.Tensor]:
         """Internal helper to run encoders and fusion module, returning only the fused tensor."""
         device = self.device
-        # Move sequence/user_ids to device (graph handled by encoder, text by its encoder)
-        if sequence_batch is not None: sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in sequence_batch.items()}
-        if user_ids is not None: user_ids = user_ids.to(device)
-        # graph_batch is moved to device within the graph_encoder call
-
         embeddings_to_fuse = {}
         graph_embed = None
+
+        # --- Determine effective batch size (number of seed nodes) ---
+        effective_batch_size = None
+        if seed_indices_for_graph is not None: effective_batch_size = seed_indices_for_graph.shape[0]
+        elif text_batch is not None: effective_batch_size = len(text_batch)
+        elif sequence_batch is not None and 'sequences' in sequence_batch: effective_batch_size = sequence_batch['sequences'].shape[0]
+        elif user_ids is not None: effective_batch_size = user_ids.shape[0]
+
+        if effective_batch_size is None or effective_batch_size == 0:
+             print("[WARN] Fuse: Cannot determine effective batch size or size is 0.")
+             return None
+
+        # --- Move Inputs to Device ---
+        if sequence_batch is not None: sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in sequence_batch.items()}
+        if user_ids is not None: user_ids = user_ids.to(device)
+
 
         # --- 1. Graph Encoding (Call the actual encoder) ---
         if self.graph_encoder and graph_batch is not None:
             try:
-                # Ensure subgraph is on the correct device BEFORE passing to encoder
-                graph_batch = graph_batch.to(device)
-                
-                # Extract seed indices from stored attributes
-                seed_idx_in_sample = None
-                transaction_indices = None
-                
-                # Get seed indices in sampled graph (for embedding extraction)
-                if hasattr(graph_batch['transaction'], 'seed_idx'):
-                    seed_idx_in_sample = graph_batch['transaction'].seed_idx
-                
-                # Get original transaction indices (for reference)
-                if hasattr(graph_batch, 'seed_indices'):
-                    transaction_indices = graph_batch.seed_indices
-                
-                # Call the graph encoder - THIS IS THE CRUCIAL ACTIVE GNN PART
-                node_embeddings_dict = self.graph_encoder(graph_batch.x_dict, graph_batch.edge_index_dict)
-                
+                # Ensure graph data is on the correct device BEFORE passing to encoder
+                graph_batch_dev = graph_batch.to(device)
+
+                # Call the graph encoder
+                node_embeddings_dict = self.graph_encoder(graph_batch_dev.x_dict, graph_batch_dev.edge_index_dict)
+
                 if 'transaction' in node_embeddings_dict:
                     tx_embeds_all = node_embeddings_dict['transaction']
-                    
-                    # Extract embeddings for the original seed nodes
-                    if seed_idx_in_sample is not None:
-                        # Use the stored seed indices to get the correct embeddings
-                        graph_embed = tx_embeds_all[seed_idx_in_sample]
+
+                    # Extract embeddings for the seed nodes specified
+                    if seed_indices_for_graph is not None:
+                         # Ensure indices are valid for the output embeddings
+                         if seed_indices_for_graph.max() < tx_embeds_all.shape[0]:
+                              graph_embed = tx_embeds_all[seed_indices_for_graph.to(device)] # Use provided indices
+                         else:
+                              print(f"[ERROR] Fuse: seed_indices_for_graph out of bounds for GNN output. Max index: {seed_indices_for_graph.max()}, Output shape: {tx_embeds_all.shape}")
+                              graph_embed = None
                     else:
-                        # Fallback: assume seed nodes are first if mapping isn't available
-                        num_seed_nodes = batch_size if batch_size is not None else \
-                                         (len(text_batch) if text_batch is not None else \
-                                          (user_ids.shape[0] if user_ids is not None else None))
-                        
-                        if num_seed_nodes is not None and tx_embeds_all.shape[0] >= num_seed_nodes:
-                            graph_embed = tx_embeds_all[:num_seed_nodes]
-                        else:
-                            print(f"[WARN] Fuse: Cannot determine seed node count. tx_embeds shape: {tx_embeds_all.shape}")
-                            graph_embed = tx_embeds_all  # Use all as fallback
-                    
+                         # If no specific indices, assume the first N embeddings correspond to the batch
+                         # This requires graph_batch to be a pre-sampled subgraph where seed nodes are first
+                         if tx_embeds_all.shape[0] >= effective_batch_size:
+                              graph_embed = tx_embeds_all[:effective_batch_size]
+                         else:
+                              print(f"[WARN] Fuse: GNN output ({tx_embeds_all.shape[0]}) is smaller than effective batch size ({effective_batch_size}). Using available embeddings.")
+                              graph_embed = tx_embeds_all # Use all available
+
                     if graph_embed is not None and graph_embed.shape[0] > 0:
+                        # Final check on batch size consistency
+                        if graph_embed.shape[0] != effective_batch_size:
+                            print(f"[WARN] Fuse: Graph embedding size ({graph_embed.shape[0]}) mismatch with effective batch size ({effective_batch_size}).")
+                            # Attempt to use graph_embed size as reference? Risky. Let pre-fusion check handle it.
                         embeddings_to_fuse['graph'] = graph_embed
-                    else:
+                    elif effective_batch_size > 0:
                         print("[WARN] Fuse: Empty graph embeddings after extraction.")
                 else:
                     print("[WARN] Fuse: GNN output missing 'transaction' embeddings.")
-            except Exception as e: 
+            except Exception as e:
                 print(f"[ERROR] Fuse (Graph Encoder Call): {e}")
-                import traceback
                 traceback.print_exc()
         elif self.use_gnn_encoder:
             print("[WARN] Fuse: GNN is enabled but graph_batch was not provided or was None.")
 
-        # --- 2. Sequence Encoding --- 
+
+        # --- 2. Sequence Encoding ---
         if self.sequence_encoder and sequence_batch is not None:
             try:
                 seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
                 if seq_embed is not None and seq_embed.shape[0] > 0:
-                    # Basic batch size check
-                    ref_len = graph_embed.shape[0] if graph_embed is not None else (len(text_batch) if text_batch else None)
-                    if ref_len is not None and seq_embed.shape[0] != ref_len: pass # Mismatch handled in fusion check
                     embeddings_to_fuse['sequence'] = seq_embed
             except Exception as e: print(f"[ERROR] Fuse (Sequence): {e}")
 
-        # --- 3. Text Encoding --- 
+        # --- 3. Text Encoding ---
         if self.text_encoder and text_batch is not None:
              if text_batch: # Ensure not empty
                  try:
@@ -761,216 +642,411 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                           embeddings_to_fuse['text'] = text_embed
                  except Exception as e: print(f"[ERROR] Fuse (Text): {e}")
 
-        # --- 4. User Embedding --- 
+        # --- 4. User Embedding ---
         if self.user_embedding and user_ids is not None:
-            if self.user_embedding.num_embeddings > 0:
-                try:
-                    user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
-                    user_embed = self.user_embedding(user_ids_clamped) # Already on device
-                    if user_embed is not None and user_embed.shape[0] > 0: embeddings_to_fuse['user'] = user_embed
-                except Exception as e: print(f"[ERROR] Fuse (User): {e}")
+            try:
+                user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
+                user_embed = self.user_embedding(user_ids_clamped) # Already on device
+                if user_embed is not None and user_embed.shape[0] > 0: embeddings_to_fuse['user'] = user_embed
+            except Exception as e: print(f"[ERROR] Fuse (User): {e}")
 
-        # --- Pre-Fusion Checks & Fusion --- 
-        if not embeddings_to_fuse: 
+        # --- Pre-Fusion Checks & Fusion ---
+        if not embeddings_to_fuse:
              print("[ERROR] Fuse: No embeddings available for fusion after processing inputs.")
              return None
 
-        # <<< Update Fusion Input Dims Check if needed >>>
-        # The AttentionFusion module needs to be initialized with the expected dimension
-        # of the combined graph features if concatenation is used.
-        # This might require adjusting the config passed to AttentionFusion init.
-
-        expected_bs = None
+        # Check consistency against effective_batch_size
         for name, emb in embeddings_to_fuse.items():
-            current_bs = emb.shape[0]
-            if expected_bs is None: expected_bs = current_bs
-            elif current_bs != expected_bs: print(f"[ERROR] Fuse: Mismatched batch sizes {name}:{current_bs} vs {expected_bs}"); return None
-            if emb.device != self.device: print(f"[ERROR] Fuse: {name} on wrong device {emb.device}"); return None
-        if expected_bs == 0: return None
+            if emb.shape[0] != effective_batch_size:
+                 print(f"[ERROR] Fuse: Mismatched batch sizes! {name}:{emb.shape[0]} vs expected:{effective_batch_size}")
+                 return None
+            if emb.device != self.device:
+                 print(f"[ERROR] Fuse: {name} on wrong device {emb.device}")
+                 return None
 
         try:
             fused_representation, _ = self.fusion_module(embeddings_to_fuse)
             return fused_representation
         except Exception as e:
-             print(f"[ERROR] Fusion module failed: {e}"); return None
+             print(f"[ERROR] Fusion module failed: {e}"); traceback.print_exc(); return None
 
-    def get_fused_features(self,
-                           graph_batch: Optional[HeteroData] = None,
-                           sequence_batch: Optional[Any] = None,
-                           text_batch: Optional[List[str]] = None,
-                           user_ids: Optional[torch.Tensor] = None,
-                           batch_size: Optional[int] = None
-                           ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Fetches fused features from the model.
+    # --- Standard (non-MAML) _step ---
+    def _step(self, batch: Any, batch_idx: int, stage: str) -> Optional[torch.Tensor]:
+        """Common logic for standard (non-MAML) train/val/test steps."""
+        # --- Unpack Batch & Extract Data (from NeighborLoader output) ---
+        if not isinstance(batch, HeteroData):
+            print(f"[ERROR] {stage}_step received unexpected batch type: {type(batch)}. Expected HeteroData.")
+            return None
 
-        Args:
-            graph_batch: HeteroData object containing graph data.
-            sequence_batch: Dict containing sequence data.
-            text_batch: List of text strings.
-            user_ids: Tensor of user IDs.
-            batch_size: Optional batch size for slicing GNN output.
+        graph_batch = batch # Input is the sampled subgraph from NeighborLoader
+        batch_size = graph_batch['transaction'].batch_size # Get batch size from loader output
 
-        Returns:
-            Tuple containing:
-                - global_logits: Tensor of global class logits.
-                - user_specific_logits: Tensor of user-specific class logits.
-                - scheduleC_logits: Tensor of schedule C class logits.
-        """
-        # Ensure other inputs are on the correct device
-        device = self.device
-        if graph_batch is not None and hasattr(graph_batch, 'to'): # Check if graph_batch can be moved
-            graph_batch = graph_batch.to(device)
-        if sequence_batch is not None:
-            sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in sequence_batch.items()}
-        if user_ids is not None:
-            user_ids = user_ids.to(device)
+        # --- Extract Features and Labels from the Subgraph Batch ---
+        sequence_batch = None
+        text_batch = None
+        user_ids = None
+        global_target = None
+        user_target = None
+        scheduleC_target = None
 
-        embeddings_to_fuse = {}
-        graph_embed = None
+        try:
+            tx_store = graph_batch['transaction']
 
-        # --- 1. Graph Encoding ---
-        if self.graph_encoder and graph_batch:
-            try:
-                # Pass both x_dict and edge_index_dict
-                node_embeddings_dict = self.graph_encoder(graph_batch.x_dict, graph_batch.edge_index_dict)
+            # Features are already on the subgraph, just need to select the target nodes (first batch_size)
+            # GNN features are handled by forward pass
+            # Sequence
+            if self.use_sequence_encoder and hasattr(tx_store, 'seq_features') and hasattr(tx_store, 'seq_lengths'):
+                 if tx_store.seq_features.shape[0] >= batch_size:
+                     sequence_batch = {
+                         'sequences': tx_store.seq_features[:batch_size],
+                         'lengths': tx_store.seq_lengths[:batch_size]
+                     }
+                     if hasattr(tx_store, 'seq_cat_features') and tx_store.seq_cat_features.shape[0] >= batch_size:
+                          sequence_batch['seq_cat_features'] = tx_store.seq_cat_features[:batch_size]
+                 else: print(f"[WARN] {stage}_step: Insufficient seq_features elements in batch.")
 
-                if 'transaction' in node_embeddings_dict:
-                     if batch_size is None:
-                          if user_ids is not None: batch_size = user_ids.shape[0]
-                          # Add fallback using maybe _raw_text length if text_encoder is on?
-                          elif self.use_text_encoder and text_batch is not None: batch_size = len(text_batch)
-                          else: raise ValueError("Forward pass needs batch_size if graph_batch is provided.")
+            # Text (requires retrieving raw text based on original indices)
+            # This requires original indices to be passed by NeighborLoader or accessible.
+            # NeighborLoader usually passes 'n_id' (original node IDs).
+            if self.use_text_encoder and hasattr(tx_store, 'n_id'):
+                 original_indices = tx_store.n_id[:batch_size] # Original indices of the batch nodes
+                 # Fetch raw text from the full graph reference using these original indices
+                 _, _, text_batch, _ = self._get_features_for_indices(original_indices)
+                 if text_batch is None:
+                     print(f"[WARN] {stage}_step: Failed to retrieve text for batch indices.")
+                     text_batch = [""] * batch_size # Fallback
+            elif self.use_text_encoder:
+                 print(f"[WARN] {stage}_step: Text enabled, but cannot get original indices ('n_id') from batch.")
 
-                     num_nodes_in_batch_output = node_embeddings_dict['transaction'].shape[0]
-                     if batch_size > num_nodes_in_batch_output:
-                         print(f"[WARN] Forward: batch_size ({batch_size}) > GNN output nodes ({num_nodes_in_batch_output}). Slicing available nodes.")
-                         graph_embed = node_embeddings_dict['transaction'][:num_nodes_in_batch_output]
-                     elif batch_size > 0:
-                          graph_embed = node_embeddings_dict['transaction'][:batch_size]
-                     # else: batch_size might be 0, graph_embed remains None
+            # User ID
+            if hasattr(tx_store, 'user_id_code'): # Assuming user_id_code is copied by loader
+                 if tx_store.user_id_code.shape[0] >= batch_size:
+                     user_ids = tx_store.user_id_code[:batch_size]
+                 else: print(f"[WARN] {stage}_step: Insufficient user_id_code elements in batch.")
+            elif hasattr(tx_store, 'n_id') and self._full_data_ref: # Fallback: get from full graph
+                 original_indices = tx_store.n_id[:batch_size]
+                 if 'user_id_code' in self._full_data_ref['transaction']:
+                     user_ids = self._full_data_ref['transaction'].user_id_code[original_indices]
+                 else: print(f"[WARN] {stage}_step: Cannot find user_id_code in full graph data.")
 
-                     if graph_embed is not None and graph_embed.shape[0] > 0: # Check size > 0
-                         embeddings_to_fuse['graph'] = graph_embed.to(self.device)
-                     elif batch_size > 0: # Only warn if batch_size was expected to be > 0
-                          print("[WARN] Forward: HGT 'transaction' embedding is None or empty after slicing.")
 
+            # Labels
+            if hasattr(tx_store, 'y_global') and tx_store.y_global.shape[0] >= batch_size:
+                global_target = tx_store.y_global[:batch_size]
+            if hasattr(tx_store, 'y_user') and tx_store.y_user.shape[0] >= batch_size:
+                user_target = tx_store.y_user[:batch_size]
+            if self.use_scheduleC_head and hasattr(tx_store, 'y_scheduleC'):
+                 if tx_store.y_scheduleC.shape[0] >= batch_size:
+                     scheduleC_target = tx_store.y_scheduleC[:batch_size]
+
+        except Exception as e:
+            print(f"[ERROR] Failed during standard batch data extraction in {stage}_step: {e}")
+            traceback.print_exc()
+            return None
+
+        # --- Validation after extraction ---
+        # ... (existing validation checks, ensure they use extracted variables) ...
+        target_available = False
+        if self.global_head and global_target is not None: target_available = True
+        if self.user_specific_head and user_target is not None: target_available = True
+        if self.scheduleC_head and scheduleC_target is not None: target_available = True
+        if not target_available and stage != 'predict':
+             print(f"[WARN] {stage}_step (batch {batch_idx}): No target labels found. Skipping batch.")
+             return None
+        if self.user_embedding and user_ids is None:
+             print(f"[WARN] {stage}_step (batch {batch_idx}): user_ids is None but user embedding is active. Skipping batch.")
+             return None
+        # Add checks for sequence_batch / text_batch if needed
+
+        # --- Forward pass ---
+        # Pass the subgraph directly, forward pass expects HeteroData
+        global_logits, user_specific_logits, scheduleC_logits = self(
+            graph_batch=graph_batch, # Pass the subgraph from NeighborLoader
+            sequence_batch=sequence_batch,
+            text_batch=text_batch,
+            user_ids=user_ids,
+            batch_size=batch_size # Pass size explicitly
+        )
+
+        # --- Loss Calculation ---
+        logits_produced = global_logits is not None or user_specific_logits is not None or scheduleC_logits is not None
+        if not logits_produced:
+             print(f"[WARN] {stage}_step (batch {batch_idx}): No logits produced by forward pass. Skipping loss calculation.")
+             return None
+
+        # Pass targets (should be on CPU or correct device for loss function)
+        total_loss, loss_global, loss_user, loss_scheduleC = self._calculate_mtl_loss(
+            global_logits, global_target, # Pass targets directly
+            user_specific_logits, user_target,
+            scheduleC_logits, scheduleC_target
+        )
+
+        # --- Accuracy Calculation ---
+        # Use numerator/denominator for accurate aggregation
+        global_correct, global_total = self._calculate_accuracy_numerator_denominator(global_logits, global_target)
+        user_correct, user_total = self._calculate_accuracy_numerator_denominator(user_specific_logits, user_target)
+        scheduleC_correct, scheduleC_total = self._calculate_accuracy_numerator_denominator(scheduleC_logits, scheduleC_target)
+
+        # --- Logging & Return ---
+        # Determine log batch size from any available target count
+        log_batch_size = global_total or user_total or scheduleC_total or 0
+        if log_batch_size == 0: log_batch_size = 1 # Avoid division by zero
+
+        log_dict = { f'{stage}/total_loss': total_loss }
+        # Only log metrics for active heads/losses
+        if self.global_head:
+             log_dict[f'{stage}/global_loss'] = loss_global
+             log_dict[f'{stage}/acc_global_num'] = float(global_correct)
+             log_dict[f'{stage}/acc_global_den'] = float(global_total)
+             avg_acc_global = global_correct / global_total if global_total > 0 else 0.0
+             log_dict[f'{stage}/acc_global'] = avg_acc_global # Log average for prog bar
+
+        if self.user_specific_head:
+             log_dict[f'{stage}/user_loss'] = loss_user
+             log_dict[f'{stage}/acc_user_num'] = float(user_correct)
+             log_dict[f'{stage}/acc_user_den'] = float(user_total)
+             avg_acc_user = user_correct / user_total if user_total > 0 else 0.0
+             log_dict[f'{stage}/acc_user'] = avg_acc_user
+
+        if self.scheduleC_head:
+             log_dict[f'{stage}/scheduleC_loss'] = loss_scheduleC
+             log_dict[f'{stage}/acc_scheduleC_num'] = float(scheduleC_correct)
+             log_dict[f'{stage}/acc_scheduleC_den'] = float(scheduleC_total)
+             avg_acc_schedC = scheduleC_correct / scheduleC_total if scheduleC_total > 0 else 0.0
+             log_dict[f'{stage}/acc_scheduleC'] = avg_acc_schedC
+
+        # Use sync_dist=True for distributed training
+        self.log_dict(log_dict, on_step=(stage=='train'), on_epoch=True, prog_bar=True, batch_size=log_batch_size, sync_dist=True)
+
+        # Return total_loss only for the training stage driver
+        return total_loss if stage == 'train' else None
+
+    # --- Lightning Hooks ---
+    # training_step modified above to handle MAML case correctly
+
+    def validation_step(self, batch: Any, batch_idx: int) -> None:
+        stage = 'val'
+        if self._use_maml_runtime_flag:
+             batch_of_tasks = None
+             if isinstance(batch, list): batch_of_tasks = batch
+             elif isinstance(batch, dict) and 'support' in batch: batch_of_tasks = self._reconstruct_maml_batch(batch)
+
+             if batch_of_tasks:
+                 self._meta_eval_step(batch_of_tasks, batch_idx, stage=stage)
+             else: print(f"[ERROR] {stage}_step: Unexpected or failed reconstruction of batch type for MAML: {type(batch)}")
+        else:
+             self._step(batch, batch_idx, stage=stage)
+
+    def test_step(self, batch: Any, batch_idx: int) -> None:
+        stage = 'test'
+        if self._use_maml_runtime_flag:
+             batch_of_tasks = None
+             if isinstance(batch, list): batch_of_tasks = batch
+             elif isinstance(batch, dict) and 'support' in batch: batch_of_tasks = self._reconstruct_maml_batch(batch)
+
+             if batch_of_tasks:
+                 self._meta_eval_step(batch_of_tasks, batch_idx, stage=stage)
+             else: print(f"[ERROR] {stage}_step: Unexpected or failed reconstruction of batch type for MAML: {type(batch)}")
+        else:
+             self._step(batch, batch_idx, stage=stage)
+
+    # _reconstruct_maml_batch added below
+
+    def configure_optimizers(self):
+        # Only optimize parameters that require grad
+        params_to_optimize = filter(lambda p: p.requires_grad, self.parameters())
+
+        # Determine learning rate based on MAML mode or not
+        # Use meta_lr for the outer loop MAML optimizer if specified, else use base learning_rate
+        lr = self.hparams.meta_lr if self._use_maml_runtime_flag and hasattr(self.hparams, 'meta_lr') else self.hparams.learning_rate
+
+        optimizer = torch.optim.AdamW(
+            params_to_optimize,
+            lr=lr,
+            weight_decay=self.hparams.weight_decay
+        )
+        print(f"[INFO] configure_optimizers: Using LR={lr:.2e} (MAML Mode: {self._use_maml_runtime_flag})")
+        # Add scheduler later if needed
+        return optimizer
+
+    # _meta_eval_step added below
+    # _reconstruct_maml_batch added below
+
+    # --- MAML Helper Methods ---
+    def _meta_eval_step(self, batch_of_tasks: List[Dict[str, Tuple[torch.Tensor, torch.Tensor]]], batch_idx: int, stage: str) -> None:
+        """ Performs MAML evaluation (adaptation + query evaluation) without meta-update. """
+        total_outer_loss = 0.0
+        total_query_acc_numerator = 0.0
+        total_query_samples = 0
+        tasks_processed = 0
+
+        target_head_attr = f"{self.hparams.maml_head_label_type}_specific_head"
+        target_loss_attr = f"focal_loss_{self.hparams.maml_head_label_type}"
+        if not hasattr(self, target_head_attr) or getattr(self, target_head_attr) is None:
+            print(f"[{stage}] MAML target head '{target_head_attr}' not found or is None. Skipping eval batch.")
+            return
+        if not hasattr(self, target_loss_attr) or getattr(self, target_loss_attr) is None:
+            print(f"[{stage}] MAML target loss '{target_loss_attr}' not found or is None. Skipping eval batch.")
+            return
+
+        original_head = getattr(self, target_head_attr)
+        loss_fn = getattr(self, target_loss_attr)
+
+
+        for task_data in batch_of_tasks:
+            support_indices, support_labels = task_data['support']
+            query_indices, query_labels = task_data['query']
+
+            support_labels = support_labels.to(self.device)
+            query_labels = query_labels.to(self.device)
+
+            if support_indices.numel() == 0 or query_indices.numel() == 0:
+                continue # Skip empty tasks
+
+            # --- Inner Loop Adaptation (Enable Grads for adaptation itself) ---
+            with torch.enable_grad(): # Gradients needed for FOMAML update
+                learner = l2l.clone_module(original_head)
+
+                inner_loop_failed = False
+                for _ in range(self.hparams.adaptation_steps):
+                    # Pass seed indices explicitly to fused representation method
+                    graph_batch_supp, seq_batch_supp, text_batch_supp, user_ids_supp = self._get_features_for_indices(support_indices)
+                    if graph_batch_supp is None and seq_batch_supp is None and text_batch_supp is None and user_ids_supp is None:
+                         inner_loop_failed=True; break
+
+                    support_fused = self._get_fused_representation(
+                        graph_batch=graph_batch_supp, # Can be full graph
+                        seed_indices_for_graph=support_indices, # Pass indices
+                        sequence_batch=seq_batch_supp,
+                        text_batch=text_batch_supp,
+                        user_ids=user_ids_supp,
+                    )
+                    if support_fused is None: inner_loop_failed=True; break
+
+                    support_preds = learner(support_fused)
+                    inner_loss = loss_fn(support_preds, support_labels)
+
+                    grads = torch.autograd.grad(inner_loss,
+                                                learner.parameters(),
+                                                create_graph=False) # FOMAML
+
+                    l2l.update_module(learner, updates=grads, lr=self.hparams.inner_lr)
+            # --- End Inner Loop ---
+            if inner_loop_failed: print(f"[{stage}] Skipping task eval due to inner loop feature failure."); continue
+
+            # --- Evaluate on Query Set (No Grads needed for eval) ---
+            with torch.no_grad():
+                graph_batch_qry, seq_batch_qry, text_batch_qry, user_ids_qry = self._get_features_for_indices(query_indices)
+                if graph_batch_qry is None and seq_batch_qry is None and text_batch_qry is None and user_ids_qry is None:
+                     print(f"[{stage}] Skipping task eval due to query feature failure."); continue
+
+                query_fused = self._get_fused_representation(
+                    graph_batch=graph_batch_qry, # Can be full graph
+                    seed_indices_for_graph=query_indices, # Pass indices
+                    sequence_batch=seq_batch_qry,
+                    text_batch=text_batch_qry,
+                    user_ids=user_ids_qry,
+                )
+                if query_fused is None: print(f"[{stage}] Skipping task eval due to query fusion failure."); continue
+
+                query_preds = learner(query_fused)
+                outer_loss = loss_fn(query_preds, query_labels)
+
+                # --- Accumulate Results ---
+                if not torch.isnan(outer_loss).any() and not torch.isinf(outer_loss).any():
+                    total_outer_loss += outer_loss.item() # Accumulate scalar value
+                    # Use numerator/denominator method for accuracy
+                    current_acc_num, current_samples = self._calculate_accuracy_numerator_denominator(query_preds, query_labels)
+                    total_query_acc_numerator += current_acc_num
+                    total_query_samples += current_samples
+                    tasks_processed += 1
                 else:
-                    print("[WARN] Forward: HGT output missing 'transaction' embeddings.")
-            except Exception as e:
-                print(f"[ERROR] HGT Encoder forward failed: {e}")
-                import traceback
-                traceback.print_exc() # Print full traceback for GNN errors
+                    print(f"[{stage}] Outer loss is NaN/Inf for user {task_data.get('user_id', 'Unknown')}. Skipping task result.")
 
-        # --- 2. Sequence Encoding ---
-        if self.sequence_encoder and sequence_batch is not None:
-            try:
-                seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
-                if seq_embed is not None and seq_embed.shape[0] > 0:
-                    # Ensure batch size matches graph if graph is used
-                    if graph_embed is not None and seq_embed.shape[0] != graph_embed.shape[0]:
-                         print(f"[ERROR] Forward: Sequence batch size ({seq_embed.shape[0]}) mismatch with Graph ({graph_embed.shape[0]})")
-                    else:
-                        embeddings_to_fuse['sequence'] = seq_embed.to(self.device)
-                elif graph_embed is not None and graph_embed.shape[0] > 0: # Check if expected based on graph
-                    print("[WARN] Forward: TFT output is None or empty.")
-            except Exception as e:
-                print(f"[ERROR] TFT Encoder forward failed: {e}")
+        # --- Logging ---
+        if tasks_processed > 0:
+             avg_outer_loss = total_outer_loss / tasks_processed
+             avg_query_acc = (total_query_acc_numerator / total_query_samples) if total_query_samples > 0 else 0.0
 
-        # --- 3. Text Encoding ---
-        if self.text_encoder and text_batch is not None:
-            try:
-                text_embed = self.text_encoder(text_batch)
-                if text_embed is not None and text_embed.shape[0] > 0:
-                    # Ensure batch size matches graph if graph is used
-                    ref_shape = graph_embed.shape[0] if graph_embed is not None else (seq_embed.shape[0] if 'sequence' in embeddings_to_fuse else None)
-                    if ref_shape is not None and text_embed.shape[0] != ref_shape:
-                         print(f"[ERROR] Forward: Text batch size ({text_embed.shape[0]}) mismatch with reference ({ref_shape})")
-                    else:
-                         embeddings_to_fuse['text'] = text_embed.to(self.device)
-                elif ref_shape is not None and ref_shape > 0: # Check if expected
-                    print("[WARN] Forward: FinBERT output is None or empty.")
+             log_batch_size = tasks_processed # Log per task
+             log_dict = {
+                 f'{stage}/meta_outer_loss': avg_outer_loss,
+                 # Log accuracy numerator and denominator for correct aggregation
+                 f'{stage}/meta_query_acc_{self.hparams.maml_head_label_type}_num': total_query_acc_numerator,
+                 f'{stage}/meta_query_acc_{self.hparams.maml_head_label_type}_den': float(total_query_samples),
+                 # Log averaged accuracy for convenience (prog bar)
+                 f'{stage}/meta_query_acc_{self.hparams.maml_head_label_type}': avg_query_acc
+             }
+             self.log_dict(log_dict, on_step=False, on_epoch=True, prog_bar=True, batch_size=log_batch_size, sync_dist=True)
+        else:
+             print(f"[{stage}] No tasks successfully processed in evaluation batch.")
 
-            except Exception as e:
-                print(f"[ERROR] FinBERT Encoder forward failed: {e}")
+        # No loss returned for eval steps
 
-        # --- 4. User Embedding ---
-        if self.user_embedding and user_ids is not None:
-             # Check if num_users > 0 before trying to embed
-            if self.user_embedding.num_embeddings > 0:
-                try:
-                    # Clamp user_ids to be safe
-                    user_ids_clamped = torch.clamp(user_ids, 0, self.user_embedding.num_embeddings - 1)
-                    user_embed = self.user_embedding(user_ids_clamped.to(self.device))
-                    if user_embed is not None and user_embed.shape[0] > 0:
-                        # Ensure batch size matches graph if graph is used
-                        ref_shape = graph_embed.shape[0] if graph_embed is not None else (embeddings_to_fuse.get('sequence', embeddings_to_fuse.get('text', None)).shape[0] if embeddings_to_fuse else None)
-                        if ref_shape is not None and user_embed.shape[0] != ref_shape:
-                            print(f"[ERROR] Forward: User ID batch size ({user_embed.shape[0]}) mismatch with reference ({ref_shape})")
-                        else:
-                            embeddings_to_fuse['user'] = user_embed.to(self.device)
-                    elif ref_shape is not None and ref_shape > 0: # Check if expected
-                         print("[WARN] Forward: User embedding is None or empty.")
-                except Exception as e:
-                    print(f"[ERROR] User Embedding forward failed: {e}")
-            else:
-                print("[WARN] Forward: Skipping user embedding as num_users is 0.")
+    def _reconstruct_maml_batch(self, collated_batch: Dict) -> Optional[List[Dict]]:
+         """Helper to reconstruct a list of tasks from a collated batch dictionary."""
+         try:
+             # Determine number of tasks, check for tensor vs list structure from collate_fn
+             if 'user_id' not in collated_batch:
+                  print("[ERROR] Cannot reconstruct MAML batch: 'user_id' key missing.")
+                  return None
+
+             if isinstance(collated_batch['user_id'], list):
+                  num_tasks = len(collated_batch['user_id'])
+             elif torch.is_tensor(collated_batch['user_id']):
+                  num_tasks = collated_batch['user_id'].shape[0]
+             else:
+                  print("[ERROR] Cannot determine number of tasks from user_id field type.")
+                  return None
+
+             if num_tasks == 0: return [] # Return empty list if no tasks
+
+             reconstructed_batch = []
+             # Check if keys exist before accessing
+             support_data = collated_batch.get('support')
+             query_data = collated_batch.get('query')
+             user_id_batch = collated_batch['user_id']
+
+             if not isinstance(support_data, (list, tuple)) or len(support_data) != 2:
+                  print("[ERROR] Invalid 'support' data format in collated batch.")
+                  return None
+             if not isinstance(query_data, (list, tuple)) or len(query_data) != 2:
+                  print("[ERROR] Invalid 'query' data format in collated batch.")
+                  return None
+
+             support_indices_batch = support_data[0]
+             support_labels_batch = support_data[1]
+             query_indices_batch = query_data[0]
+             query_labels_batch = query_data[1]
+
+             # Check if lengths match num_tasks
+             if not (len(support_indices_batch) == num_tasks and
+                     len(support_labels_batch) == num_tasks and
+                     len(query_indices_batch) == num_tasks and
+                     len(query_labels_batch) == num_tasks):
+                   print("[ERROR] Mismatch between num_tasks and length of support/query data lists.")
+                   return None
 
 
-        # --- Pre-Fusion Checks ---
-        if not embeddings_to_fuse:
-            print("[ERROR] Forward: No embeddings available for fusion.")
-            return None, None, None # Return three Nones
-
-        ref_batch_size = None
-        first_key = next(iter(embeddings_to_fuse))
-        ref_batch_size = embeddings_to_fuse[first_key].shape[0]
-
-        if ref_batch_size == 0:
-             print("[WARN] Forward: Fusion input batch size is 0. Returning None.")
-             return None, None, None
-
-        for name, emb in embeddings_to_fuse.items():
-             if emb.shape[0] != ref_batch_size:
-                  print(f"[ERROR] Forward: Mismatched batch size for {name}: {emb.shape[0]} vs {ref_batch_size}. Skipping fusion.")
-                  return None, None, None
-             if emb.device != self.device:
-                  print(f"[ERROR] Forward: Embedding {name} is on wrong device: {emb.device} vs {self.device}. Skipping fusion.")
-                  return None, None, None
-
-        # --- 5. Fusion ---
-        fused_representation = None
-        try:
-            fused_representation, _ = self.fusion_module(embeddings_to_fuse)
-        except Exception as e:
-             print(f"[ERROR] Fusion module forward failed: {e}")
-             return None, None, None # Return Nones if fusion fails
-
-        # --- 6. Classify ---
-        global_logits = None
-        user_specific_logits = None
-        scheduleC_logits = None # Initialize
-
-        if fused_representation is None:
-             print("[ERROR] Forward: Fused representation is None after fusion module.")
-             return None, None, None
-
-        try:
-            if self.global_head:
-                 global_logits = self.global_head(fused_representation)
-            if self.user_specific_head:
-                 user_specific_logits = self.user_specific_head(fused_representation)
-            # <<< Conditional Schedule C Classification >>>
-            if self.scheduleC_head:
-                 scheduleC_logits = self.scheduleC_head(fused_representation)
-        except Exception as e:
-             print(f"[ERROR] Classifier head forward failed: {e}")
-             # Return Nones based on which heads exist
-             return (None if self.global_head else global_logits,
-                     None if self.user_specific_head else user_specific_logits,
-                     None if self.scheduleC_head else scheduleC_logits)
-
-        return global_logits, user_specific_logits, scheduleC_logits # Return all three
+             for i in range(num_tasks):
+                  # Access elements assuming default collate stacked tensors or kept lists
+                  support_indices = support_indices_batch[i]
+                  support_labels = support_labels_batch[i]
+                  query_indices = query_indices_batch[i]
+                  query_labels = query_labels_batch[i]
+                  user_id = user_id_batch[i]
+                  task = {
+                      'support': (support_indices, support_labels),
+                      'query': (query_indices, query_labels),
+                      'user_id': user_id
+                  }
+                  reconstructed_batch.append(task)
+             return reconstructed_batch
+         except Exception as e:
+             print(f"[ERROR] Failed to reconstruct MAML batch: {e}")
+             print(f"Collated Batch type: {type(collated_batch)}, Batch keys: {collated_batch.keys()}")
+             traceback.print_exc() # Print traceback for reconstruction errors
+             return None
 
     def _calculate_mtl_loss(self,
                               global_logits: Optional[torch.Tensor], global_target: Optional[torch.Tensor],
@@ -1063,561 +1139,36 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             accuracy = correct.mean()
         return accuracy
 
-    def _step(self, batch: Any, batch_idx: int, stage: str) -> Optional[torch.Tensor]:
-        """Common logic for train/val/test steps."""
-        # --- Unpack Batch & Extract Data ---
-        graph_batch = None
-        sequence_batch = None
-        text_batch = None
-        user_ids = None
-        global_target = None
-        user_target = None
-        scheduleC_target = None # Initialize
-        batch_size = None
+    def _calculate_accuracy_numerator_denominator(self, logits: Optional[torch.Tensor], targets: Optional[torch.Tensor]) -> Tuple[float, int]:
+        """Helper to calculate sum of correct predictions and number of valid samples."""
+        if logits is None or targets is None or logits.shape[0] == 0 or targets.shape[0] == 0:
+             return 0.0, 0
+        if logits.shape[0] != targets.shape[0]:
+             print(f"[WARN] Accuracy calc: Logits batch ({logits.shape[0]}) != Targets batch ({targets.shape[0]})")
+             return 0.0, 0
 
-        # Assuming batch is HeteroData from HGTLoader if GNN is used
-        if self.use_gnn_encoder:
-            if not isinstance(batch, HeteroData):
-                print(f"[ERROR] {stage}_step received unexpected batch type: {type(batch)} when GNN enabled.")
-                return None
-            graph_batch = batch # Pass the full sampled graph
-        else:
-             # Handle non-GNN batch format (e.g., a dictionary)
-             # This needs specific implementation based on how non-GNN loader yields data
-             print(f"[WARN] {stage}_step running without GNN. Assuming batch is a dictionary (implement proper handling).")
-             if not isinstance(batch, dict):
-                  print(f"[ERROR] {stage}_step received unexpected batch type: {type(batch)} when GNN disabled.")
-                  return None
-             # Example: Extract data needed for non-GNN modalities from the dict
-             # sequence_batch = batch.get('sequence_data')
-             # text_batch = batch.get('text_data')
-             # user_ids = batch.get('user_ids')
-             # global_target = batch.get('global_labels')
-             # ... etc ...
-             # Need to determine batch_size from the available data
-             # batch_size = user_ids.shape[0] if user_ids is not None else len(text_batch) # Example
-             # For now, we'll assume the required data is present in the HeteroData structure even if GNN isn't used for processing
-             if not isinstance(batch, HeteroData): # Fallback check
-                  print(f"[ERROR] {stage}_step requires HeteroData structure even if GNN is off for current data extraction logic.")
-                  return None
-             graph_batch = batch # Still use HeteroData for unpacking, just won't pass to GNN encoder
+        # Ensure targets are on the same device as logits FOR COMPARISON
+        targets_dev = targets.to(logits.device)
 
+        # Check if targets contain only ignored values (e.g., -1)
+        valid_mask = targets_dev >= 0 # Assuming negative values are ignored
+        valid_targets = targets_dev[valid_mask]
 
-        try:
-            if 'transaction' in graph_batch.node_types:
-                tx_store = graph_batch['transaction']
+        if valid_targets.numel() == 0:
+            return 0.0, 0 # No valid targets to calculate accuracy on
 
-                # Determine batch_size (number of seed nodes for HGTLoader, or total nodes if not HGT)
-                # HGTLoader adds 'batch_size' attribute to the central node type store
-                if hasattr(tx_store, 'batch_size') and tx_store.batch_size is not None:
-                     batch_size = tx_store.batch_size
-                     if batch_size == 0:
-                          print(f"[WARN] {stage}_step (batch {batch_idx}): tx_store.batch_size is 0. Skipping batch.")
-                          return None
-                elif hasattr(tx_store, 'input_id'): # Fallback for HGTLoader if batch_size missing
-                     batch_size = tx_store.input_id.shape[0]
-                     if batch_size == 0: print(f"[WARN] {stage}_step (batch {batch_idx}): Determined batch_size=0 from input_id. Skipping.") ; return None
-                     print(f"[INFO] {stage}_step (batch {batch_idx}): Used input_id length for batch_size: {batch_size}")
-                elif hasattr(tx_store, 'num_nodes'):
-                     # If not using HGTLoader, batch_size might just be the number of nodes in the batch graph
-                     batch_size = tx_store.num_nodes
-                     if batch_size == 0: print(f"[WARN] {stage}_step (batch {batch_idx}): Determined batch_size=0 from num_nodes. Skipping.") ; return None
-                     # print(f"[INFO] {stage}_step (batch {batch_idx}): Used tx_store.num_nodes for batch_size: {batch_size}")
-                else:
-                     print(f"[ERROR] {stage}_step (batch {batch_idx}): Cannot determine batch_size.")
-                     return None
+        logits_valid = logits[valid_mask]
 
-                # --- Fetch data by slicing first batch_size elements (assumes target nodes are first) ---
-                # This slicing logic is specific to HGTLoader's output where target nodes are first.
-                # If using a different loader, data extraction needs adjustment.
-                nodes_available = tx_store.num_nodes
-                if batch_size > nodes_available:
-                     print(f"[WARN] {stage}_step (batch {batch_idx}): Required batch_size ({batch_size}) > nodes available ({nodes_available}). Using available.")
-                     slice_len = nodes_available
-                else:
-                     slice_len = batch_size
+        if logits_valid.shape[0] == 0: # Double check after filtering
+             return 0.0, 0
 
-                if slice_len == 0: print(f"[WARN] {stage}_step (batch {batch_idx}): Effective batch size is 0 after checks. Skipping."); return None
+        with torch.no_grad():
+            preds = torch.argmax(logits_valid, dim=1)
+            # Clamp targets based on the number of classes in logits AFTER filtering
+            num_classes = logits_valid.shape[1]
+            # Ensure targets are long type for comparison
+            targets_clamped = torch.clamp(valid_targets.long(), 0, num_classes - 1)
+            correct_sum = (preds == targets_clamped).float().sum().item()
+            num_valid_samples = valid_targets.numel()
 
-                # User ID
-                if hasattr(tx_store, 'user_id_code'):
-                    if tx_store.user_id_code.shape[0] >= slice_len:
-                        user_ids = tx_store.user_id_code[:slice_len]
-                    else: print(f"[WARN] {stage}_step (batch {batch_idx}): Insufficient user_id_code elements.")
-
-                # Text (_raw_text is Python list, handle differently)
-                if self.use_text_encoder and hasattr(tx_store, '_raw_text'):
-                    if tx_store._raw_text is not None and len(tx_store._raw_text) >= slice_len:
-                         # _raw_text might be on the whole graph, need mapping if GNN sampled
-                         if hasattr(tx_store, 'input_id'): # HGTLoader provides input_id map
-                             original_indices = tx_store.input_id[:slice_len] # Get original indices of seed nodes
-                             # Need the full graph's _raw_text IF _raw_text wasn't copied to batch
-                             # This assumes _raw_text IS copied/sliced correctly by the loader
-                             text_batch = [tx_store._raw_text[i] for i in range(slice_len)] # Simpler if loader handles it
-                         elif len(tx_store._raw_text) == tx_store.num_nodes: # Assume direct mapping if no input_id
-                              text_batch = tx_store._raw_text[:slice_len]
-                         else:
-                              print(f"[WARN] {stage}_step (batch {batch_idx}): Cannot map _raw_text, length mismatch ({len(tx_store._raw_text)}) vs nodes ({tx_store.num_nodes}).")
-                    else: print(f"[WARN] {stage}_step (batch {batch_idx}): Missing or insufficient _raw_text elements.")
-
-                # Sequence
-                if self.use_sequence_encoder and hasattr(tx_store, 'seq_features') and hasattr(tx_store, 'seq_lengths'):
-                    # Assume sequence features are already sliced correctly for the batch_size nodes
-                    if tx_store.seq_features.shape[0] >= slice_len:
-                        sequence_batch = {
-                            'sequences': tx_store.seq_features[:slice_len],
-                            'lengths': tx_store.seq_lengths[:slice_len]
-                        }
-                        # Add categorical features if they exist and match size
-                        if hasattr(tx_store, 'seq_cat_features') and tx_store.seq_cat_features.shape[0] >= slice_len:
-                             sequence_batch['seq_cat_features'] = tx_store.seq_cat_features[:slice_len]
-                        # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Missing or incorrectly sized seq_cat_features.")
-                    else: print(f"[WARN] {stage}_step (batch {batch_idx}): Insufficient seq_features elements.")
-
-                # Labels
-                if hasattr(tx_store, 'y_global') and tx_store.y_global.shape[0] >= slice_len:
-                    global_target = tx_store.y_global[:slice_len]
-                # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Cannot extract global_target.")
-
-                if hasattr(tx_store, 'y_user') and tx_store.y_user.shape[0] >= slice_len:
-                    user_target = tx_store.y_user[:slice_len]
-                # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Cannot extract user_target.")
-
-                # <<< Conditional Schedule C Label Extraction >>>
-                if self.use_scheduleC_head and hasattr(tx_store, 'y_scheduleC'):
-                     if tx_store.y_scheduleC.shape[0] >= slice_len:
-                         scheduleC_target = tx_store.y_scheduleC[:slice_len]
-                     # else: print(f"[DEBUG] {stage}_step (batch {batch_idx}): Cannot extract scheduleC_target.")
-
-
-            else: # 'transaction' node type not found
-                 print(f"[WARN] {stage}_step (batch {batch_idx}): 'transaction' node type not found in batch.")
-                 return None
-
-        except Exception as e:
-            print(f"[ERROR] Failed during batch data extraction in {stage}_step (batch {batch_idx}): {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-        # --- Validation after extraction ---
-        # Check if at least one target is available based on active heads
-        target_available = False
-        if self.global_head and global_target is not None: target_available = True
-        if self.user_specific_head and user_target is not None: target_available = True
-        if self.scheduleC_head and scheduleC_target is not None: target_available = True
-
-        if not target_available and stage != 'predict': # Need labels for train/val/test
-            print(f"[WARN] {stage}_step (batch {batch_idx}): No target labels found for active heads. Skipping batch.")
-            return None
-        # Check user_ids if user embedding is used
-        if self.user_embedding and self.user_embedding.num_embeddings > 0 and user_ids is None:
-             print(f"[WARN] {stage}_step (batch {batch_idx}): user_ids is None but user embedding is active. Skipping batch.")
-             return None
-        # Check other required inputs based on enabled modalities
-        if self.use_sequence_encoder and sequence_batch is None:
-              print(f"[WARN] {stage}_step (batch {batch_idx}): sequence_batch is None but sequence encoder is active. Skipping batch.")
-              return None
-        if self.use_text_encoder and text_batch is None:
-              print(f"[WARN] {stage}_step (batch {batch_idx}): text_batch is None but text encoder is active. Skipping batch.")
-              return None
-
-        # --- Forward pass ---
-        device = self.device
-        # Move graph batch to device only if GNN is used
-        if self.use_gnn_encoder and graph_batch is not None:
-             graph_batch = graph_batch.to(device)
-        # Move other inputs to device
-        user_ids = user_ids.to(device) if user_ids is not None else None
-        if isinstance(sequence_batch, dict):
-             sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k,v in sequence_batch.items()}
-        # Text batch remains on CPU, handled by text encoder
-
-        # Pass determined batch_size to forward (crucial for GNN slicing)
-        global_logits, user_specific_logits, scheduleC_logits = self( # Unpack third logit
-            graph_batch=graph_batch if self.use_gnn_encoder else None, # Pass graph only if used
-            sequence_batch=sequence_batch,
-            text_batch=text_batch,
-            user_ids=user_ids,
-            batch_size=slice_len # Use the actual number of nodes being processed
-        )
-
-        # --- Loss Calculation ---
-        # Check if any logits were produced (at least one head must be active)
-        logits_produced = global_logits is not None or user_specific_logits is not None or scheduleC_logits is not None
-        if not logits_produced:
-             print(f"[WARN] {stage}_step (batch {batch_idx}): No logits produced by forward pass. Skipping loss calculation.")
-             return None
-
-        # Ensure targets are on CPU for the loss function (it handles moving them)
-        total_loss, loss_global, loss_user, loss_scheduleC = self._calculate_mtl_loss( # Unpack fourth loss
-            global_logits, global_target.cpu() if global_target is not None else None,
-            user_specific_logits, user_target.cpu() if user_target is not None else None,
-            scheduleC_logits, scheduleC_target.cpu() if scheduleC_target is not None else None # Pass schedule C items
-        )
-
-        # --- Accuracy Calculation ---
-        acc_global = self._calculate_accuracy(global_logits, global_target)
-        acc_user = self._calculate_accuracy(user_specific_logits, user_target)
-        acc_scheduleC = self._calculate_accuracy(scheduleC_logits, scheduleC_target) # Calculate Schedule C Acc
-
-        # --- Logging & Return ---
-        # Determine log batch size from any available logits
-        log_batch_size = 0
-        if global_logits is not None: log_batch_size = global_logits.shape[0]
-        elif user_specific_logits is not None: log_batch_size = user_specific_logits.shape[0]
-        elif scheduleC_logits is not None: log_batch_size = scheduleC_logits.shape[0]
-        if log_batch_size == 0:
-            print(f"[WARN] {stage}_step (batch {batch_idx}): Log batch size is 0. Skipping logging.")
-            # Still return loss for training step if calculated
-            return total_loss if stage == 'train' and torch.is_tensor(total_loss) else None
-
-
-        log_dict = { f'{stage}/total_loss': total_loss }
-        # Only log metrics for active heads/losses
-        if self.global_head:
-             log_dict[f'{stage}/global_loss'] = loss_global
-             log_dict[f'{stage}/acc_global'] = acc_global
-        if self.user_specific_head:
-             log_dict[f'{stage}/user_loss'] = loss_user
-             log_dict[f'{stage}/acc_user'] = acc_user
-        if self.scheduleC_head:
-             log_dict[f'{stage}/scheduleC_loss'] = loss_scheduleC
-             log_dict[f'{stage}/acc_scheduleC'] = acc_scheduleC
-
-        # Use sync_dist=True for distributed training
-        self.log_dict(log_dict, on_step=(stage=='train'), on_epoch=True, prog_bar=True, batch_size=log_batch_size, sync_dist=True)
-
-
-        # Return total_loss only for the training stage driver
-        return total_loss if stage == 'train' else None
-
-    # --- Standard Lightning Hooks ---
-    def training_step(self, batch: Any, batch_idx: int) -> Optional[torch.Tensor]:
-        # <<< Use reliable runtime flag for dispatch >>>
-        if self._use_maml_runtime_flag:
-            meta_optimizer = self.optimizers() # Get meta-optimizer for manual update
-            meta_optimizer.zero_grad()
-
-            # --- Process Batch of Tasks --- 
-            batch_of_tasks = None
-            # Handle potential collation by default DataLoader
-            if isinstance(batch, dict) and 'support' in batch and 'query' in batch:
-                 # Reconstruct list of tasks if collated
-                 try:
-                     num_tasks = len(batch['user_id']) # Assuming user_id marks tasks
-                     reconstructed_batch = []
-                     for i in range(num_tasks):
-                          # Adapt access based on how collate_fn might structure it
-                          support_indices = batch['support'][0][i] # Assuming first dim is batch
-                          support_labels = batch['support'][1][i]
-                          query_indices = batch['query'][0][i]
-                          query_labels = batch['query'][1][i]
-                          user_id = batch['user_id'][i] # Assume user_id is indexable
-
-                          task = {
-                              'support': (support_indices, support_labels),
-                              'query': (query_indices, query_labels),
-                              'user_id': user_id
-                          }
-                          reconstructed_batch.append(task)
-                     batch_of_tasks = reconstructed_batch # Use reconstructed list
-                 except Exception as e:
-                      print(f"[ERROR] Failed to reconstruct MAML batch in training_step: {e}")
-                      print(f"Batch type: {type(batch)}, Batch keys: {batch.keys() if isinstance(batch, dict) else 'N/A'}")
-                      return None # Skip batch if reconstruction fails
-            elif isinstance(batch, list): # Already a list of tasks
-                 batch_of_tasks = batch
-            else:
-                 print(f"[ERROR] training_step: Unexpected batch type for MAML: {type(batch)}")
-                 return None
-
-            if batch_of_tasks is None: return None # Exit if batch processing failed
-
-            # --- MAML Inner/Outer Loop Logic (Moved here from non-existent meta_training_step) --- 
-            total_outer_loss = 0.0
-            avg_query_acc = 0.0
-            tasks_processed = 0
-
-            # <<< FIX: Correct attribute name construction >>>
-            target_head_attr = f"{self.hparams.maml_head_label_type}_specific_head"
-            # Loss name seems correct already
-            target_loss_attr = f"focal_loss_{self.hparams.maml_head_label_type}"
-            if not hasattr(self, target_head_attr) or getattr(self, target_head_attr) is None:
-                print(f"[ERROR] MAML target head '{target_head_attr}' not found or is None.")
-                return None
-            if not hasattr(self, target_loss_attr) or getattr(self, target_loss_attr) is None:
-                print(f"[ERROR] MAML target loss '{target_loss_attr}' not found or is None.")
-                return None
-
-            original_head = getattr(self, target_head_attr)
-            loss_fn = getattr(self, target_loss_attr)
-
-            for task_data in batch_of_tasks:
-                support_indices, support_labels = task_data['support']
-                query_indices, query_labels = task_data['query']
-
-                support_labels = support_labels.to(self.device)
-                query_labels = query_labels.to(self.device)
-
-                if support_indices.numel() == 0 or query_indices.numel() == 0:
-                    print(f"[WARN] Skipping task for user {task_data.get('user_id', 'Unknown')} due to empty support/query indices.")
-                    continue
-
-                # --- Inner Loop Adaptation ---
-                learner = l2l.clone_module(original_head)
-                # --- REMOVE Standard Inner Optimizer ---
-                # inner_optimizer = torch.optim.SGD(learner.parameters(), lr=self.hparams.inner_lr)
-
-                for _ in range(self.hparams.adaptation_steps):
-                    # 1. Get features (now includes graph_batch)
-                    graph_batch_supp, seq_batch_supp, text_batch_supp, user_ids_supp = self._get_features_for_indices(support_indices)
-                    
-                    # 2. Get fused representation (pass graph_batch)
-                    support_fused = self._get_fused_representation(
-                        graph_batch=graph_batch_supp, # Pass the subgraph
-                        sequence_batch=seq_batch_supp,
-                        text_batch=text_batch_supp, 
-                        user_ids=user_ids_supp,
-                        # batch_size derived internally now
-                    )
-                    if support_fused is None: print(f"[WARN] Inner Loop: Could not get fused features for support set. Skipping adapt step."); break
-                    
-                    # 3. Calculate loss with adapted learner
-                    support_preds = learner(support_fused)
-                    inner_loss = loss_fn(support_preds, support_labels)
-
-                    # 4. Adapt the learner using learn2learn utilities (FOMAML style)
-                    # Calculate gradients w.r.t. learner's parameters
-                    grads = torch.autograd.grad(inner_loss, 
-                                                learner.parameters(), 
-                                                create_graph=False) # create_graph=False for FOMAML
-                    
-                    # Manually update the learner's parameters
-                    # <<< FIX: Correct path for update_module >>>
-                    l2l.update_module(learner, updates=grads, lr=self.hparams.inner_lr)
-                    
-                    # No inner_optimizer step needed
-                # torch.enable_grad() context ends here
-
-                # --- Outer Loop Evaluation ---
-                # 1. Get features for query set (now includes graph_batch)
-                graph_batch_qry, seq_batch_qry, text_batch_qry, user_ids_qry = self._get_features_for_indices(query_indices)
-                
-                # 2. Get fused representation for query set (pass graph_batch)
-                query_fused = self._get_fused_representation(
-                    graph_batch=graph_batch_qry, # Pass the subgraph
-                    sequence_batch=seq_batch_qry,
-                    text_batch=text_batch_qry, 
-                    user_ids=user_ids_qry,
-                    # batch_size derived internally now
-                )
-                if query_fused is None: print(f"[WARN] Outer Loop: Could not get fused features for query set. Skipping task."); continue
-                
-                # 3. Evaluate with adapted learner (no grad)
-                with torch.no_grad():
-                    query_preds = learner(query_fused)
-                    outer_loss = loss_fn(query_preds, query_labels)
-
-                # --- Accumulate Results --- 
-                if not torch.isnan(outer_loss).any() and not torch.isinf(outer_loss).any():
-                     total_outer_loss += outer_loss
-                     avg_query_acc += self._calculate_accuracy(query_preds, query_labels)
-                     tasks_processed += 1
-                else:
-                     print(f"[WARN] Outer loss is NaN/Inf for user {task_data.get('user_id', 'Unknown')}. Skipping task.")
-
-            # --- Meta-Update --- 
-            if tasks_processed > 0:
-                avg_outer_loss = total_outer_loss / tasks_processed
-                avg_query_acc /= tasks_processed
-                self.manual_backward(avg_outer_loss) # Calculate gradients for original_head
-                meta_optimizer.step() # Update original_head
-                self.log(f'train/meta_outer_loss', avg_outer_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=tasks_processed, sync_dist=True)
-                self.log(f'train/meta_query_acc', avg_query_acc, on_step=False, on_epoch=True, prog_bar=True, batch_size=tasks_processed, sync_dist=True)
-                return avg_outer_loss
-            else:
-                print("[WARN] No tasks processed in meta-batch. Skipping meta-update.")
-                return None # No loss to return
-        else:
-            # Call renamed standard step method
-            return self._standard_step(batch, batch_idx, stage='train')
-
-    def validation_step(self, batch: Any, batch_idx: int) -> None:
-        stage = 'val'
-        # <<< Use reliable runtime flag for dispatch >>>
-        if self._use_maml_runtime_flag:
-             # Similar batch restructuring logic as training_step if needed
-             if isinstance(batch, dict) and 'support' in batch and 'query' in batch:
-                  try:
-                      num_tasks = len(batch['user_id'])
-                      batch_of_tasks = []
-                      for i in range(num_tasks):
-                           # Simplified reconstruction (adapt based on actual collate behavior)
-                           support_indices = batch['support'][0][i]
-                           support_labels = batch['support'][1][i]
-                           query_indices = batch['query'][0][i]
-                           query_labels = batch['query'][1][i]
-                           user_id = batch['user_id'][i]
-                           batch_of_tasks.append({
-                               'support': (support_indices, support_labels),
-                               'query': (query_indices, query_labels),
-                               'user_id': user_id
-                           })
-                      self._meta_eval_step(batch_of_tasks, batch_idx, stage=stage)
-                  except Exception as e:
-                       print(f"[ERROR] Failed to reconstruct MAML batch in validation_step: {e}")
-             elif isinstance(batch, list):
-                  # <<< FIX: Pass correct target head attribute name here too >>>
-                  self._meta_eval_step(batch, batch_idx, stage=stage)
-             else: print(f"[ERROR] {stage}_step: Unexpected batch type for MAML: {type(batch)}")
-        else:
-            # Call renamed standard step method
-            self._standard_step(batch, batch_idx, stage=stage)
-
-    def test_step(self, batch: Any, batch_idx: int) -> None:
-        stage = 'test'
-        # <<< Use reliable runtime flag for dispatch >>>
-        if self._use_maml_runtime_flag:
-             # Similar batch restructuring logic as training_step if needed
-             if isinstance(batch, dict) and 'support' in batch and 'query' in batch:
-                  try:
-                     num_tasks = len(batch['user_id'])
-                     batch_of_tasks = []
-                     for i in range(num_tasks):
-                          # Simplified reconstruction (adapt based on actual collate behavior)
-                          support_indices = batch['support'][0][i]
-                          support_labels = batch['support'][1][i]
-                          query_indices = batch['query'][0][i]
-                          query_labels = batch['query'][1][i]
-                          user_id = batch['user_id'][i]
-                          batch_of_tasks.append({
-                              'support': (support_indices, support_labels),
-                              'query': (query_indices, query_labels),
-                              'user_id': user_id
-                          })
-                     self._meta_eval_step(batch_of_tasks, batch_idx, stage=stage)
-                  except Exception as e:
-                      print(f"[ERROR] Failed to reconstruct MAML batch in test_step: {e}")
-             elif isinstance(batch, list):
-                  # <<< FIX: Pass correct target head attribute name here too >>>
-                  self._meta_eval_step(batch, batch_idx, stage=stage)
-             else: print(f"[ERROR] {stage}_step: Unexpected batch type for MAML: {type(batch)}")
-        else:
-            # Call renamed standard step method
-            self._standard_step(batch, batch_idx, stage=stage)
-
-    def configure_optimizers(self):
-        # TODO: Implement differential LR (e.g., lower LR for text encoder) if needed
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.parameters()), # Only optimize parameters that require grad
-            lr=self.hparams.learning_rate,
-            weight_decay=self.hparams.weight_decay
-        )
-        print("[INFO] configure_optimizers: Returning simple AdamW optimizer.")
-        # Example Scheduler (Optional):
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
-        # return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "monitor": "val/total_loss"}}
-        return optimizer
-        # Add scheduler later if needed 
-
-    def _meta_eval_step(self, batch_of_tasks: List[Dict[str, Tuple[torch.Tensor, torch.Tensor]]], batch_idx: int, stage: str) -> None:
-        """ Performs MAML evaluation (adaptation + query evaluation) without meta-update. """
-
-        total_outer_loss = 0.0
-        avg_query_acc = 0.0
-        tasks_processed = 0
-
-        for task_data in batch_of_tasks:
-            support_indices, support_labels = task_data['support']
-            query_indices, query_labels = task_data['query']
-
-            support_labels = support_labels.to(self.device)
-            query_labels = query_labels.to(self.device)
-
-            if support_indices.numel() == 0 or query_indices.numel() == 0:
-                print(f"[WARN] Skipping task for user {task_data.get('user_id', 'Unknown')} due to empty support/query indices.")
-                continue
-
-            # Enable gradients for inner loop adaptation during evaluation
-            with torch.enable_grad():
-                # Clone the adaptable head
-                learner = l2l.clone_module(getattr(self, f"{self.hparams.maml_head_label_type}_specific_head"))
-
-                for _ in range(self.hparams.adaptation_steps):
-                    # 1. Get features (now includes graph_batch)
-                    graph_batch_supp, seq_batch_supp, text_batch_supp, user_ids_supp = self._get_features_for_indices(support_indices)
-                    
-                    # 2. Get fused representation (pass graph_batch)
-                    support_fused = self._get_fused_representation(
-                        graph_batch=graph_batch_supp, # Pass subgraph
-                        sequence_batch=seq_batch_supp,
-                        text_batch=text_batch_supp, 
-                        user_ids=user_ids_supp,
-                        # batch_size derived internally now
-                    )
-                    if support_fused is None: break # Stop adaptation if features fail
-
-                    # 3. Apply cloned head (learner) - requires grad
-                    support_preds = learner(support_fused)
-                    inner_loss = getattr(self, f"focal_loss_{self.hparams.maml_head_label_type}")(support_preds, support_labels)
-
-                    # 4. Adapt the learner using learn2learn utilities (FOMAML style)
-                    # Calculate gradients w.r.t. learner's parameters
-                    grads = torch.autograd.grad(inner_loss, 
-                                                learner.parameters(), 
-                                                create_graph=False) # create_graph=False for FOMAML
-                    
-                    # Manually update the learner's parameters
-                    l2l.update_module(learner, updates=grads, lr=self.hparams.inner_lr)
-                
-                # torch.enable_grad() context ends here
-
-            # --- Evaluate on Query Set --- 
-            # 1. Get Features for query set (now includes graph_batch)
-            graph_batch_qry, seq_batch_qry, text_batch_qry, user_ids_qry = self._get_features_for_indices(query_indices)
-            
-            # 2. Get fused representation for query set (pass graph_batch)
-            query_fused = self._get_fused_representation(
-                graph_batch=graph_batch_qry, # Pass subgraph
-                sequence_batch=seq_batch_qry,
-                text_batch=text_batch_qry, 
-                user_ids=user_ids_qry,
-                # batch_size derived internally now
-            )
-            if query_fused is None:
-                 print(f"[WARN] Eval: Could not get fused features for query set. Skipping task eval.")
-                 continue # Skip task if features fail
-
-            # 3. Apply learner within no_grad context
-            with torch.no_grad():
-                query_preds = learner(query_fused)
-                outer_loss = getattr(self, f"focal_loss_{self.hparams.maml_head_label_type}")(query_preds, query_labels)
-
-            # --- Accumulate Results --- 
-            if not torch.isnan(outer_loss).any() and not torch.isinf(outer_loss).any():
-                total_outer_loss += outer_loss
-                avg_query_acc += self._calculate_accuracy(query_preds, query_labels)
-                tasks_processed += 1
-            else:
-                print(f"[WARN] Outer loss is NaN/Inf for user {task_data.get('user_id', 'Unknown')}. Skipping task.")
-
-        # --- Logging & Return ---
-        # Determine log batch size from any available logits
-        log_batch_size = 0
-        if avg_query_acc > 0: log_batch_size = tasks_processed
-        if log_batch_size == 0:
-            print(f"[WARN] {stage}_step (batch {batch_idx}): Log batch size is 0. Skipping logging.")
-            # Still return loss for training step if calculated
-            return total_outer_loss if stage == 'train' and torch.is_tensor(total_outer_loss) else None
-
-        log_dict = { f'{stage}/total_loss': total_outer_loss }
-        # Only log metrics for active heads/losses
-        if getattr(self, f"{self.hparams.maml_head_label_type}_specific_head"):
-            log_dict[f'{stage}/acc'] = avg_query_acc
-
-        # Use sync_dist=True for distributed training
-        self.log_dict(log_dict, on_step=(stage=='train'), on_epoch=True, prog_bar=True, batch_size=log_batch_size, sync_dist=True)
-
-        # Return total_loss only for the training stage driver
-        return total_outer_loss if stage == 'train' else None 
+        return correct_sum, num_valid_samples
