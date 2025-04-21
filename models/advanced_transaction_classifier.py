@@ -291,49 +291,210 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                                  ) -> Tuple[Optional[HeteroData], Optional[Any], Optional[List[str]], Optional[torch.Tensor]]:
         """
         Fetches input features for specific transaction indices from self._full_data_ref.
-        Assumes _full_data_ref is the *processed* graph.
+        Performs k-hop subgraph sampling for GNN if enabled.
+        Retrieves sequence and text data for the specified indices.
         """
-        if self._full_data_ref is None or not isinstance(self._full_data_ref, HeteroData): print("[ERROR] _get_features_for_indices: _full_data_ref missing."); return None, None, None, None
+        if self._full_data_ref is None or not isinstance(self._full_data_ref, HeteroData):
+            print("[ERROR] _get_features_for_indices: _full_data_ref (processed graph) is None or invalid.")
+            return None, None, None, None
         full_graph = self._full_data_ref
-        if transaction_indices is None or transaction_indices.numel() == 0: print("[WARN] _get_features_for_indices: Empty indices."); return None, None, None, None
-        indices_np = transaction_indices.cpu().numpy()
-        device = self.device
-        graph_batch, sequence_batch, text_batch, user_ids = None, None, None, None
+
+        if transaction_indices is None or transaction_indices.numel() == 0:
+             print("[WARN] _get_features_for_indices: Received empty or None indices.")
+             return None, None, None, None
+
+        # Ensure indices are long and on CPU for indexing/sampling logic
+        seed_indices_tensor = transaction_indices.cpu().long()
+        indices_np = seed_indices_tensor.numpy()
+        device = self.device # Target device for final user_ids tensor
+
+        # --- Initialize outputs ---
+        graph_batch = None # Will hold the sampled subgraph
+        sequence_batch = None
+        text_batch = None
+        user_ids = None
+
         try:
+            # Check node existence for safety against transaction indices
             num_tx_nodes = full_graph['transaction'].num_nodes
-            if np.any(indices_np >= num_tx_nodes): print(f"[ERROR] _get_features_for_indices: Indices out of bounds."); return None, None, None, None
+            if np.any(indices_np >= num_tx_nodes):
+                 offending_indices = indices_np[indices_np >= num_tx_nodes]
+                 print(f"[ERROR] _get_features_for_indices: Indices out of bounds. Max tx node index: {num_tx_nodes-1}. Offending: {offending_indices}")
+                 return None, None, None, None
+
+            # --- 1. Subgraph Sampling (if GNN enabled) ---
             if self.use_gnn_encoder:
-                 # Option A: Pass full graph reference, rely on _get_fused_representation to handle slicing via seed_indices_for_graph
-                 graph_batch = full_graph
+                try:
+                    print(f"[DEBUG] MAML Subgraph Sampling for {len(seed_indices_tensor)} seed nodes...")
+                    k_hops = self._graph_config.get('maml_sampling_hops', 2)
+                    num_neighbors = self._graph_config.get('maml_sampling_neighbors', [15, 10]) # Placeholder if needed
+                    
+                    # --- Manual k-Hop Subgraph Implementation for HeteroData ---
+                    sampled_nodes = {'transaction': set(indices_np)} # Start with seed nodes
+                    frontier = {'transaction': sampled_nodes['transaction'].copy()}
+                    all_sampled_edges = {etype: set() for etype in full_graph.edge_types} # Store (src_orig, dst_orig) tuples
+
+                    # Initialize sets for other node types
+                    for ntype in full_graph.node_types:
+                        if ntype != 'transaction':
+                            sampled_nodes[ntype] = set()
+                            frontier[ntype] = set()
+
+                    # BFS for k hops
+                    for hop in range(k_hops):
+                        next_frontier = {ntype: set() for ntype in full_graph.node_types}
+                        print(f"[DEBUG] Sampling Hop {hop+1}/{k_hops}...")
+                        nodes_added_this_hop = 0
+                        edges_added_this_hop = 0
+
+                        for edge_type in full_graph.edge_types:
+                            src_type, _, dst_type = edge_type
+                            
+                            # Check if source type has nodes in the current frontier
+                            if frontier[src_type]:
+                                # Get edges originating from frontier nodes of src_type
+                                full_edge_index = full_graph[edge_type].edge_index
+                                
+                                # Create a mask for edges starting from the current frontier
+                                # This can be slow for large frontiers/graphs - consider optimization if needed
+                                frontier_nodes_tensor = torch.tensor(list(frontier[src_type]), dtype=torch.long)
+                                edge_mask = torch.isin(full_edge_index[0], frontier_nodes_tensor)
+
+                                # Get target nodes and original indices of the edges found
+                                dst_nodes_indices = full_edge_index[1][edge_mask]
+                                src_nodes_indices = full_edge_index[0][edge_mask] # Source nodes for the matched edges
+                                
+                                # Add newly found destination nodes
+                                new_dst_nodes = set(dst_nodes_indices.numpy()) - sampled_nodes[dst_type]
+                                sampled_nodes[dst_type].update(new_dst_nodes)
+                                next_frontier[dst_type].update(new_dst_nodes)
+                                nodes_added_this_hop += len(new_dst_nodes)
+                                
+                                # Add edges to the collection
+                                current_edges = set(zip(src_nodes_indices.numpy(), dst_nodes_indices.numpy()))
+                                new_edges_count = len(current_edges - all_sampled_edges[edge_type])
+                                all_sampled_edges[edge_type].update(current_edges)
+                                edges_added_this_hop += new_edges_count
+
+                        print(f"[DEBUG] Hop {hop+1}: Added {nodes_added_this_hop} nodes, {edges_added_this_hop} edges.")
+                        frontier = next_frontier
+                        if nodes_added_this_hop == 0 and edges_added_this_hop == 0: # Optimization: stop if no new nodes/edges found
+                             print(f"[DEBUG] Early stopping sampling at hop {hop+1}.")
+                             break
+
+                    # --- Construct the Subgraph HeteroData Object ---
+                    graph_batch = HeteroData()
+                    node_maps = {} # original_index -> new_subgraph_index
+
+                    print("[DEBUG] Building subgraph object...")
+                    # 1. Map nodes and copy features
+                    for node_type, nodes_set in sampled_nodes.items():
+                        if not nodes_set: continue # Skip empty node types
+                        
+                        sorted_nodes = sorted(list(nodes_set))
+                        node_maps[node_type] = {orig_idx: new_idx for new_idx, orig_idx in enumerate(sorted_nodes)}
+                        graph_batch[node_type].num_nodes = len(sorted_nodes)
+                        
+                        if 'x' in full_graph[node_type]:
+                            node_indices_tensor = torch.tensor(sorted_nodes, dtype=torch.long)
+                            graph_batch[node_type].x = full_graph[node_type].x[node_indices_tensor]
+                        
+                        # Copy other necessary attributes (like labels, original_index for transaction)
+                        if node_type == 'transaction':
+                             if 'y_global' in full_graph[node_type]: graph_batch[node_type].y_global = full_graph[node_type].y_global[node_indices_tensor]
+                             if 'y_user' in full_graph[node_type]: graph_batch[node_type].y_user = full_graph[node_type].y_user[node_indices_tensor]
+                             if 'original_index' in full_graph[node_type]: graph_batch[node_type].original_index = full_graph[node_type].original_index[node_indices_tensor]
+                             if 'user_id_code' in full_graph[node_type]: graph_batch[node_type].user_id_code = full_graph[node_type].user_id_code[node_indices_tensor]
+                             # Add timestamp if needed by model architecture (e.g., some GNN layers)
+                             if 'timestamp' in full_graph[node_type]: graph_batch[node_type].timestamp = full_graph[node_type].timestamp[node_indices_tensor]
+
+
+                    # 2. Map edges and copy attributes
+                    for edge_type, edges_set in all_sampled_edges.items():
+                        if not edges_set: continue
+                        
+                        src_type, _, dst_type = edge_type
+                        if src_type not in node_maps or dst_type not in node_maps: continue # Skip if node types not in subgraph
+
+                        src_map = node_maps[src_type]
+                        dst_map = node_maps[dst_type]
+                        
+                        new_edge_indices = []
+                        original_edge_indices_for_attrs = [] # Store original indices to fetch edge_attr
+
+                        # Find original indices of the sampled edges
+                        full_edge_index_np = full_graph[edge_type].edge_index.T.numpy() # Transpose for easier row searching
+                        edge_set_list = list(edges_set) # Convert set to list for consistent ordering? Not strictly needed.
+
+                        # This mapping can be slow, optimize if bottleneck
+                        # Create a quick lookup for edges in the original graph
+                        # full_edge_tuples = set(tuple(row) for row in full_edge_index_np) # Can be large
+
+                        # Store original edge indices corresponding to the edges in edges_set
+                        # We need to map (src_orig, dst_orig) back to the row index in full_graph[edge_type].edge_index
+                        # This is non-trivial. Let's simplify: ONLY copy edge_index first.
+                        # If edge_attr is crucial, this needs careful implementation.
+
+                        for src_orig, dst_orig in edges_set:
+                            if src_orig in src_map and dst_orig in dst_map:
+                                new_src = src_map[src_orig]
+                                new_dst = dst_map[dst_orig]
+                                new_edge_indices.append([new_src, new_dst])
+                                # --- Simplified: Omit edge_attr copying for now ---
+                                # TODO: Implement edge_attr copying if needed by finding original edge index
+                                # -------------------------------------------------
+
+                        if new_edge_indices:
+                            graph_batch[edge_type].edge_index = torch.tensor(new_edge_indices, dtype=torch.long).t().contiguous()
+                            # --- Simplified: Set edge_attr to None ---
+                            graph_batch[edge_type].edge_attr = None
+                            # -----------------------------------------
+                        print(f"[DEBUG] Added {len(new_edge_indices)} edges for type {edge_type}.")
+
+
+                    # 3. Store mapping for seed nodes
+                    if 'transaction' in node_maps:
+                         seed_map = node_maps['transaction']
+                         # Filter seed indices that are actually present in the sampled subgraph
+                         valid_seed_indices = [idx.item() for idx in seed_indices_tensor if idx.item() in seed_map]
+                         if valid_seed_indices:
+                              graph_batch['transaction'].seed_idx_in_sample = torch.tensor(
+                                   [seed_map[orig_idx] for orig_idx in valid_seed_indices], dtype=torch.long
+                              )
+                              # Also store the original indices corresponding to these subgraph seeds
+                              graph_batch['transaction'].original_seed_indices = torch.tensor(valid_seed_indices, dtype=torch.long)
+                         else:
+                              print("[WARN] No valid seed nodes found within the sampled subgraph!")
+                              graph_batch['transaction'].seed_idx_in_sample = torch.tensor([], dtype=torch.long)
+                              graph_batch['transaction'].original_seed_indices = torch.tensor([], dtype=torch.long)
+
+                    print(f"[DEBUG] MAML Subgraph Sampling Complete. Nodes: {graph_batch.num_nodes}, Edges: {graph_batch.num_edges}")
+
+                except ImportError:
+                     print("[ERROR] NeighborSampler not available (check PyG version?). MAML GNN requires efficient sampling.")
+                     graph_batch = None # Fallback if sampler fails
+                except Exception as e_sample:
+                    print(f"[ERROR] Subgraph sampling/preparation failed: {e_sample}")
+                    traceback.print_exc()
+                    graph_batch = None # Fallback to None if sampling fails
+            # else: graph_batch remains None if GNN not used
+
+            # --- 2. Fetch Features ONLY for SEED nodes (transaction_indices) ---
+            #    (Sequence and Text data fetching logic remains the same)
+            # --- (Code from previous correct version) ---
             if 'user_id_code' in full_graph['transaction']: user_ids = full_graph['transaction'].user_id_code[indices_np].to(device)
             if self.use_text_encoder:
                  combined_texts = []
-                 text_keys = [k for k in full_graph['transaction'].keys() if k.endswith('_input_ids')] # Look for tokenized keys
-                 if not text_keys:
-                      # Fallback to raw text if tokenized not found (should not happen after process_graph.py)
-                      raw_text_keys = [k for k in full_graph['transaction'].keys() if k.startswith('_raw_')]
-                      if raw_text_keys:
-                          print("[WARN] MAML using _raw_ text fields. Was process_graph.py run with --prepare_text?")
-                          for i in indices_np:
-                               entry_texts = [str(full_graph['transaction'][key][i]) for key in raw_text_keys if i < len(full_graph['transaction'][key])]
-                               combined_texts.append(" ".join(filter(None, entry_texts)).strip())
-                          text_batch = combined_texts
-                      else: text_batch = [""] * len(indices_np)
-                 else:
-                      # If tokenized keys exist, we actually need the raw text for FinBERT input
-                      # This indicates _get_features should only return raw text, tokenization happens in FinBERTEncoder
-                       raw_text_keys = [k.replace('_input_ids','').replace('_attention_mask','') for k in text_keys if k.startswith('_raw_')] # Try to reconstruct raw keys
-                       raw_text_keys = list(set(k for k in raw_text_keys if k in full_graph['transaction'])) # Check if they exist
-                       if raw_text_keys:
-                           for i in indices_np:
-                                entry_texts = [str(full_graph['transaction'][key][i]) for key in raw_text_keys if i < len(full_graph['transaction'][key])]
-                                combined_texts.append(" ".join(filter(None, entry_texts)).strip())
-                           text_batch = combined_texts
-                       else: # Cannot find raw text, problematic
-                            print("[ERROR] Cannot find corresponding raw text for tokenized fields in MAML feature fetching.")
-                            text_batch = [""] * len(indices_np)
-
-
+                 raw_text_keys = [k for k in full_graph['transaction'].keys() if k.startswith('_raw_')]
+                 if raw_text_keys:
+                     for i in indices_np:
+                         entry_texts = []
+                         for key in raw_text_keys:
+                             try: text_list = full_graph['transaction'][key]; entry_texts.append(str(text_list[i]))
+                             except Exception: entry_texts.append("")
+                         combined_texts.append(" ".join(filter(None, entry_texts)).strip())
+                     text_batch = combined_texts
+                 else: text_batch = [""] * len(indices_np)
             if self.use_sequence_encoder:
                  if 'seq_features' in full_graph['transaction'] and 'seq_lengths' in full_graph['transaction']:
                       seq_feat = full_graph['transaction'].seq_features[indices_np]
@@ -341,43 +502,96 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                       sequence_batch = {'sequences': seq_feat, 'lengths': seq_len}
                       if 'seq_cat_features' in full_graph['transaction']: sequence_batch['seq_cat_features'] = full_graph['transaction'].seq_cat_features[indices_np]
                  else: print("[WARN] _get_features_for_indices: Sequence data missing.")
-        except Exception as e: print(f"[ERROR] _get_features_for_indices failed: {e}"); traceback.print_exc(); return None, None, None, None
+            # --- End Sequence/Text Fetching ---
+
+        except Exception as e:
+            print(f"[ERROR] _get_features_for_indices: Failed during feature extraction: {e}")
+            traceback.print_exc()
+            return None, None, None, None
+
         return graph_batch, sequence_batch, text_batch, user_ids
 
 
     def _get_fused_representation(self,
-                                  graph_batch: Optional[HeteroData] = None,
-                                  seed_indices_for_graph: Optional[torch.Tensor] = None,
+                                  graph_batch: Optional[HeteroData] = None, # Now expects a SUBGRAPH for MAML GNN
+                                  seed_indices_for_graph: Optional[torch.Tensor] = None, # Original indices (still useful for other modalities)
                                   sequence_batch: Optional[Any] = None,
                                   text_batch: Optional[List[str]] = None,
                                   user_ids: Optional[torch.Tensor] = None
                                  ) -> Optional[torch.Tensor]:
-        device = self.device; embeddings_to_fuse = {}; graph_embed = None
+        """Internal helper to run encoders and fusion module, returning only the fused tensor."""
+        device = self.device
+        embeddings_to_fuse = {}
+        graph_embed = None
+
+        # Determine effective batch size from seed_indices if available, else fallback
         effective_batch_size = None
-        if seed_indices_for_graph is not None: effective_batch_size = seed_indices_for_graph.shape[0]
+        if seed_indices_for_graph is not None:
+             effective_batch_size = seed_indices_for_graph.shape[0]
+        # Fallbacks (should match seed_indices size ideally)
         elif text_batch is not None: effective_batch_size = len(text_batch)
         elif sequence_batch is not None and 'sequences' in sequence_batch: effective_batch_size = sequence_batch['sequences'].shape[0]
         elif user_ids is not None: effective_batch_size = user_ids.shape[0]
+
         if effective_batch_size is None or effective_batch_size == 0: print("[WARN] Fuse: Cannot determine effective batch size."); return None
         if sequence_batch is not None: sequence_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in sequence_batch.items()}
         if user_ids is not None: user_ids = user_ids.to(device)
+
+
+        # --- 1. Graph Encoding (Operates on Subgraph if MAML) ---
         if self.graph_encoder and graph_batch is not None:
             try:
-                graph_batch_dev = graph_batch.to(device)
-                node_embeddings_dict = self.graph_encoder(graph_batch_dev.x_dict, graph_batch_dev.edge_index_dict)
+                graph_batch_dev = graph_batch.to(device) # Move subgraph to device
+                # Call the graph encoder on the SUBGRAPH
+                node_embeddings_dict = self.graph_encoder(graph_batch_dev.x_dict, graph_batch_dev.edge_index_dict) # Pass edge_attr if copied
+
                 if 'transaction' in node_embeddings_dict:
-                    tx_embeds_all = node_embeddings_dict['transaction']
-                    if seed_indices_for_graph is not None:
-                         if seed_indices_for_graph.max() < tx_embeds_all.shape[0]: graph_embed = tx_embeds_all[seed_indices_for_graph.to(device)]
-                         else: print(f"[ERROR] Fuse: seed_indices_for_graph out of bounds."); graph_embed = None
-                    else: # Should not happen if seed_indices passed correctly
-                         if tx_embeds_all.shape[0] >= effective_batch_size: graph_embed = tx_embeds_all[:effective_batch_size]
-                         else: print(f"[WARN] Fuse: GNN output smaller than batch size."); graph_embed = tx_embeds_all
-                    if graph_embed is not None and graph_embed.shape[0] > 0: embeddings_to_fuse['graph'] = graph_embed
-                    elif effective_batch_size > 0: print("[WARN] Fuse: Empty graph embeddings.")
-                else: print("[WARN] Fuse: GNN output missing 'transaction' embeddings.")
-            except Exception as e: print(f"[ERROR] Fuse (Graph Encoder Call): {e}"); traceback.print_exc()
-        elif self.use_gnn_encoder: print("[WARN] Fuse: GNN enabled but graph_batch missing.")
+                    tx_embeds_all_subgraph = node_embeddings_dict['transaction']
+
+                    # --- Extract embeddings for original SEED nodes using the stored mapping ---
+                    if hasattr(graph_batch['transaction'], 'seed_idx_in_sample'):
+                         seed_idx_in_sample = graph_batch['transaction'].seed_idx_in_sample.to(device) # Get indices within subgraph
+                         if seed_idx_in_sample.numel() > 0:
+                              # Ensure indices are valid
+                              if seed_idx_in_sample.max() < tx_embeds_all_subgraph.shape[0]:
+                                   graph_embed = tx_embeds_all_subgraph[seed_idx_in_sample]
+                              else:
+                                   print(f"[ERROR] Fuse: seed_idx_in_sample out of bounds for subgraph GNN output!")
+                                   graph_embed = None
+                         else:
+                              print("[WARN] Fuse: seed_idx_in_sample is empty.")
+                              graph_embed = None # No valid seed nodes found in subgraph
+                    else:
+                         # This case should ideally not happen if _get_features_for_indices stores the mapping
+                         print("[WARN] Fuse: seed_idx_in_sample not found on graph_batch. Attempting fallback slice.")
+                         # Fallback: Assume seed nodes are the first N in the subgraph output
+                         if tx_embeds_all_subgraph.shape[0] >= effective_batch_size:
+                              graph_embed = tx_embeds_all_subgraph[:effective_batch_size]
+                         else:
+                              graph_embed = tx_embeds_all_subgraph # Use what's available
+
+                    # --- Validate output size and add to fusion dict ---
+                    if graph_embed is not None and graph_embed.shape[0] > 0:
+                         # The number of embeddings extracted should match the original number of valid seed nodes
+                         expected_seeds = graph_batch['transaction'].original_seed_indices.numel() if hasattr(graph_batch['transaction'], 'original_seed_indices') else effective_batch_size
+                         if graph_embed.shape[0] != expected_seeds:
+                              print(f"[WARN] Fuse: Extracted graph embedding size ({graph_embed.shape[0]}) mismatch with expected seeds ({expected_seeds}).")
+                              # Handle potential size mismatch with other modalities if necessary (e.g., pad?)
+                              # For now, let pre-fusion check handle strict size match.
+                         embeddings_to_fuse['graph'] = graph_embed
+                    elif effective_batch_size > 0:
+                        print("[WARN] Fuse: Empty graph embeddings after extraction.")
+                else:
+                    print("[WARN] Fuse: GNN output missing 'transaction' embeddings.")
+            except Exception as e:
+                print(f"[ERROR] Fuse (Graph Encoder Call): {e}")
+                traceback.print_exc()
+        elif self.use_gnn_encoder:
+            print("[WARN] Fuse: GNN is enabled but graph_batch was not provided or was None.")
+
+
+        # --- 2. Sequence Encoding ---
+        # ... (Sequence, Text, User Embedding logic remains the same) ...
         if self.sequence_encoder and sequence_batch is not None:
             try:
                 seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
@@ -395,50 +609,23 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                 user_embed = self.user_embedding(user_ids_clamped)
                 if user_embed is not None and user_embed.shape[0] > 0: embeddings_to_fuse['user'] = user_embed
             except Exception as e: print(f"[ERROR] Fuse (User): {e}")
+
+        # --- Pre-Fusion Checks & Fusion ---
         if not embeddings_to_fuse: print("[ERROR] Fuse: No embeddings available."); return None
+        # Check consistency against effective_batch_size
+        ref_size = next(iter(embeddings_to_fuse.values())).shape[0] # Get size from first available modality
         for name, emb in embeddings_to_fuse.items():
-            if emb.shape[0] != effective_batch_size: print(f"[ERROR] Fuse: Mismatched batch sizes! {name}:{emb.shape[0]} vs expected:{effective_batch_size}"); return None
+            if emb.shape[0] != ref_size: # Check against the size of the first modality found
+                 print(f"[ERROR] Fuse: Mismatched batch sizes! {name}:{emb.shape[0]} vs reference:{ref_size}")
+                 return None
             if emb.device != self.device: print(f"[ERROR] Fuse: {name} on wrong device {emb.device}"); return None
+        if ref_size == 0: print("[WARN] Fuse: Reference embedding size is 0."); return None
+
         try:
             fused_representation, _ = self.fusion_module(embeddings_to_fuse)
             return fused_representation
         except Exception as e: print(f"[ERROR] Fusion module failed: {e}"); traceback.print_exc(); return None
-
-
-    # --- Loss and Accuracy Calculation ---
-    def _calculate_mtl_loss(self, global_logits, global_target, user_logits, user_target, scheduleC_logits, scheduleC_target):
-        loss_global = torch.tensor(0.0, device=self.device); loss_user = torch.tensor(0.0, device=self.device); loss_scheduleC = torch.tensor(0.0, device=self.device)
-        if self.focal_loss_global and global_logits is not None and global_target is not None:
-            try: loss_global = self.focal_loss_global(global_logits, global_target.to(global_logits.device))
-            except Exception as e: print(f"[ERROR] Global loss failed: {e}"); loss_global = torch.tensor(0.0, device=self.device, requires_grad=True)
-        if self.focal_loss_user and user_logits is not None and user_target is not None:
-            try: loss_user = self.focal_loss_user(user_logits, user_target.to(user_logits.device))
-            except Exception as e: print(f"[ERROR] User loss failed: {e}"); loss_user = torch.tensor(0.0, device=self.device, requires_grad=True)
-        if self.focal_loss_scheduleC and scheduleC_logits is not None and scheduleC_target is not None:
-             if 'scheduleC' in self.hparams.mtl_weights:
-                 try: loss_scheduleC = self.focal_loss_scheduleC(scheduleC_logits, scheduleC_target.to(scheduleC_logits.device))
-                 except Exception as e: print(f"[ERROR] Schedule C loss failed: {e}"); loss_scheduleC = torch.tensor(0.0, device=self.device, requires_grad=True)
-        total_loss = torch.tensor(0.0, device=self.device)
-        weight_global = self.hparams.mtl_weights.get('global', 0.0); weight_user = self.hparams.mtl_weights.get('user', 0.0); weight_scheduleC = self.hparams.mtl_weights.get('scheduleC', 0.0)
-        if weight_global > 0: total_loss += weight_global * loss_global
-        if weight_user > 0: total_loss += weight_user * loss_user
-        if weight_scheduleC > 0: total_loss += weight_scheduleC * loss_scheduleC
-        if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
-              print(f"[WARN] total_loss is NaN/Inf."); total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-              loss_global = torch.tensor(0.0, device=self.device); loss_user = torch.tensor(0.0, device=self.device); loss_scheduleC = torch.tensor(0.0, device=self.device)
-        return total_loss, loss_global, loss_user, loss_scheduleC
-
-    def _calculate_accuracy_numerator_denominator(self, logits: Optional[torch.Tensor], targets: Optional[torch.Tensor]) -> Tuple[float, int]:
-        if logits is None or targets is None or logits.shape[0] == 0 or targets.shape[0] == 0: return 0.0, 0
-        if logits.shape[0] != targets.shape[0]: print(f"[WARN] Acc Calc: Size mismatch."); return 0.0, 0
-        targets_dev = targets.to(logits.device); valid_mask = targets_dev >= 0
-        valid_targets = targets_dev[valid_mask]; logits_valid = logits[valid_mask]
-        if valid_targets.numel() == 0 or logits_valid.shape[0] == 0 : return 0.0, 0
-        with torch.no_grad():
-            preds = torch.argmax(logits_valid, dim=1); num_classes = logits_valid.shape[1]
-            targets_clamped = torch.clamp(valid_targets.long(), 0, num_classes - 1)
-            correct_sum = (preds == targets_clamped).float().sum().item(); num_valid_samples = valid_targets.numel()
-        return correct_sum, num_valid_samples
+        # --- End _get_fused_representation Code ---
 
 
     # --- Lightning Steps ---
