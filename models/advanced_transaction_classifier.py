@@ -659,6 +659,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                     if graph_batch_supp is None and seq_batch_supp is None and text_batch_supp is None and user_ids_supp is None: inner_loop_failed=True; break
                     support_fused = self._get_fused_representation(graph_batch=graph_batch_supp, seed_indices_for_graph=support_indices, sequence_batch=seq_batch_supp, text_batch=text_batch_supp, user_ids=user_ids_supp)
                     if support_fused is None: inner_loop_failed=True; break
+                    support_preds = learner(support_fused); inner_loss = loss_fn(support_preds, support_labels)
                     grads = torch.autograd.grad(inner_loss, learner.parameters(), create_graph=False)
                     updates = [-self.hparams.inner_lr * g for g in grads]
                     l2l.update_module(learner, updates=updates)
@@ -829,6 +830,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                     if graph_batch_supp is None and seq_batch_supp is None and text_batch_supp is None and user_ids_supp is None: inner_loop_failed=True; break
                     support_fused = self._get_fused_representation(graph_batch=graph_batch_supp, seed_indices_for_graph=support_indices, sequence_batch=seq_batch_supp, text_batch=text_batch_supp, user_ids=user_ids_supp)
                     if support_fused is None: inner_loop_failed=True; break
+                    support_preds = learner(support_fused); inner_loss = loss_fn(support_preds, support_labels)
                     grads = torch.autograd.grad(inner_loss, learner.parameters(), create_graph=False)
                     updates = [-self.hparams.inner_lr * g for g in grads]
                     l2l.update_module(learner, updates=updates)
