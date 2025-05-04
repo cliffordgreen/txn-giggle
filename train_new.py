@@ -193,7 +193,7 @@ def train_advanced(
 
     num_hgt_layers = model_config['graph_encoder_params'].get('num_layers', 2) 
     data_module = TransactionDataModuleV2(
-        transactions_df=df,
+        transactions_df_ref=df,
         batch_size=batch_size,
         num_workers=num_workers,
         num_hgt_layers=num_hgt_layers,
