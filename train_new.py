@@ -204,9 +204,7 @@ def train_advanced(
         # Pass flags to DataModule
         use_sequence_encoder=use_seq,
         use_gnn_encoder=use_graph,
-        use_text_encoder=use_text,
-        # Pass the base DataFrame reference
-        transactions_df_ref=df
+        use_text_encoder=use_text
     )
     print("Setting up DataModuleV2...")
     data_module.setup('fit') 
