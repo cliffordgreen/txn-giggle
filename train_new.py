@@ -1,6 +1,10 @@
 import os
 import argparse
 import pandas as pd
+import pyarrow.dataset as ds # Added for reading arrow datasets
+import json # Added for parsing JSON strings
+import glob # Added for finding files
+from tqdm import tqdm # Added for progress bar
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_forecasting.metrics import MAE # Use MAE for TFT init placeholder
@@ -15,61 +19,107 @@ from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable
 from models.advanced_transaction_classifier import AdvancedTransactionCategorizationModel
 
 # Helper function to load data (similar to old train.py)
-def load_data(data_path: str) -> pd.DataFrame:
-    print(f"Loading data from: {data_path}")
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f"Data file not found: {data_path}")
+def load_data(data_dir: str) -> pd.DataFrame:
+    """Loads and preprocesses data from multiple Arrow files in a directory."""
+    print(f"Loading data from directory: {data_dir}")
+    arrow_files = glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True)
+    if not arrow_files:
+        raise FileNotFoundError(f"No .arrow files found in directory: {data_dir}")
+
+    print(f"Found {len(arrow_files)} arrow files. Reading dataset...")
     try:
-        # Handle potential low_memory warning
-        df = pd.read_csv(data_path, low_memory=False)
-        print(f"Data loaded successfully: {len(df)} records")
-        # Basic preprocessing (handle missing essential columns)
-        if 'user_id' not in df.columns:
-            raise ValueError("Missing required column: 'user_id'")
-        if 'category_id' not in df.columns:
-             raise ValueError("Missing required column: 'category_id' (for global labels)")
-        if 'user_category_id' not in df.columns:
-             print("[WARN] 'user_category_id' column not found. User-specific task might fail.")
-             # Optionally create a dummy column if needed downstream
-             # df['user_category_id'] = df['category_id'] # Example: Use global as user 
-
-        # Handle timestamp (use actual column name)
-        timestamp_col = 'books_create_timestamp' # <<< Use correct column name
-        if timestamp_col not in df.columns:
-            print(f"[WARN] Timestamp column '{timestamp_col}' not found. Using default date.")
-            df['timestamp'] = pd.Timestamp('2020-01-01') # Still create standard 'timestamp' col
-        else:
-            print(f"Converting '{timestamp_col}' column to datetime...")
-            # Create the standard 'timestamp' column from the source column
-            df['timestamp'] = pd.to_datetime(df[timestamp_col], errors='coerce')
-            if df['timestamp'].isnull().any():
-                 print(f"[WARN] Coerced {df['timestamp'].isnull().sum()} invalid timestamps to NaT.")
-                 median_date = df['timestamp'].dropna().median()
-                 if pd.isna(median_date): median_date = pd.Timestamp('2020-01-01')
-                 print(f"Filling NaT timestamps with {median_date}")
-                 df['timestamp'].fillna(median_date, inplace=True)
-            print("Timestamp conversion/handling complete.")
-        
-        # Extract time features from the standard 'timestamp' column
-        df['weekday'] = df['timestamp'].dt.weekday
-        df['hour'] = df['timestamp'].dt.hour
-
-        # Handle text fields (replace if different names are used)
-        for col in ['raw_description', 'memo', 'merchant_name']:
-            if col in df:
-                df[col] = df[col].fillna('')
-            else:
-                print(f"[WARN] Text column '{col}' not found. Filling with empty strings.")
-                df[col] = ''
-
+        dataset = ds.dataset(arrow_files, format="arrow")
+        df = dataset.to_table().to_pandas()
+        print(f"Data loaded successfully: {len(df)} records from {len(arrow_files)} files.")
     except Exception as e:
-        print(f"Error loading or processing data from {data_path}: {e}")
+        print(f"Error loading Arrow dataset from {data_dir}: {e}")
         raise
+
+    print("Preprocessing data...")
+    required_cols = ['target_transaction_processed', 'txn_accepted_category_id_str', 'company_name']
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column in Arrow files: '{col}'")
+
+    # --- Extract data from target_transaction_processed ---
+    extracted_data = []
+    # Progress bar for potentially long parsing
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Parsing transactions"):
+        try:
+            # Check if it's already a dict or needs parsing
+            if isinstance(row['target_transaction_processed'], dict):
+                txn_dict = row['target_transaction_processed']
+            else:
+                txn_dict = json.loads(row['target_transaction_processed'])
+
+            extracted_data.append({
+                'amount': float(txn_dict.get('amount', 0.0)), # Convert to float, default 0.0
+                'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'), # Convert to datetime
+                'description': str(txn_dict.get('description', '')), # Ensure string, default ''
+                'memo': str(txn_dict.get('memo', '')), # Ensure string, default ''
+                'merchant_name': str(txn_dict.get('payee', '')) # Use 'payee' as 'merchant_name', ensure string
+            })
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            print(f"[WARN] Error parsing target_transaction_processed on row {row.name if hasattr(row, 'name') else 'UNKNOWN'}: {e}. Using defaults.")
+            extracted_data.append({
+                'amount': 0.0,
+                'timestamp': pd.NaT, # Use NaT for failed timestamp parse
+                'description': '',
+                'memo': '',
+                'merchant_name': ''
+            })
+
+    extracted_df = pd.DataFrame(extracted_data, index=df.index)
+
+    # Combine extracted data with original df (keeping necessary original columns)
+    df = pd.concat([df, extracted_df], axis=1)
+
+    # --- Handle missing timestamps ---
+    if df['timestamp'].isnull().any():
+        num_null = df['timestamp'].isnull().sum()
+        print(f"[WARN] Found {num_null} missing/invalid timestamps after parsing.")
+        # Fallback strategy: Use median or a fixed date
+        median_date = df['timestamp'].dropna().median()
+        if pd.isna(median_date):
+            median_date = pd.Timestamp('2020-01-01') # Default fallback
+        print(f"Filling NaT timestamps with median/default: {median_date}")
+        df['timestamp'].fillna(median_date, inplace=True)
+
+    # --- Extract time features ---
+    df['weekday'] = df['timestamp'].dt.weekday
+    df['hour'] = df['timestamp'].dt.hour
+
+    # --- Ensure other necessary columns exist and have correct types ---
+    # 'txn_accepted_category_id_str' is our target, keep as object/string for now
+    df['txn_accepted_category_id_str'] = df['txn_accepted_category_id_str'].fillna('UNKNOWN').astype(str)
+    # 'company_name' will be used as user_id, keep as object/string
+    df['company_name'] = df['company_name'].fillna('UNKNOWN').astype(str)
+    # 'industry_name' - useful feature potentially
+    if 'industry_name' in df.columns:
+         df['industry_name'] = df['industry_name'].fillna('UNKNOWN').astype(str)
+    else:
+         print("[WARN] 'industry_name' column not found. Will proceed without it.")
+         df['industry_name'] = 'UNKNOWN'
+    # 'num_chart_of_accounts' - useful feature
+    if 'num_chart_of_accounts' in df.columns:
+         df['num_chart_of_accounts'] = pd.to_numeric(df['num_chart_of_accounts'], errors='coerce').fillna(0).astype(int)
+    else:
+         print("[WARN] 'num_chart_of_accounts' column not found. Filling with 0.")
+         df['num_chart_of_accounts'] = 0
+    # 'chart_of_accounts_processed' - keep for DataModule to process
+    if 'chart_of_accounts_processed' not in df.columns:
+        print("[WARN] 'chart_of_accounts_processed' column not found. Graph/features relying on it might be affected.")
+        # Add an empty list/string placeholder if needed by datamodule? For now, just warn.
+
+    # Drop the original processed column if no longer needed
+    # df = df.drop(columns=['target_transaction_processed']) # Optional cleanup
+
+    print("Preprocessing finished.")
     return df
 
 def train_advanced(
     # Data/Output
-    data_path: str,
+    data_dir: str, # Changed from data_path
     output_dir: str,
     # Basic Training Params
     batch_size: int = 32,
@@ -96,13 +146,13 @@ def train_advanced(
     os.makedirs(output_dir, exist_ok=True)
 
     # --- Load Data --- 
-    df = load_data(data_path)
+    df = load_data(data_dir)
 
     # --- Calculate necessary dims from data --- 
-    num_global_classes = df['category_id'].nunique()
-    num_user_classes = df['user_category_id'].nunique() if 'user_category_id' in df else num_global_classes
-    # Need num_users for embedding layer, get from processed df in DataModule init
-    num_users = df['user_id'].nunique() # Estimate here, can be refined if needed
+    num_global_classes = df['txn_accepted_category_id_str'].nunique()
+    num_user_classes = 0 # Adjust if user-specific task is defined later
+    # Need num_users for embedding layer, use 'company_name'
+    num_users = df['company_name'].nunique() # Estimate here, refined in DataModule
     print(f"Derived from data: #Global={num_global_classes}, #User={num_user_classes}, #Users={num_users}")
     
     # --- Data Module V2 --- 
@@ -125,7 +175,9 @@ def train_advanced(
         # Pass flags to DataModule
         use_sequence_encoder=use_seq,
         use_gnn_encoder=use_graph,
-        use_text_encoder=use_text
+        use_text_encoder=use_text,
+        # Pass the base DataFrame reference
+        transactions_df_ref=df
     )
     print("Setting up DataModuleV2...")
     data_module.setup('fit') 
@@ -251,7 +303,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train Advanced Transaction Classifier')
     
     # --- Data/Output Arguments --- 
-    parser.add_argument('--data_path', type=str, required=True, help='Path to transaction data CSV file')
+    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing transaction data Arrow files')
     parser.add_argument('--output_dir', type=str, required=True, help='Directory to save model checkpoints and logs')
     parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML model configuration file')
 
@@ -317,7 +369,7 @@ if __name__ == '__main__':
 
     # --- Run Training --- 
     train_advanced(
-        data_path=args.data_path,
+        data_dir=args.data_dir,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
