@@ -14,6 +14,7 @@ import yaml # For loading potential YAML configs
 from typing import Optional, Dict, List
 import pyarrow as pa # Added for ArrowInvalid check
 import pyarrow.ipc as ipc # Use ipc explicitly for stream reading
+import numpy as np # Added
 
 # Use the V2 DataModule
 from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable 
@@ -21,23 +22,32 @@ from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable
 from models.advanced_transaction_classifier import AdvancedTransactionCategorizationModel
 
 # Helper function to load data (similar to old train.py)
-def load_data(data_dir: str) -> pd.DataFrame:
-    """Loads and preprocesses data from multiple Arrow streaming files, one by one."""
+def load_data(data_dir: str, max_files_to_process: Optional[int] = None) -> pd.DataFrame:
+    """Loads and preprocesses data from multiple Arrow streaming files, one by one.
+    Processes up to max_files_to_process if specified.
+    """
     print(f"Loading data from directory: {data_dir}")
     arrow_files_pattern = os.path.join(data_dir, '**/*.arrow')
-    arrow_files = glob.glob(arrow_files_pattern, recursive=True)
+    # Sort files for deterministic behavior when using max_files_to_process
+    arrow_files = sorted(glob.glob(arrow_files_pattern, recursive=True))
     
     if not arrow_files:
         if not os.path.isdir(data_dir):
              raise FileNotFoundError(f"Data directory not found: {data_dir}")
         raise FileNotFoundError(f"No .arrow files found in directory: {data_dir}")
 
-    print(f"Found {len(arrow_files)} arrow files. Processing file by file...")
+    # Limit number of files if max_files_to_process is set
+    files_to_process = arrow_files
+    if max_files_to_process is not None and max_files_to_process > 0:
+        print(f"Limiting processing to the first {max_files_to_process} files found.")
+        files_to_process = arrow_files[:max_files_to_process]
+    
+    print(f"Found {len(arrow_files)} arrow files. Processing {len(files_to_process)} file(s) file by file...")
     
     processed_dfs = []
     skipped_files = []
     
-    for file_path in tqdm(arrow_files, desc="Processing Arrow files"):
+    for file_path in tqdm(files_to_process, desc="Processing Arrow files"):
         try:
             # 1. Read one Arrow stream file
             with ipc.open_stream(file_path) as reader:
@@ -156,13 +166,16 @@ def train_advanced(
     # <<< HGTLoader specific config >>>
     hgt_num_samples: Optional[Dict[str, List[int]]] = None,
     # num_hgt_layers is derived from model_config now
+    # Add max_files_to_process argument
+    max_files_to_process: Optional[int] = None 
 ):
     """Train the advanced transaction classifier."""
     pl.seed_everything(seed)
     os.makedirs(output_dir, exist_ok=True)
 
     # --- Load Data --- 
-    df = load_data(data_dir)
+    # Pass the new argument to load_data
+    df = load_data(data_dir, max_files_to_process=max_files_to_process)
 
     # --- Calculate necessary dims from data --- 
     num_global_classes = df['txn_accepted_category_id_str'].nunique()
@@ -322,6 +335,8 @@ if __name__ == '__main__':
     parser.add_argument('--data_dir', type=str, required=True, help='Directory containing transaction data Arrow files')
     parser.add_argument('--output_dir', type=str, required=True, help='Directory to save model checkpoints and logs')
     parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML model configuration file')
+    parser.add_argument('--max_files_to_process', type=int, default=None, 
+                        help='Optional: Process only the first N files found in data_dir for testing.')
 
     # --- Training Arguments --- 
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
@@ -400,4 +415,6 @@ if __name__ == '__main__':
         accelerator=args.accelerator,
         precision=args.precision,
         hgt_num_samples=hgt_samples_dict, # Pass parsed dict or None
+        # Pass max_files_to_process to load_data via train_advanced
+        max_files_to_process=args.max_files_to_process
     ) 
