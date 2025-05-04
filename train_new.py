@@ -33,7 +33,7 @@ def load_data(data_dir: str) -> pd.DataFrame:
     try:
         # Use pyarrow.dataset to handle potential larger-than-memory data
         # Specify format="arrow" which should handle IPC File and Streaming formats
-        dataset = ds.dataset(data_dir, format="arrow", ignore_invalid_files=True) # Try ignoring invalid files
+        dataset = ds.dataset(data_dir, format="arrow") 
         
         # Check schema and row count without loading fully
         schema = dataset.schema
