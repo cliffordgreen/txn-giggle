@@ -681,7 +681,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                 # Apply max_seq_length limit - window slicing already limits input rows
                 # but final check ensures tensor length constraint
                 if seq_tensor.shape[0] > self.max_seq_length:
-                     seq_tensor = seq_tensor[-self.max_seq_length:, :]
+                    seq_tensor = seq_tensor[-self.max_seq_length:, :]
                 seq_len = len(seq_tensor)
             else:
                 seq_tensor = torch.zeros((0, self.sequence_feature_dim), dtype=torch.float)

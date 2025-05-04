@@ -12,6 +12,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 import torch
 import yaml # For loading potential YAML configs
 from typing import Optional, Dict, List
+import pyarrow as pa # Added for ArrowInvalid check
+import pyarrow.ipc as ipc # Use ipc explicitly for stream reading
 
 # Use the V2 DataModule
 from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable 
@@ -20,21 +22,45 @@ from models.advanced_transaction_classifier import AdvancedTransactionCategoriza
 
 # Helper function to load data (similar to old train.py)
 def load_data(data_dir: str) -> pd.DataFrame:
-    """Loads and preprocesses data from multiple Arrow files in a directory."""
+    """Loads data from multiple Arrow files in a directory using pyarrow.dataset."""
     print(f"Loading data from directory: {data_dir}")
-    arrow_files = glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True)
-    if not arrow_files:
-        raise FileNotFoundError(f"No .arrow files found in directory: {data_dir}")
+    
+    # Check if directory exists
+    if not os.path.isdir(data_dir):
+         raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
-    print(f"Found {len(arrow_files)} arrow files. Reading dataset...")
+    print(f"Attempting to create Arrow Dataset from: {data_dir}")
     try:
-        dataset = ds.dataset(arrow_files, format="arrow")
+        # Use pyarrow.dataset to handle potential larger-than-memory data
+        # Specify format="arrow" which should handle IPC File and Streaming formats
+        dataset = ds.dataset(data_dir, format="arrow", ignore_invalid_files=True) # Try ignoring invalid files
+        
+        # Check schema and row count without loading fully
+        schema = dataset.schema
+        print(f"Dataset schema: {schema}")
+        # Getting row count might scan files but not load all data
+        # Use scanner().count_rows() for potentially large datasets
+        scanner = dataset.scanner()
+        num_rows = scanner.count_rows()
+        # num_rows = dataset.count_rows() # Deprecated
+        print(f"Dataset contains {num_rows} rows.")
+
+        # --- Convert to Pandas --- 
+        # WARNING: This step WILL load the entire dataset into memory.
+        # If this causes OOM, we need to refactor the DataModule.
+        print("Converting Arrow Table to pandas DataFrame (this may use significant memory)...")
         df = dataset.to_table().to_pandas()
-        print(f"Data loaded successfully: {len(df)} records from {len(arrow_files)} files.")
+        print(f"Data loaded successfully into pandas: {len(df)} records.")
+        
+    except pa.lib.ArrowInvalid as e:
+        print(f"[ERROR] Failed to read Arrow dataset from {data_dir}. "
+              f"An invalid file might be present, even with ignore_invalid_files=True. Error: {e}")
+        raise
     except Exception as e:
-        print(f"Error loading Arrow dataset from {data_dir}: {e}")
+        print(f"[ERROR] Error loading Arrow dataset from {data_dir}: {e}")
         raise
 
+    # --- Existing Preprocessing Steps from here --- 
     print("Preprocessing data...")
     required_cols = ['target_transaction_processed', 'txn_accepted_category_id_str', 'company_name']
     for col in required_cols:
