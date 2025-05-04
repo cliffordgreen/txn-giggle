@@ -22,126 +22,116 @@ from models.advanced_transaction_classifier import AdvancedTransactionCategoriza
 
 # Helper function to load data (similar to old train.py)
 def load_data(data_dir: str) -> pd.DataFrame:
-    """Loads data from multiple Arrow files in a directory using pyarrow.dataset."""
+    """Loads and preprocesses data from multiple Arrow streaming files, one by one."""
     print(f"Loading data from directory: {data_dir}")
+    arrow_files_pattern = os.path.join(data_dir, '**/*.arrow')
+    arrow_files = glob.glob(arrow_files_pattern, recursive=True)
     
-    # Check if directory exists
-    if not os.path.isdir(data_dir):
-         raise FileNotFoundError(f"Data directory not found: {data_dir}")
+    if not arrow_files:
+        if not os.path.isdir(data_dir):
+             raise FileNotFoundError(f"Data directory not found: {data_dir}")
+        raise FileNotFoundError(f"No .arrow files found in directory: {data_dir}")
 
-    print(f"Attempting to create Arrow Dataset from: {data_dir}")
-    try:
-        # Use pyarrow.dataset to handle potential larger-than-memory data
-        # Specify format="arrow" which should handle IPC File and Streaming formats
-        dataset = ds.dataset(data_dir, format="arrow") 
-        
-        # Check schema and row count without loading fully
-        schema = dataset.schema
-        print(f"Dataset schema: {schema}")
-        # Getting row count might scan files but not load all data
-        # Use scanner().count_rows() for potentially large datasets
-        scanner = dataset.scanner()
-        num_rows = scanner.count_rows()
-        # num_rows = dataset.count_rows() # Deprecated
-        print(f"Dataset contains {num_rows} rows.")
-
-        # --- Convert to Pandas --- 
-        # WARNING: This step WILL load the entire dataset into memory.
-        # If this causes OOM, we need to refactor the DataModule.
-        print("Converting Arrow Table to pandas DataFrame (this may use significant memory)...")
-        df = dataset.to_table().to_pandas()
-        print(f"Data loaded successfully into pandas: {len(df)} records.")
-        
-    except pa.lib.ArrowInvalid as e:
-        print(f"[ERROR] Failed to read Arrow dataset from {data_dir}. "
-              f"An invalid file might be present, even with ignore_invalid_files=True. Error: {e}")
-        raise
-    except Exception as e:
-        print(f"[ERROR] Error loading Arrow dataset from {data_dir}: {e}")
-        raise
-
-    # --- Existing Preprocessing Steps from here --- 
-    print("Preprocessing data...")
-    required_cols = ['target_transaction_processed', 'txn_accepted_category_id_str', 'company_name']
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column in Arrow files: '{col}'")
-
-    # --- Extract data from target_transaction_processed ---
-    extracted_data = []
-    # Progress bar for potentially long parsing
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Parsing transactions"):
+    print(f"Found {len(arrow_files)} arrow files. Processing file by file...")
+    
+    processed_dfs = []
+    skipped_files = []
+    
+    for file_path in tqdm(arrow_files, desc="Processing Arrow files"):
         try:
-            # Check if it's already a dict or needs parsing
-            if isinstance(row['target_transaction_processed'], dict):
-                txn_dict = row['target_transaction_processed']
-            else:
-                txn_dict = json.loads(row['target_transaction_processed'])
+            # 1. Read one Arrow stream file
+            with ipc.open_stream(file_path) as reader:
+                 table = reader.read_all()
+                 df_single = table.to_pandas()
+            
+            # 2. Perform initial preprocessing on this single DataFrame
+            required_cols = ['target_transaction_processed', 'txn_accepted_category_id_str', 'company_name']
+            if not all(col in df_single.columns for col in required_cols):
+                print(f"[WARN] Skipping file {os.path.basename(file_path)} due to missing required columns.")
+                skipped_files.append(os.path.basename(file_path))
+                continue # Skip to next file
+                
+            extracted_data = []
+            for _, row in df_single.iterrows(): # Process rows within the small df
+                try:
+                    if isinstance(row['target_transaction_processed'], dict):
+                        txn_dict = row['target_transaction_processed']
+                    else:
+                        txn_dict = json.loads(row['target_transaction_processed'])
+                    
+                    extracted_data.append({
+                        'amount': float(txn_dict.get('amount', 0.0)),
+                        'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'),
+                        'description': str(txn_dict.get('description', '')),
+                        'memo': str(txn_dict.get('memo', '')),
+                        'merchant_name': str(txn_dict.get('payee', ''))
+                    })
+                except (json.JSONDecodeError, TypeError, ValueError) as e:
+                    # print(f"[WARN] Error parsing target_transaction_processed in file {os.path.basename(file_path)}, row {row.name}: {e}. Using defaults.")
+                    extracted_data.append({'amount': 0.0, 'timestamp': pd.NaT, 'description': '', 'memo': '', 'merchant_name': ''})
+            
+            extracted_df = pd.DataFrame(extracted_data, index=df_single.index)
+            df_processed_single = pd.concat([df_single, extracted_df], axis=1)
 
-            extracted_data.append({
-                'amount': float(txn_dict.get('amount', 0.0)), # Convert to float, default 0.0
-                'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'), # Convert to datetime
-                'description': str(txn_dict.get('description', '')), # Ensure string, default ''
-                'memo': str(txn_dict.get('memo', '')), # Ensure string, default ''
-                'merchant_name': str(txn_dict.get('payee', '')) # Use 'payee' as 'merchant_name', ensure string
-            })
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
-            print(f"[WARN] Error parsing target_transaction_processed on row {row.name if hasattr(row, 'name') else 'UNKNOWN'}: {e}. Using defaults.")
-            extracted_data.append({
-                'amount': 0.0,
-                'timestamp': pd.NaT, # Use NaT for failed timestamp parse
-                'description': '',
-                'memo': '',
-                'merchant_name': ''
-            })
+            # Handle timestamps within the small df
+            if df_processed_single['timestamp'].isnull().any():
+                median_date = df_processed_single['timestamp'].dropna().median()
+                if pd.isna(median_date):
+                    median_date = pd.Timestamp('2020-01-01') 
+                df_processed_single['timestamp'].fillna(median_date, inplace=True)
 
-    extracted_df = pd.DataFrame(extracted_data, index=df.index)
+            # Extract time features within the small df
+            df_processed_single['weekday'] = df_processed_single['timestamp'].dt.weekday
+            df_processed_single['hour'] = df_processed_single['timestamp'].dt.hour
+            
+            # Ensure other columns exist and fill NaNs within the small df
+            df_processed_single['txn_accepted_category_id_str'] = df_processed_single['txn_accepted_category_id_str'].fillna('UNKNOWN').astype(str)
+            df_processed_single['company_name'] = df_processed_single['company_name'].fillna('UNKNOWN').astype(str)
+            if 'industry_name' in df_processed_single.columns:
+                 df_processed_single['industry_name'] = df_processed_single['industry_name'].fillna('UNKNOWN').astype(str)
+            else: df_processed_single['industry_name'] = 'UNKNOWN'
+            if 'num_chart_of_accounts' in df_processed_single.columns:
+                 df_processed_single['num_chart_of_accounts'] = pd.to_numeric(df_processed_single['num_chart_of_accounts'], errors='coerce').fillna(0).astype(int)
+            else: df_processed_single['num_chart_of_accounts'] = 0
+            # Don't drop target_transaction_processed yet, might be needed later? Keep it for now.
+            
+            # Select only the columns needed downstream to potentially save memory before append
+            cols_to_keep = [
+                'txn_accepted_category_id_str', 'company_name', 'industry_name', 
+                'num_chart_of_accounts', 'chart_of_accounts_processed', # Keep COA for DataModule
+                'amount', 'timestamp', 'description', 'memo', 'merchant_name', 
+                'weekday', 'hour'
+                # Add any other original columns if they are used by DataModule/Model
+            ]
+            # Filter df_processed_single to keep only necessary columns
+            df_filtered_single = df_processed_single[[col for col in cols_to_keep if col in df_processed_single.columns]]
+            
+            processed_dfs.append(df_filtered_single)
 
-    # Combine extracted data with original df (keeping necessary original columns)
-    df = pd.concat([df, extracted_df], axis=1)
+        except pa.lib.ArrowInvalid as e:
+            print(f"[WARN] Skipping invalid Arrow stream file: {os.path.basename(file_path)} - Reason: {e}")
+            skipped_files.append(os.path.basename(file_path))
+        except Exception as e:
+            print(f"[WARN] Skipping file {os.path.basename(file_path)} due to unexpected error: {e}")
+            skipped_files.append(os.path.basename(file_path))
 
-    # --- Handle missing timestamps ---
-    if df['timestamp'].isnull().any():
-        num_null = df['timestamp'].isnull().sum()
-        print(f"[WARN] Found {num_null} missing/invalid timestamps after parsing.")
-        # Fallback strategy: Use median or a fixed date
-        median_date = df['timestamp'].dropna().median()
-        if pd.isna(median_date):
-            median_date = pd.Timestamp('2020-01-01') # Default fallback
-        print(f"Filling NaT timestamps with median/default: {median_date}")
-        df['timestamp'].fillna(median_date, inplace=True)
+    if not processed_dfs:
+        raise ValueError(f"No valid Arrow files could be processed from {data_dir}. Skipped files: {skipped_files}")
 
-    # --- Extract time features ---
-    df['weekday'] = df['timestamp'].dt.weekday
-    df['hour'] = df['timestamp'].dt.hour
+    # 3. Concatenate all *processed* DataFrames
+    print(f"Concatenating {len(processed_dfs)} processed DataFrames..." )
+    print("[WARNING] This step loads the full processed dataset into memory!")
+    df_combined = pd.concat(processed_dfs, ignore_index=True)
+    
+    num_processed = len(processed_dfs)
+    num_skipped = len(skipped_files)
+    print(f"Data loading and initial processing complete: {len(df_combined)} records from {num_processed} files ({num_skipped} files skipped)." )
+    if skipped_files:
+         print(f"Skipped files: {skipped_files}")
 
-    # --- Ensure other necessary columns exist and have correct types ---
-    # 'txn_accepted_category_id_str' is our target, keep as object/string for now
-    df['txn_accepted_category_id_str'] = df['txn_accepted_category_id_str'].fillna('UNKNOWN').astype(str)
-    # 'company_name' will be used as user_id, keep as object/string
-    df['company_name'] = df['company_name'].fillna('UNKNOWN').astype(str)
-    # 'industry_name' - useful feature potentially
-    if 'industry_name' in df.columns:
-         df['industry_name'] = df['industry_name'].fillna('UNKNOWN').astype(str)
-    else:
-         print("[WARN] 'industry_name' column not found. Will proceed without it.")
-         df['industry_name'] = 'UNKNOWN'
-    # 'num_chart_of_accounts' - useful feature
-    if 'num_chart_of_accounts' in df.columns:
-         df['num_chart_of_accounts'] = pd.to_numeric(df['num_chart_of_accounts'], errors='coerce').fillna(0).astype(int)
-    else:
-         print("[WARN] 'num_chart_of_accounts' column not found. Filling with 0.")
-         df['num_chart_of_accounts'] = 0
-    # 'chart_of_accounts_processed' - keep for DataModule to process
-    if 'chart_of_accounts_processed' not in df.columns:
-        print("[WARN] 'chart_of_accounts_processed' column not found. Graph/features relying on it might be affected.")
-        # Add an empty list/string placeholder if needed by datamodule? For now, just warn.
-
-    # Drop the original processed column if no longer needed
-    # df = df.drop(columns=['target_transaction_processed']) # Optional cleanup
-
-    print("Preprocessing finished.")
-    return df
+    # No further processing needed here, return the combined df
+    print("Preprocessing finished.") # Renamed log message
+    return df_combined
 
 def train_advanced(
     # Data/Output
