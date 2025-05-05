@@ -171,6 +171,8 @@ def train_advanced(
     max_files_to_process: Optional[int] = None 
 ):
     """Train the advanced transaction classifier."""
+    # Set precision for Tensor Cores before seeding
+    torch.set_float32_matmul_precision('high') 
     pl.seed_everything(seed)
     os.makedirs(output_dir, exist_ok=True)
 
