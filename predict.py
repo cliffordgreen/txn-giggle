@@ -5,6 +5,7 @@ import torch
 import pytorch_lightning as pl
 from tqdm import tqdm
 import pickle # To load saved scalers/mappings later
+import numpy as np # Added for concatenate
 from sklearn.metrics import accuracy_score, classification_report
 
 # Import necessary components from our project
@@ -18,10 +19,10 @@ def predict(
     checkpoint_path: str,
     data_dir: str,
     config_path: str,
+    state_path: str, # Added path for saved state
     output_csv: Optional[str] = None,
     batch_size: int = 64, # Can often use larger batch size for inference
     num_workers: int = 0,
-    # Add args for saved scalers/mappings later
 ):
     """Load a trained model and make predictions on new data."""
     print(f"Loading configuration from: {config_path}")
@@ -36,59 +37,80 @@ def predict(
         print(f"[ERROR] Failed to load or parse config file {config_path}: {e}")
         raise
 
+    # --- Load Preprocessing State --- 
+    print(f"Loading preprocessing state from: {state_path}")
+    try:
+        with open(state_path, 'rb') as f:
+            preprocessing_state = pickle.load(f)
+        print("Preprocessing state loaded successfully.")
+        # Extract components
+        fitted_scalers = preprocessing_state.get('scalers')
+        fitted_seq_scalers = preprocessing_state.get('seq_scalers')
+        fitted_edge_scalers = preprocessing_state.get('edge_scalers')
+        fitted_user_map = preprocessing_state.get('user_map')
+        fitted_category_id_map = preprocessing_state.get('category_id_map')
+        # Basic validation
+        if not all([fitted_scalers is not None, fitted_seq_scalers is not None, fitted_edge_scalers is not None, 
+                    fitted_user_map is not None, fitted_category_id_map is not None]):
+             raise ValueError("Loaded preprocessing state is missing required keys.")
+    except FileNotFoundError:
+        print(f"[ERROR] Preprocessing state file not found at {state_path}. Cannot proceed.")
+        return
+    except Exception as e:
+        print(f"[ERROR] Failed to load or parse preprocessing state file {state_path}: {e}")
+        raise
+
     print(f"Loading data from directory: {data_dir}")
     # This loads the data we want to predict on
-    predict_df = load_data(data_dir) 
+    predict_df = load_data(data_dir) # Assuming load_data doesn't need max_files here
 
-    # TODO: Load saved scalers and mappings from training run
-    # e.g., with open('training_output/scalers.pkl', 'rb') as f: fitted_scalers = pickle.load(f)
-    #       with open('training_output/mappings.pkl', 'rb') as f: fitted_mappings = pickle.load(f)
-    
     print("Initializing DataModule for prediction...")
-    # NOTE: We need to modify DataModuleV2 to accept fitted scalers/mappings
-    # For now, placeholder initialization - this will likely fail or misuse data
-    # We assume model_config contains necessary static parameters like text_model_name etc.
-    # but dynamic ones like num_classes/users might be needed from checkpoint hparams.
+    # Pass the loaded state to DataModuleV2 constructor
+    # (Need to modify DataModuleV2.__init__ next)
     data_module = TransactionDataModuleV2(
         transactions_df_ref=predict_df, # Pass prediction data
         batch_size=batch_size,
         num_workers=num_workers,
-        num_hgt_layers=model_config['graph_encoder_params'].get('num_layers', 2), # Example static param
-        hgt_num_samples=None, # Or load from config/train state if needed
+        # Static params from config
+        num_hgt_layers=model_config['graph_encoder_params'].get('num_layers', 2), 
+        hgt_num_samples=None, # Not typically needed for prediction graph structure?
         text_model_name=model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
         max_seq_length=model_config.get('max_seq_length', 50),
         text_max_length=model_config['text_encoder_params'].get('max_length', 128),
         use_sequence_encoder=model_config.get('use_sequence_encoder', True),
         use_gnn_encoder=model_config.get('use_graph_encoder', True),
         use_text_encoder=model_config.get('use_text_encoder', True),
-        # TODO: Pass fitted_scalers and fitted_mappings here after loading
-        # fitted_scalers=fitted_scalers, 
-        # fitted_user_map=fitted_mappings['user_map'],
-        # fitted_category_map=fitted_mappings['category_map']
+        # Pass fitted state
+        fitted_scalers=fitted_scalers, 
+        fitted_seq_scalers=fitted_seq_scalers,
+        fitted_edge_scalers=fitted_edge_scalers,
+        fitted_user_map=fitted_user_map,
+        fitted_category_id_map=fitted_category_id_map
     )
-    # TODO: Call a modified setup method, e.g., data_module.setup('predict')
-    # This setup should apply the loaded scalers/mappings, not fit new ones.
-    # For now, using 'test' stage setup as a placeholder
-    print("Setting up DataModule (placeholder - needs modification)..." )
-    data_module.setup('test') 
+    
+    # Call setup - it will need modification to use the fitted state
+    print("Setting up DataModule using loaded state..." )
+    data_module.setup('predict') # Using 'predict' stage - DataModule needs to handle this
 
     print(f"Loading model from checkpoint: {checkpoint_path}")
-    # Load the model - might need to pass the config if not saved in checkpoint hparams
-    # Or update config with hparams from checkpoint after loading? Check Lightning docs.
-    # model = AdvancedTransactionCategorizationModel.load_from_checkpoint(checkpoint_path, map_location='cpu') # Load to CPU initially
-    # Let's try passing the config directly, assuming it contains necessary static info
-    # The dynamic parts (num_classes, etc.) should ideally be in hparams or loaded separately.
+    # It's safer to update config with counts derived from loaded maps
+    model_config['num_users'] = len(fitted_user_map)
+    model_config['num_global_classes'] = len(fitted_category_id_map)
+    model_config['num_user_classes'] = 0 # Assuming still 0
+    # Potentially update metadata if it changed (though unlikely if structure is same)
+    # model_config['graph_encoder_params']['metadata'] = data_module.full_graph_data.metadata() 
+
     try:
+        # Pass updated model_config
         model = AdvancedTransactionCategorizationModel.load_from_checkpoint(
             checkpoint_path, 
-            map_location='cpu', # Load to CPU initially
-            model_config=model_config # Pass the loaded config
-            # We might need to update model_config with num_classes etc. AFTER loading checkpoint hparams
+            map_location='cpu',
+            model_config=model_config 
         )
         print("Model loaded successfully.")
     except Exception as e:
          print(f"[ERROR] Failed to load model from checkpoint {checkpoint_path}: {e}")
-         print("Ensure the checkpoint is compatible and the model_config is correct.")
+         print("Ensure the checkpoint/config/state are compatible.")
          raise
 
     # --- Trainer Initialization ---
@@ -127,12 +149,10 @@ def predict(
     # So, the order should match the predict_df if it was sorted correctly in setup.
     true_labels_str = predict_df['txn_accepted_category_id_str'].iloc[:len(predictions)] # Slice to match prediction count
     
-    # We need the integer mapping used during training to compare predictions (integers)
-    # TODO: Load the category_id_map from the saved training state
-    # category_id_map_inverse = {v: k for k, v in fitted_mappings['category_map'].items()} # Example
-    category_id_map = data_module.category_id_map # Placeholder - uses map from predict_df! Needs fix.
+    # Use the loaded category_id map for mapping
+    category_id_map = fitted_category_id_map 
     if category_id_map is None:
-         print("[ERROR] Category ID map not found in DataModule. Cannot calculate accuracy correctly.")
+         print("[ERROR] Loaded Category ID map is None. Cannot calculate accuracy correctly.")
          return
          
     # Convert true string labels to integer labels based on the *training* mapping
@@ -181,12 +201,9 @@ def predict(
             'true_label_int': true_labels,     # Mapped integer labels (-1 if unknown)
             'predicted_label_int': predictions # Model output integer labels
         })
-        # Add predicted string label using the map
-        map_int_to_str = {k: v for k, v in category_id_map.items()}
+        # Add predicted string label using the loaded map
+        map_int_to_str = {v: k for k, v in category_id_map.items()} # Use loaded map
         results_df['predicted_label_str'] = results_df['predicted_label_int'].map(map_int_to_str).fillna('UNKNOWN_PRED')
-        
-        # Optionally include original data columns if needed
-        # results_df = pd.concat([predict_df.iloc[:len(predictions)].reset_index(drop=True), results_df], axis=1)
         
         results_df.to_csv(output_csv, index=False)
         print("Predictions saved.")
@@ -200,13 +217,14 @@ if __name__ == '__main__':
                         help='Path to the directory containing prediction data (.arrow files)')
     parser.add_argument('--config_path', type=str, required=True, 
                         help='Path to the model configuration YAML file used during training')
+    parser.add_argument('--state_path', type=str, required=True, 
+                        help='Path to the saved preprocessing state file (preprocessing_state.pkl)') # Added state_path arg
     parser.add_argument('--output_csv', type=str, default=None, 
                         help='Optional path to save predictions and true labels to a CSV file')
     parser.add_argument('--batch_size', type=int, default=64, 
                         help='Batch size for prediction')
     parser.add_argument('--num_workers', type=int, default=0, 
                         help='Number of data loading workers')
-    # TODO: Add arguments for paths to saved scalers/mappings
 
     args = parser.parse_args()
 
@@ -214,8 +232,8 @@ if __name__ == '__main__':
         checkpoint_path=args.checkpoint_path,
         data_dir=args.data_dir,
         config_path=args.config_path,
+        state_path=args.state_path, # Pass state_path
         output_csv=args.output_csv,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        # Pass loaded scaler/mapping paths here later
     ) 

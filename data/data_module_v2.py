@@ -58,7 +58,13 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                  test_ratio: float = 0.1,
                  use_sequence_encoder: bool = True,
                  use_text_encoder: bool = True,
-                 use_gnn_encoder: bool = True
+                 use_gnn_encoder: bool = True,
+                 # --- Arguments for loading pre-fitted state --- 
+                 fitted_scalers: Optional[Dict[str, StandardScaler]] = None,
+                 fitted_seq_scalers: Optional[Dict[str, StandardScaler]] = None,
+                 fitted_edge_scalers: Optional[Dict[str, StandardScaler]] = None,
+                 fitted_user_map: Optional[Dict[int, Any]] = None,
+                 fitted_category_id_map: Optional[Dict[int, Any]] = None
                  ):
         super().__init__()
         # Expects preprocessed df from train_new.load_data
@@ -104,17 +110,25 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         print(f"Initializing TransactionDataModuleV2 (HGTLoader - No Category Node)...")
         print(f"  Modality Flags: GNN={self.use_gnn_encoder}, Sequence={self.use_sequence_encoder}, Text={self.use_text_encoder}")
 
+        # Store pre-fitted state if provided
+        self.fitted_scalers = fitted_scalers
+        self.fitted_seq_scalers = fitted_seq_scalers
+        self.fitted_edge_scalers = fitted_edge_scalers
+        self.fitted_user_map = fitted_user_map
+        self.fitted_category_id_map = fitted_category_id_map
+        self.is_predicting = (fitted_scalers is not None) # Flag if we are in prediction mode
+
         # Placeholders
         self.tokenizer = None
         self.full_graph_data: Optional[HeteroData] = None
         self.node_feature_dims: Dict[str, int] = {}
         self.edge_feature_dims: Dict[Tuple[str, str, str], int] = {}
         self.sequence_feature_dim: Optional[int] = None
-        self.scalers: Dict[str, StandardScaler] = {}
-        self.seq_scalers: Dict[str, StandardScaler] = {}
-        self.edge_scalers: Dict[str, StandardScaler] = {}
-        self.user_map = None
-        self.category_id_map = None # Map for the target string IDs
+        self.scalers: Dict[str, StandardScaler] = {} if fitted_scalers is None else fitted_scalers
+        self.seq_scalers: Dict[str, StandardScaler] = {} if fitted_seq_scalers is None else fitted_seq_scalers
+        self.edge_scalers: Dict[str, StandardScaler] = {} if fitted_edge_scalers is None else fitted_edge_scalers
+        self.user_map = None if fitted_user_map is None else fitted_user_map
+        self.category_id_map = None if fitted_category_id_map is None else fitted_category_id_map
         self.num_users = 0
         self.num_global_classes = 0
         self.num_user_classes = 0 # No user-specific target assumed
@@ -136,26 +150,29 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             print(f"[WARN] Target column '{target_col}' still contains NaNs after load_data. Filling with 'UNKNOWN'.")
             self.transactions_df[target_col] = self.transactions_df[target_col].fillna('UNKNOWN')
             
-        # Factorize to get integer IDs for loss calculation and potential graph use
-        codes, uniques = pd.factorize(self.transactions_df[target_col], sort=True)
-        self.transactions_df['category_id'] = codes # Assign the integer codes
-        self.category_id_map = {code: unique_val for code, unique_val in enumerate(uniques)}
-        self.num_global_classes = len(uniques)
-        print(f"Factorized '{target_col}' into {self.num_global_classes} unique integer IDs.")
-
-        # User ID handling (use company_name)
-        user_col = 'company_name'
-        if user_col not in self.transactions_df.columns:
-            raise ValueError(f"Missing required user ID column: '{user_col}'")
-        # Ensure fillna happened in load_data
-        if self.transactions_df[user_col].isnull().any():
-             print(f"[WARN] User ID column '{user_col}' still contains NaNs after load_data. Filling with 'UNKNOWN'.")
-             self.transactions_df[user_col] = self.transactions_df[user_col].fillna('UNKNOWN')
-        
-        user_codes, user_uniques = pd.factorize(self.transactions_df[user_col], sort=True)
-        self.transactions_df['user_id_code'] = user_codes 
-        self.user_map = {code: uid for code, uid in enumerate(user_uniques)}
-        self.num_users = len(user_uniques)
+        # Use fitted maps if provided (predicting), otherwise factorize
+        if self.is_predicting:
+            print("  Using provided category_id and user maps.")
+            # Map strings to known ints, use -1 for unknowns
+            map_cat_str_to_int = {v: k for k, v in self.category_id_map.items()}
+            map_user_str_to_int = {v: k for k, v in self.user_map.items()}
+            self.transactions_df['category_id'] = self.transactions_df[target_col].map(map_cat_str_to_int).fillna(-1).astype(int)
+            self.transactions_df['user_id_code'] = self.transactions_df['company_name'].map(map_user_str_to_int).fillna(-1).astype(int)
+            self.num_global_classes = len(self.category_id_map)
+            self.num_users = len(self.user_map)
+            if (self.transactions_df['user_id_code'] == -1).any():
+                print(f"[WARN] Found {(self.transactions_df['user_id_code'] == -1).sum()} users in prediction data not present in training user_map.")
+        else:
+            print("  Factorizing category_id and user maps from data.")
+            codes, uniques = pd.factorize(self.transactions_df[target_col], sort=True)
+            self.transactions_df['category_id'] = codes 
+            self.category_id_map = {code: unique_val for code, unique_val in enumerate(uniques)}
+            self.num_global_classes = len(uniques)
+            
+            user_codes, user_uniques = pd.factorize(self.transactions_df['company_name'], sort=True)
+            self.transactions_df['user_id_code'] = user_codes 
+            self.user_map = {code: uid for code, uid in enumerate(user_uniques)}
+            self.num_users = len(user_uniques)
         
         print(f"Final Counts: Global Classes={self.num_global_classes}, Users={self.num_users}")
         print(f"DataFrame pre-processing finished in {time.time() - start_time:.2f}s")
@@ -171,9 +188,24 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                  raise e
 
     def setup(self, stage: Optional[str] = None):
-        if self.full_graph_data is not None and self.train_indices is not None: 
-             print("DataModuleV2 already set up.")
-             return
+        # Added check for prediction stage
+        is_predict_stage = (stage == 'predict')
+        if is_predict_stage and not self.is_predicting:
+            raise ValueError("Setup stage is 'predict', but no pre-fitted state was provided during __init__.")
+        if not is_predict_stage and self.is_predicting:
+             print("[WARN] Pre-fitted state was provided during __init__, but setup stage is not 'predict'. Using fitted state anyway.")
+             # Allow using fitted state even if stage is fit/test for simplicity
+
+        if self.full_graph_data is not None and self.train_indices is not None: # Check if already set up for fit/test
+             if not is_predict_stage:
+                 print("DataModuleV2 already set up for fit/test.")
+                 return
+             # Allow re-setup for predict stage if needed, but maybe graph exists?
+             # If graph exists, maybe just assign test mask?
+             if self.test_indices is not None:
+                  print("DataModuleV2 graph exists, assigning predict mask.")
+                  self._assign_masks_to_graph(predict_only=True) # New flag needed
+                  return 
 
         print(f"--- Starting DataModuleV2 Setup for stage: {stage} ---")
         setup_start_time = time.time()
@@ -184,41 +216,54 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             print("Tokenizer initialized.")
 
         # Ensure the DataFrame is sorted for consistent splitting and processing
-        # Use the factorized user ID code for sorting
         self.transactions_df.sort_values(['user_id_code', 'timestamp'], inplace=True)
         self.transactions_df.reset_index(drop=True, inplace=True) # Reset index after sort
 
-        # **Step 1: Split data indices (time-based within users)**
-        print("Splitting data indices (time-based within users)...")
-        self.train_indices, self.val_indices, self.test_indices = self._split_data_indices()
-        print(f"Split complete: #Train={len(self.train_indices)}, #Val={len(self.val_indices)}, #Test={len(self.test_indices)}")
+        # **Step 1: Split data indices (or assign for prediction)**
+        if is_predict_stage:
+            print("Assigning all indices to test set for prediction...")
+            self.train_indices = torch.tensor([], dtype=torch.long)
+            self.val_indices = torch.tensor([], dtype=torch.long)
+            self.test_indices = torch.arange(len(self.transactions_df), dtype=torch.long)
+            print(f"Split complete (predict): #Test={len(self.test_indices)}")
+        else:
+            print("Splitting data indices (time-based within users)...")
+            self.train_indices, self.val_indices, self.test_indices = self._split_data_indices()
+            print(f"Split complete: #Train={len(self.train_indices)}, #Val={len(self.val_indices)}, #Test={len(self.test_indices)}")
 
         # **Step 2: Build the full graph structure and calculate raw node features**
-        # Raw features might be needed by multiple components
         print("Calculating raw features for graph nodes...")
-        raw_features = {} # Initialize raw_features
+        raw_features = {} 
         if self.use_gnn_encoder:
-            raw_features = self._calculate_raw_features() # Calculate based on full df
+            raw_features = self._calculate_raw_features() 
 
-        # **Step 3: Fit scalers ONLY on TRAINING data**
-        print("Fitting scalers on TRAINING data...")
-        self._fit_scalers(raw_features, self.train_indices) # Pass train_indices
+        # **Step 3: Fit scalers ONLY on TRAINING data (Skip if predicting)**
+        if not self.is_predicting: # Only fit if not using pre-fitted state
+            print("Fitting scalers on TRAINING data...")
+            self._fit_scalers(raw_features, self.train_indices) 
+        else:
+            print("Skipping scaler fitting (using pre-loaded scalers).")
+            # Ensure edge scaler exists if needed and not provided
+            if self.use_gnn_encoder and 'amount_dist' not in self.edge_scalers: 
+                 self._create_proxy_edge_scaler() # New helper needed
 
         # **Step 4: Build Graph with SCALED features (using fitted scalers)**
         print("Building full graph data with scaled features...")
         if self.use_gnn_encoder:
-             # Pass train_indices to scaling part within build_graph
-            self._build_graph_and_edges(raw_features, self.train_indices)
+             # Pass train_indices (needed for amount_dist scaling even in predict? Check _build_graph)
+             # _build_graph_and_edges uses self.scalers which are now populated
+            self._build_graph_and_edges(raw_features, self.train_indices) 
         else:
-            self._build_minimal_graph() # Contains essential info like labels, user_id_code
+            self._build_minimal_graph() 
 
         # **Step 5: Prepare and Add Sequences (uses full graph data)**
         if self.use_sequence_encoder:
-            # Pass train_indices for fitting sequence scalers
+            # Pass train_indices for fitting sequence scalers if not predicting
+            # _prepare_and_add_sequences needs update to handle self.is_predicting
             self._prepare_and_add_sequences(self.train_indices) 
 
         # Assign masks to the graph data AFTER it's built
-        self._assign_masks_to_graph()
+        self._assign_masks_to_graph(predict_only=is_predict_stage)
             
         print(f"--- DataModuleV2 Setup finished in {time.time() - setup_start_time:.2f}s ---")
 
@@ -333,6 +378,23 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         else:
              self.edge_scalers['amount_dist'] = None
              print("  [INFO] Skipping scaler fitting for edge 'amount_dist' (transaction scaler not available).")
+
+        # Add creation of proxy edge scaler here as well
+        self._create_proxy_edge_scaler()
+
+    def _create_proxy_edge_scaler(self):
+        if self.use_gnn_encoder and 'transaction' in self.scalers and self.scalers['transaction'] is not None:
+             if self.scalers['transaction'].scale_.shape[0] > 0:
+                 scale_val = np.maximum(self.scalers['transaction'].scale_[0:1], 1e-8)
+                 # Only create if not already loaded
+                 if 'amount_dist' not in self.edge_scalers or self.edge_scalers['amount_dist'] is None:
+                      amount_dist_scaler_proxy = StandardScaler()
+                      amount_dist_scaler_proxy.mean_ = np.array([0.0])
+                      amount_dist_scaler_proxy.scale_ = scale_val
+                      self.edge_scalers['amount_dist'] = amount_dist_scaler_proxy
+                      print("  Created proxy edge scaler for 'amount_dist' based on transaction scaler (amount column).")
+             # else: print warn? (Already done in fit_scalers)
+        # else: print warn? (Already done in fit_scalers)
 
     def _build_graph_and_edges(self, raw_features: Dict[str, np.ndarray], train_indices: torch.Tensor):
         print("Building graph structure and applying SCALED features...")
@@ -588,58 +650,52 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         if hasattr(self.full_graph_data['transaction'], 'seq_features'): return 
              
         print("Preparing sequence features...")
-        # df should already be sorted by user_id_code, timestamp from setup()
         df_sorted = self.transactions_df 
-        num_transactions = len(df_sorted) # Get total number of transactions
+        num_transactions = len(df_sorted)
         train_indices_np = train_indices.numpy()
 
-        # --- Fit sequence scalers only on training data portions ---
-        print("  Fitting sequence scalers on TRAINING data...")
-        all_train_time_deltas = []
-        # Use the current node index (which matches df_sorted index after reset)
-        # We can iterate directly using train_indices_np as they are the indices for df_sorted
+        # --- Fit sequence scalers only if NOT predicting --- 
+        if not self.is_predicting:
+            print("  Fitting sequence scalers on TRAINING data...")
+            all_train_time_deltas = []
+            for current_pos_in_sorted in train_indices_np:
+                 # Ensure index is valid
+                 if current_pos_in_sorted >= num_transactions: continue
 
-        for current_pos_in_sorted in train_indices_np:
-             # Ensure index is valid
-             if current_pos_in_sorted >= num_transactions: continue
+                 current_row = df_sorted.iloc[current_pos_in_sorted]
+                 user_id_code = current_row['user_id_code']; current_time = current_row['timestamp']
+                 start_idx_in_sorted = max(0, current_pos_in_sorted - self.max_seq_length)
+                 prev_txs_window_df = df_sorted.iloc[start_idx_in_sorted:current_pos_in_sorted]
+                 # Filter window to only include transactions from the same user
+                 prev_txs_user_df = prev_txs_window_df[prev_txs_window_df['user_id_code'] == user_id_code]
 
-             current_row = df_sorted.iloc[current_pos_in_sorted]
-             user_id_code = current_row['user_id_code']; current_time = current_row['timestamp']
-             start_idx_in_sorted = max(0, current_pos_in_sorted - self.max_seq_length)
-             prev_txs_window_df = df_sorted.iloc[start_idx_in_sorted:current_pos_in_sorted]
-             # Filter window to only include transactions from the same user
-             prev_txs_user_df = prev_txs_window_df[prev_txs_window_df['user_id_code'] == user_id_code]
-
-             if not prev_txs_user_df.empty:
-                 # Calculate time deltas within this training sequence
-                 if pd.notna(current_time):
-                     time_diffs = (current_time - prev_txs_user_df['timestamp']).dt.total_seconds()
-                     valid_time_diffs = time_diffs[pd.notna(time_diffs)].clip(lower=0).tolist()
-                     all_train_time_deltas.extend(valid_time_diffs)
-        
-        # Fit time_delta scaler
-        if all_train_time_deltas:
-             time_delta_array = np.array(all_train_time_deltas).reshape(-1, 1)
-             scaler_td = StandardScaler().fit(time_delta_array)
-             self.seq_scalers['time_delta'] = scaler_td
-             print(f"    Fitted time_delta scaler on training sequences.")
+                 if not prev_txs_user_df.empty:
+                     # Calculate time deltas within this training sequence
+                     if pd.notna(current_time):
+                         time_diffs = (current_time - prev_txs_user_df['timestamp']).dt.total_seconds()
+                         valid_time_diffs = time_diffs[pd.notna(time_diffs)].clip(lower=0).tolist()
+                         all_train_time_deltas.extend(valid_time_diffs)
+            
+            # Fit time_delta scaler
+            if all_train_time_deltas:
+                 time_delta_array = np.array(all_train_time_deltas).reshape(-1, 1)
+                 scaler_td = StandardScaler().fit(time_delta_array)
+                 self.seq_scalers['time_delta'] = scaler_td
+                 print(f"    Fitted time_delta scaler on training sequences.")
+            else:
+                 print(f"    [WARN] No valid time deltas found in training sequences to fit scaler.")
+                 self.seq_scalers['time_delta'] = None
         else:
-             print(f"    [WARN] No valid time deltas found in training sequences to fit scaler.")
-             self.seq_scalers['time_delta'] = None
+            print("  Skipping sequence scaler fitting (using pre-loaded scaler).")
+            # Ensure the key exists even if None was loaded
+            if 'time_delta' not in self.seq_scalers:
+                 self.seq_scalers['time_delta'] = None
 
-        # --- Generate sequences for ALL transactions (apply fitted scalers) ---
+        # --- Generate sequences for ALL transactions (apply fitted/loaded scalers) ---
         print("  Generating sequences for ALL transactions...")
         all_seq_features = []
-        # all_seq_cat_features = [] # Removed categorical sequence features like region_id
         all_seq_lengths = []
-        self.sequence_feature_dim = 6 # Real features: amount, day_sin, day_cos, hour_sin, hour_cos, time_delta
-        # self.num_regions = 0 # Removed
-
-        # No region_id factorization needed
-        
-        # orig_indices_tensor = self.full_graph_data['transaction'].original_index # Not needed if indices match sorted df
-        # Map original DataFrame index back to the current position in the sorted DataFrame
-        # original_to_sorted_pos = {idx: i for i, idx in enumerate(df_sorted.index)} # Not needed
+        self.sequence_feature_dim = 6 
 
         for node_idx in range(num_transactions):
             # We iterate through node indices 0..N-1, which correspond to df_sorted rows
@@ -653,7 +709,6 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             prev_txs_user_df = prev_txs_window_df[prev_txs_window_df['user_id_code'] == user_id_code]
 
             seq_features_for_tx = []
-            # seq_cat_features_for_tx = [] # Removed
 
             if not prev_txs_user_df.empty:
                 for _, prev_row in prev_txs_user_df.iterrows():
@@ -665,6 +720,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                     # Amount scaling for sequences - should we fit a separate scaler?
                     # For now, don't scale amount in sequences, only time_delta.
                     time_delta_val = time_delta
+                    # Check if scaler exists and is not None before applying
                     if 'time_delta' in self.seq_scalers and self.seq_scalers['time_delta'] is not None:
                          scaler_td = self.seq_scalers['time_delta']
                          time_delta_val = (time_delta - scaler_td.mean_[0]) / (np.maximum(scaler_td.scale_[0], 1e-8))
@@ -673,8 +729,6 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                     day_sin = np.sin(2*np.pi*day/7); day_cos = np.cos(2*np.pi*day/7)
                     scaled_feat = [amount, day_sin, day_cos, hour_sin, hour_cos, time_delta_val]
                     seq_features_for_tx.append(scaled_feat)
-
-                    # --- No Categorical Feature --- 
 
             if seq_features_for_tx: # Check if real features were added
                 seq_tensor = torch.tensor(seq_features_for_tx, dtype=torch.float)
@@ -688,7 +742,6 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                 seq_len = 0
                 
             all_seq_features.append(seq_tensor)
-            # all_seq_cat_features.append(seq_cat_tensor) # Removed
             all_seq_lengths.append(seq_len)
 
         max_len_found = max(all_seq_lengths) if all_seq_lengths else 0
@@ -701,10 +754,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # No padding for categorical features
 
         self.full_graph_data['transaction'].seq_features = padded_sequences
-        # self.full_graph_data['transaction'].seq_cat_features = padded_cat_sequences # Removed
         self.full_graph_data['transaction'].seq_lengths = torch.tensor(all_seq_lengths, dtype=torch.long)
         print(f"Added sequence features. Padded reals shape: {padded_sequences.shape}") # Removed cat shape log
-
 
     def _split_data_indices(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         df = self.transactions_df # Assumes sorted by user_id_code, timestamp
@@ -758,7 +809,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         return train_indices_tensor, val_indices_tensor, test_indices_tensor
 
     # New helper to assign masks AFTER graph is built
-    def _assign_masks_to_graph(self):
+    def _assign_masks_to_graph(self, predict_only: bool = False):
         if self.full_graph_data is None or not hasattr(self.full_graph_data['transaction'], 'num_nodes'):
             print("[WARN] Cannot assign masks, graph data not available.")
             return
@@ -768,17 +819,26 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         val_mask = torch.zeros(num_nodes, dtype=torch.bool)
         test_mask = torch.zeros(num_nodes, dtype=torch.bool)
 
-        if self.train_indices is not None:
-            train_mask[self.train_indices] = True
-        if self.val_indices is not None:
-            val_mask[self.val_indices] = True
-        if self.test_indices is not None:
-            test_mask[self.test_indices] = True
+        if predict_only:
+            # Only assign test mask using self.test_indices (which covers all nodes)
+            if self.test_indices is not None:
+                 test_mask[self.test_indices] = True
+                 print("Assigned predict mask (all nodes) to graph data.")
+            else:
+                 print("[WARN] predict_only=True but test_indices is None.")
+        else:
+            # Assign train/val/test masks as before for fit/test stages
+            if self.train_indices is not None:
+                train_mask[self.train_indices] = True
+            if self.val_indices is not None:
+                val_mask[self.val_indices] = True
+            if self.test_indices is not None:
+                test_mask[self.test_indices] = True
+            print("Assigned train/val/test masks to graph data.")
 
         self.full_graph_data['transaction'].train_mask = train_mask
         self.full_graph_data['transaction'].val_mask = val_mask
         self.full_graph_data['transaction'].test_mask = test_mask
-        print("Assigned train/val/test masks to graph data.")
         
     # --- Dataloader Methods using HGTLoader --- 
     def train_dataloader(self) -> HGTLoader:
@@ -835,6 +895,31 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             else:
                  raise ValueError("No valid node types for HGT sampling found.")
         graph_data_cpu = self.full_graph_data.cpu()
+        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
+                         input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
+                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+
+    # Add predict_dataloader
+    def predict_dataloader(self) -> HGTLoader:
+        print("Creating predict HGTLoader...")
+        if self.test_indices is None: self.setup('predict') # Ensure setup is called
+        if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
+        if self.test_indices is None or len(self.test_indices) == 0: 
+             # If test_indices is still empty after setup('predict'), something went wrong
+             raise ValueError("Prediction set empty or test indices not assigned correctly during setup.")
+             
+        # Use the same sampling logic as test_dataloader
+        valid_hgt_num_samples = {k:v for k,v in self.hgt_num_samples.items() if k in self.full_graph_data.node_types}
+        if not valid_hgt_num_samples: 
+            print("[WARN] No valid node types for HGT sampling specified or detected during prediction.")
+            if self.use_gnn_encoder and 'transaction' in self.full_graph_data.node_types:
+                 print("  Defaulting to sampling only for 'transaction' node.")
+                 valid_hgt_num_samples = {'transaction': self.hgt_num_samples.get('transaction', [15, 10][:self.num_hgt_layers])}
+            else:
+                 raise ValueError("No valid node types for HGT sampling found.")
+                 
+        graph_data_cpu = self.full_graph_data.cpu()
+        # Input nodes should be the test_indices, which contain all nodes for predict stage
         return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
                          input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
                          num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))

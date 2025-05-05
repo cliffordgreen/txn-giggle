@@ -15,6 +15,7 @@ from typing import Optional, Dict, List
 import pyarrow as pa # Added for ArrowInvalid check
 import pyarrow.ipc as ipc # Use ipc explicitly for stream reading
 import numpy as np # Added
+import pickle # Added for saving state
 
 # Use the V2 DataModule
 from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable 
@@ -307,6 +308,23 @@ def train_advanced(
         traceback.print_exc()
         # Optionally save state or raise
         raise e
+    finally:
+        # --- Save Preprocessing State (Scalers and Mappings) ---
+        print("Attempting to save preprocessing state...")
+        state_to_save = {
+            'scalers': data_module.scalers,
+            'seq_scalers': data_module.seq_scalers,
+            'edge_scalers': data_module.edge_scalers,
+            'user_map': data_module.user_map,
+            'category_id_map': data_module.category_id_map
+        }
+        save_path = os.path.join(output_dir, 'preprocessing_state.pkl')
+        try:
+            with open(save_path, 'wb') as f:
+                pickle.dump(state_to_save, f)
+            print(f"Preprocessing state saved successfully to: {save_path}")
+        except Exception as save_e:
+            print(f"[ERROR] Failed to save preprocessing state to {save_path}: {save_e}")
 
     # --- Test --- 
     print("Starting Testing...")

@@ -38,13 +38,13 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         # We access these via self._config_name during init
         self._model_config = model_config 
         self._graph_config = model_config['graph_encoder_params']
-        self._sequence_config = model_config['sequence_encoder_params']
-        self._text_config = model_config['text_encoder_params']
+        self._sequence_config = model_config.get('sequence_encoder_params', {})
+        self._text_config = model_config.get('text_encoder_params', {})
         self._fusion_config = model_config['fusion_params']
         
         # Extract required counts/dims from the config for convenience
         num_global_classes = model_config['num_global_classes']
-        num_user_classes = model_config['num_user_classes']
+        num_user_classes = model_config.get('num_user_classes', 0) # Default to 0 if missing
         num_users = model_config['num_users']
         user_embed_dim = model_config['user_embed_dim']
 
@@ -76,6 +76,9 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         self.sequence_encoder = None
         seq_out_dim = 0 # Default if not used
         if self.use_sequence_encoder:
+            # Ensure sequence config is not empty if used
+            if not self._sequence_config:
+                 raise ValueError("Sequence encoder is enabled but 'sequence_encoder_params' is missing or empty in config.")
             self.sequence_encoder = PytorchForecastingTFTWrapper(
                 output_dim=self._sequence_config['output_dim'],
                 tft_params=self._sequence_config.get('tft_params', {}),
@@ -84,9 +87,13 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             seq_out_dim = self.sequence_encoder.get_output_dim()
             print(f"[INFO] TFT Wrapper Initialized. Output Dim: {seq_out_dim}")
 
+        # <<< Conditionally initialize Text Encoder >>>
         self.text_encoder = None
         text_out_dim = 0 # Default if not used
         if self.use_text_encoder:
+             # Ensure text config is not empty if used
+             if not self._text_config:
+                  raise ValueError("Text encoder is enabled but 'text_encoder_params' is missing or empty in config.")
              self.text_encoder = FinBERTEmbedder(
                 model_name=self._text_config.get('model_name', 'ProsusAI/finbert'),
                 pooling_strategy=self._text_config.get('pooling_strategy', 'mean'),
@@ -95,9 +102,11 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
              )
              text_out_dim = self.text_encoder.get_output_dim()
              print(f"[INFO] FinBERT Encoder Initialized. Output Dim: {text_out_dim}")
-        else:
-             text_out_dim = 0 # Ensure text_out_dim exists
-             
+        
+        # <<< User Embedding (Always initialized if num_users > 0?) >>>
+        # Check if num_users is valid
+        if not isinstance(num_users, int) or num_users <= 0:
+             raise ValueError(f"Invalid num_users ({num_users}). Must be a positive integer.")
         self.user_embedding = nn.Embedding(num_users, user_embed_dim)
         print(f"[INFO] User Embedding Initialized. Output Dim: {user_embed_dim}")
 
@@ -115,7 +124,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         
         # Ensure at least one modality is active
         if not fusion_input_dims:
-            raise ValueError("No encoders are enabled. At least one encoder (graph, sequence, text) must be active.")
+            raise ValueError("No encoders are enabled or user embedding dim is zero. At least one input must be available for fusion.")
             
         self.fusion_module = AttentionFusion(
             modality_dims=fusion_input_dims,
@@ -127,20 +136,35 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         print(f"[INFO] Attention Fusion Initialized. Output Dim: {fused_dim}")
 
         # --- 3. Classification Heads ---
+        # Global head should always exist if num_global_classes is valid
+        if not isinstance(num_global_classes, int) or num_global_classes <= 0:
+            raise ValueError(f"Invalid num_global_classes ({num_global_classes}). Must be a positive integer.")
         self.global_head = nn.Linear(fused_dim, num_global_classes)
-        self.user_specific_head = nn.Linear(fused_dim, num_user_classes)
-        print(f"[INFO] Classifiers Initialized: Global={num_global_classes}, User={num_user_classes}")
+        
+        # User-specific head only if num_user_classes > 0
+        self.user_specific_head = None
+        if isinstance(num_user_classes, int) and num_user_classes > 0:
+            self.user_specific_head = nn.Linear(fused_dim, num_user_classes)
+            print(f"[INFO] Classifiers Initialized: Global={num_global_classes}, User={num_user_classes}")
+        else:
+             print(f"[INFO] Classifiers Initialized: Global={num_global_classes}, User=DISABLED")
 
         # --- 4. Loss Function ---
         self.focal_loss_global = FocalLoss(
             alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma, 
             num_classes=num_global_classes # Pass num_classes for alpha tensor creation
         )
-        self.focal_loss_user = FocalLoss(
-            alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma, 
-            num_classes=num_user_classes # Pass num_classes for alpha tensor creation
-        )
-        print("[INFO] Focal Loss Initialized.")
+        
+        # User-specific loss only if num_user_classes > 0
+        self.focal_loss_user = None
+        if isinstance(num_user_classes, int) and num_user_classes > 0:
+            self.focal_loss_user = FocalLoss(
+                alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma, 
+                num_classes=num_user_classes # Pass num_classes for alpha tensor creation
+            )
+            print("[INFO] Focal Loss Initialized: Global, User")
+        else:
+             print("[INFO] Focal Loss Initialized: Global Only")
 
     def forward(self, 
                 graph_batch: Optional[HeteroData] = None, 
@@ -269,29 +293,29 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         
     def _calculate_mtl_loss(self, 
                               global_logits: torch.Tensor, global_target: torch.Tensor, 
-                              user_logits: torch.Tensor, user_target: torch.Tensor
+                              user_logits: Optional[torch.Tensor], user_target: Optional[torch.Tensor]
                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
          """Calculates individual and combined MTL loss."""
          loss_global = torch.tensor(0.0, device=self.device)
          if global_logits is not None and global_target is not None:
              try:
-                 # Loss expects targets on the same device as logits
                  loss_global = self.focal_loss_global(global_logits, global_target.to(global_logits.device))
              except Exception as e:
                  print(f"[ERROR] Global loss calculation failed: {e}")
                  loss_global = torch.tensor(0.0, device=self.device, requires_grad=True) 
  
          loss_user = torch.tensor(0.0, device=self.device)
-         if user_logits is not None and user_target is not None:
+         # Check if user head and loss are initialized AND logits/targets are provided
+         if self.user_specific_head is not None and self.focal_loss_user is not None and \
+            user_logits is not None and user_target is not None:
              try:
-                 # Loss expects targets on the same device as logits
                  loss_user = self.focal_loss_user(user_logits, user_target.to(user_logits.device))
              except Exception as e:
                  print(f"[ERROR] User loss calculation failed: {e}")
                  loss_user = torch.tensor(0.0, device=self.device, requires_grad=True)
                  
-         weight_global = self.hparams.mtl_weights.get('global', 0.5)
-         weight_user = self.hparams.mtl_weights.get('user', 0.5)
+         weight_global = self.hparams.mtl_weights.get('global', 1.0) # Default to 1.0 if user loss is disabled
+         weight_user = self.hparams.mtl_weights.get('user', 0.0) if self.user_specific_head else 0.0 # Use 0 weight if disabled
          total_loss = weight_global * loss_global + weight_user * loss_user
          
          # Handle potential NaN loss before returning
@@ -433,13 +457,13 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
              return None
              
         total_loss, loss_global, loss_user = self._calculate_mtl_loss(
-            global_logits, global_target, # Pass CPU targets, loss fn moves them
-            user_specific_logits, user_target 
+            global_logits, global_target,
+            user_specific_logits, user_target # Pass potentially None user logits/targets
         )
 
         # --- Accuracy Calculation --- 
         acc_global = self._calculate_accuracy(global_logits, global_target)
-        acc_user = self._calculate_accuracy(user_specific_logits, user_target)
+        acc_user = self._calculate_accuracy(user_specific_logits, user_target) # Handles None inputs
 
         # --- Logging & Return --- 
         log_batch_size = global_logits.shape[0]
