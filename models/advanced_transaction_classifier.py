@@ -24,7 +24,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                  # Training Config
                  learning_rate: float = 1e-4, 
                  weight_decay: float = 1e-5,
-                 mtl_weights: Dict[str, float] = {'global': 0.5, 'user': 0.5},
+                 mtl_weights: Dict[str, float] = {'global': 1.0, 'user': 0.0},
                  focal_loss_alpha: float = 0.25,
                  focal_loss_gamma: float = 2.0,
                  # Add DataFrame reference

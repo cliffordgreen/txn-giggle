@@ -87,3 +87,8 @@ fusion_params:
   hidden_dim: 128     # Hidden dimension within the fusion module
   output_dim: 256     # Final dimension after fusion, before classification heads
   dropout: 0.1
+
+
+mtl_weights:
+  global: 1.0
+  user: 0.0 
