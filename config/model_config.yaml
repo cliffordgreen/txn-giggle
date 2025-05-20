@@ -4,7 +4,7 @@
 use_sequence_encoder: false # Set to true to enable TFT/Sequence encoder
 use_graph_encoder: true     # Set to true to enable HGT/Graph encoder
 use_text_encoder: true      # Set to true to enable FinBERT/Text encoder
-
+use_coa_text_features: false
 # --- General Parameters ---
 user_embed_dim: 64        # Dimension for the user ID embeddings
 max_seq_length: 50        # Max sequence length considered by the sequence encoder (used in DataModule)

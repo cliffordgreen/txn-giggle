@@ -190,9 +190,11 @@ def train_advanced(
     # --- Data Module V2 --- 
     print("Initializing TransactionDataModuleV2...")
     # --- Get encoder flags from config --- 
-    use_seq = model_config.get('use_sequence_encoder', True)
-    use_graph = model_config.get('use_graph_encoder', True)
-    use_text = model_config.get('use_text_encoder', True)
+    use_seq = model_config.get('use_sequence_encoder', True) # Default to True if missing
+    use_graph = model_config.get('use_graph_encoder', True)   # Default to True
+    use_text = model_config.get('use_text_encoder', True)     # Default to True
+    # Get the new flag for COA text features
+    use_coa_text = model_config.get('use_coa_text_features', True) # Default to True
 
     num_hgt_layers = model_config['graph_encoder_params'].get('num_layers', 2) 
     data_module = TransactionDataModuleV2(
@@ -204,10 +206,12 @@ def train_advanced(
         text_model_name=model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
         max_seq_length=model_config.get('max_seq_length', 50),
         text_max_length=model_config['text_encoder_params'].get('max_length', 128),
-        # Pass flags to DataModule
         use_sequence_encoder=use_seq,
         use_gnn_encoder=use_graph,
-        use_text_encoder=use_text
+        use_text_encoder=use_text,
+        use_coa_text_features=use_coa_text # Pass the new flag
+        # Add other arguments like fitted_scalers if this is also used for predict.py context
+        # For now, assuming this specific snippet is from train_new.py for training context
     )
     print("Setting up DataModuleV2...")
     data_module.setup('fit') 

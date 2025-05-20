@@ -59,6 +59,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                  use_sequence_encoder: bool = True,
                  use_text_encoder: bool = True,
                  use_gnn_encoder: bool = True,
+                 use_coa_text_features: bool = True,
                  # --- Arguments for loading pre-fitted state --- 
                  fitted_scalers: Optional[Dict[str, StandardScaler]] = None,
                  fitted_seq_scalers: Optional[Dict[str, StandardScaler]] = None,
@@ -79,6 +80,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         self.use_sequence_encoder = use_sequence_encoder
         self.use_text_encoder = use_text_encoder
         self.use_gnn_encoder = use_gnn_encoder
+        self.use_coa_text_features = use_coa_text_features
 
         # Store/Create HGT sampling config
         self.num_hgt_layers = num_hgt_layers
@@ -453,10 +455,9 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         data['transaction'].user_id_code = torch.tensor(df['user_id_code'].values, dtype=torch.long)
         
         # Updated text feature extraction
-        text_cols = ['description', 'memo', 'merchant_name'] # Use new source columns
-        # Optionally add chart of account text
+        text_cols = ['description', 'memo', 'merchant_name'] 
         coa_text_list = []
-        if 'chart_of_accounts_processed' in df.columns and self.use_text_encoder:
+        if self.use_text_encoder and self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns:
             print("  Including chart of accounts text...")
             for coa_json_str in df['chart_of_accounts_processed'].fillna('[]'):
                 try:
@@ -466,8 +467,11 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                     coa_text_list.append(" || ".join(filter(None, acc_texts)))
                 except (json.JSONDecodeError, TypeError):
                     coa_text_list.append("") # Append empty string on error
-        else:
-             coa_text_list = ["" for _ in range(len(df))] # Empty strings if column missing
+        elif self.use_text_encoder and self.use_coa_text_features: # COA enabled but column missing
+            print("  [WARN] use_coa_text_features is True, but 'chart_of_accounts_processed' column not found. COA text will be empty.")
+            coa_text_list = ["" for _ in range(len(df))] # Ensure list exists
+        else: # COA text disabled or text encoder disabled
+            coa_text_list = ["" for _ in range(len(df))] # Ensure list exists
 
         # Combine transaction text and chart of accounts text
         raw_text_combined = []
@@ -479,7 +483,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             raw_text_combined.append(combined)
         
         data['transaction']._raw_text = raw_text_combined
-        if self.use_text_encoder: print(f"  Combined raw text features created (including COA if present).")
+        if self.use_text_encoder: print(f"  Combined raw text features created (COA included: {self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns}).")
 
         print("  Creating edges and edge features...")
         edge_index_dict = {}
@@ -620,7 +624,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # Updated text feature extraction for minimal graph
         text_cols = ['description', 'memo', 'merchant_name'] 
         coa_text_list = []
-        if 'chart_of_accounts_processed' in df.columns and self.use_text_encoder:
+        if self.use_text_encoder and self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns:
             for coa_json_str in df['chart_of_accounts_processed'].fillna('[]'):
                 try:
                     coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
@@ -628,7 +632,10 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                     coa_text_list.append(" || ".join(filter(None, acc_texts)))
                 except (json.JSONDecodeError, TypeError):
                     coa_text_list.append("") 
-        else:
+        elif self.use_text_encoder and self.use_coa_text_features: # COA enabled but column missing
+            print("  [WARN] Minimal graph: use_coa_text_features is True, but 'chart_of_accounts_processed' column not found.") # Optional print
+            coa_text_list = ["" for _ in range(len(df))]
+        else: # COA text disabled or text encoder disabled
             coa_text_list = ["" for _ in range(len(df))]
 
         raw_text_combined = []
