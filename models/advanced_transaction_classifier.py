@@ -6,13 +6,13 @@ import pandas as pd
 
 # Import components from other files in the 'models' directory
 from .hgt_encoder import HGT
-from .tft_encoder import PytorchForecastingTFTWrapper
+# from .tft_encoder import PytorchForecastingTFTWrapper
 from .finbert_encoder import FinBERTEmbedder
 from .fusion_modules import AttentionFusion # Assuming AttentionFusion is desired
 from .losses import FocalLoss
 
 # Assume HeteroData comes from torch_geometric
-from torch_geometric.data import HeteroData
+from torch_geometric.data import Batch # HeteroData Batch object
 
 class AdvancedTransactionCategorizationModel(pl.LightningModule):
     """ Multi-modal transaction categorization using HGT, TFT, FinBERT, 
@@ -21,10 +21,18 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
     def __init__(self, 
                  # Config Dictionaries
                  model_config: Dict[str, Any], # Contains keys like graph_encoder_params etc.
+                 # Feature dimensions and counts (from DataModule after setup)
+                 node_feature_dims: Dict[str, int],
+                 edge_feature_dims: Dict[Tuple[str,str,str], int], # For GNN metadata
+                 num_users: int,
+                 num_global_classes: int,
+                 graph_metadata: Tuple[List[str], List[Tuple[str,str,str]]], # Moved up
+                 # User COA tokenized tensors (from DataModule)
+                 user_tokenized_coa_tensors: Optional[Dict[str, torch.Tensor]] = None,
                  # Training Config
                  learning_rate: float = 1e-4, 
                  weight_decay: float = 1e-5,
-                 mtl_weights: Dict[str, float] = {'global': 1.0, 'user': 0.0},
+                 mtl_weights: Dict[str, float] = {'global': 1.0}, # User MTL removed for now
                  focal_loss_alpha: float = 0.25,
                  focal_loss_gamma: float = 2.0,
                  # Add DataFrame reference
@@ -33,20 +41,26 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         super().__init__()
         # Store simple hyperparameters automatically
         self.save_hyperparameters('learning_rate', 'weight_decay',
-                                'mtl_weights', 'focal_loss_alpha', 'focal_loss_gamma')
+                                'mtl_weights', 'focal_loss_alpha', 'focal_loss_gamma',
+                                'node_feature_dims', 'edge_feature_dims',
+                                'num_users', 'num_global_classes',
+                                'graph_metadata' # Added graph_metadata
+                                )
         # Store complex configs manually (needed if loading from checkpoint)
         # We access these via self._config_name during init
         self._model_config = model_config 
         self._graph_config = model_config['graph_encoder_params']
-        self._sequence_config = model_config.get('sequence_encoder_params', {})
+        # self._sequence_config = model_config.get('sequence_encoder_params', {}) # Removed
         self._text_config = model_config.get('text_encoder_params', {})
         self._fusion_config = model_config['fusion_params']
+        self.graph_metadata_prop = graph_metadata # Store graph_metadata directly
         
         # Extract required counts/dims from the config for convenience
-        num_global_classes = model_config['num_global_classes']
-        num_user_classes = model_config.get('num_user_classes', 0) # Default to 0 if missing
-        num_users = model_config['num_users']
-        user_embed_dim = model_config['user_embed_dim']
+        self.node_feature_dims = node_feature_dims
+        self.edge_feature_dims = edge_feature_dims # Used for GNN metadata
+        # self.sequence_feature_dim = sequence_feature_dim
+        self.num_users = num_users
+        self.num_global_classes = num_global_classes
 
         # Store references (NOT saved as hparams)
         self._transactions_df_ref = transactions_df_ref
@@ -55,17 +69,19 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
         # <<< Store modality flags from config >>>
         self.use_gnn_encoder = model_config.get('use_gnn_encoder', True)
-        self.use_sequence_encoder = model_config.get('use_sequence_encoder', True)
+        # self.use_sequence_encoder = model_config.get('use_sequence_encoder', True) # Removed
         self.use_text_encoder = model_config.get('use_text_encoder', True)
+        self.use_coa_text_features = model_config.get('use_coa_text_features', True) # New flag from config
 
         # --- 1. Encoders ---
         self.graph_encoder = None
         if self.use_gnn_encoder:
+             print(f"[DEBUG HGT INIT] metadata type: {type(self.graph_metadata_prop)}, value: {self.graph_metadata_prop}") # DEBUG PRINT
              self.graph_encoder = HGT(
-                in_channels=self._graph_config['in_channels'],
+                in_channels=self.node_feature_dims,
                 hidden_channels=self._graph_config['hidden_channels'], 
                 out_channels=self._graph_config['out_channels'], 
-                metadata=self._graph_config['metadata'], 
+                metadata=self.graph_metadata_prop, # Use the stored graph_metadata tuple
                 num_heads=self._graph_config['num_heads'], 
                 num_layers=self._graph_config['num_layers']
                 # Add dropout if HGT supports it
@@ -74,18 +90,19 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
 
         # <<< Conditionally initialize Sequence Encoder >>>
         self.sequence_encoder = None
-        seq_out_dim = 0 # Default if not used
-        if self.use_sequence_encoder:
+        # seq_out_dim = 0 # Default if not used
+        # if self.use_sequence_encoder:
             # Ensure sequence config is not empty if used
-            if not self._sequence_config:
-                 raise ValueError("Sequence encoder is enabled but 'sequence_encoder_params' is missing or empty in config.")
-            self.sequence_encoder = PytorchForecastingTFTWrapper(
-                output_dim=self._sequence_config['output_dim'],
-                tft_params=self._sequence_config.get('tft_params', {}),
-                embedding_source_key=self._sequence_config.get('embedding_source_key', 'encoder_variables')
-            )
-            seq_out_dim = self.sequence_encoder.get_output_dim()
-            print(f"[INFO] TFT Wrapper Initialized. Output Dim: {seq_out_dim}")
+            # if not self._sequence_config:
+                 # raise ValueError("Sequence encoder is enabled but 'sequence_encoder_params' is missing or empty in config.")
+            # self.sequence_encoder = PytorchForecastingTFTWrapper(
+                # input_dim=self.sequence_feature_dim, # New: pass input_dim per timestep
+                # output_dim=self._sequence_config['output_dim'],
+                # tft_params=self._sequence_config.get('tft_params', {}),
+                # embedding_source_key=self._sequence_config.get('embedding_source_key', 'encoder_variables')
+            # )
+            # seq_out_dim = self.sequence_encoder.get_output_dim()
+            # print(f"[INFO] Sequence (TFT) Encoder Initialized. Input dim per step: {self.sequence_feature_dim}, Output Dim: {seq_out_dim}")
 
         # <<< Conditionally initialize Text Encoder >>>
         self.text_encoder = None
@@ -101,26 +118,47 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                 projection_dim=self._text_config.get('projection_dim', 0)
              )
              text_out_dim = self.text_encoder.get_output_dim()
-             print(f"[INFO] FinBERT Encoder Initialized. Output Dim: {text_out_dim}")
+             print(f"[INFO] Transaction FinBERT Encoder Initialized. Output Dim: {text_out_dim}")
         
         # <<< User Embedding (Always initialized if num_users > 0?) >>>
         # Check if num_users is valid
         if not isinstance(num_users, int) or num_users <= 0:
              raise ValueError(f"Invalid num_users ({num_users}). Must be a positive integer.")
-        self.user_embedding = nn.Embedding(num_users, user_embed_dim)
-        print(f"[INFO] User Embedding Initialized. Output Dim: {user_embed_dim}")
+        self.user_embedding = nn.Embedding(num_users, self._model_config['user_embed_dim'])
+        print(f"[INFO] User Embedding Initialized. Output Dim: {self._model_config['user_embed_dim']}")
+        
+        # Effective dimension for user features going into fusion
+        effective_user_dim_for_fusion = self._model_config['user_embed_dim']
+        if self.use_coa_text_features and self.use_text_encoder and self.text_encoder:
+            # COA text will be encoded by the main text_encoder, so its output dim is text_out_dim
+            effective_user_dim_for_fusion += text_out_dim # Concatenation
+            print(f"[INFO] COA text features will be used. Effective user dim for fusion: {effective_user_dim_for_fusion}")
+
+        # Store user_tokenized_coa_tensors as buffers if provided (Option A)
+        self.user_coa_input_ids_buffer = None
+        self.user_coa_attention_mask_buffer = None
+        if self.use_coa_text_features and user_tokenized_coa_tensors is not None:
+            if 'input_ids' in user_tokenized_coa_tensors and 'attention_mask' in user_tokenized_coa_tensors:
+                self.register_buffer('user_coa_input_ids_buffer', user_tokenized_coa_tensors['input_ids'])
+                self.register_buffer('user_coa_attention_mask_buffer', user_tokenized_coa_tensors['attention_mask'])
+                print(f"[INFO] Registered COA tokenized tensors as buffers. Shape e.g. input_ids: {self.user_coa_input_ids_buffer.shape}")
+            else:
+                print("[WARN] user_tokenized_coa_tensors provided but missing 'input_ids' or 'attention_mask'. COA features might not work.")
+        elif self.use_coa_text_features:
+            print("[WARN] COA text features enabled, but user_tokenized_coa_tensors not provided to model. COA features will be zeros.")
 
         # --- 2. Fusion Module --- 
         # <<< Adjust fusion input dims based on active encoders >>>
         fusion_input_dims = {}
         if self.use_gnn_encoder and self.graph_encoder:
              fusion_input_dims['graph'] = self._graph_config['out_channels']
-        if self.use_sequence_encoder and self.sequence_encoder:
-             fusion_input_dims['sequence'] = seq_out_dim
-        if self.use_text_encoder and self.text_encoder:
+        # if self.use_sequence_encoder and self.sequence_encoder:
+             # fusion_input_dims['sequence'] = seq_out_dim
+        if self.use_text_encoder and self.text_encoder: # For transaction text
              fusion_input_dims['text'] = text_out_dim
-        # Always include user embedding (assuming it's always used)
-        fusion_input_dims['user'] = user_embed_dim
+        
+        # User modality uses the (potentially combined) effective user dimension
+        fusion_input_dims['user'] = effective_user_dim_for_fusion
         
         # Ensure at least one modality is active
         if not fusion_input_dims:
@@ -141,135 +179,297 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
             raise ValueError(f"Invalid num_global_classes ({num_global_classes}). Must be a positive integer.")
         self.global_head = nn.Linear(fused_dim, num_global_classes)
         
-        # User-specific head only if num_user_classes > 0
-        self.user_specific_head = None
-        if isinstance(num_user_classes, int) and num_user_classes > 0:
-            self.user_specific_head = nn.Linear(fused_dim, num_user_classes)
-            print(f"[INFO] Classifiers Initialized: Global={num_global_classes}, User={num_user_classes}")
-        else:
-             print(f"[INFO] Classifiers Initialized: Global={num_global_classes}, User=DISABLED")
-
         # --- 4. Loss Function ---
         self.focal_loss_global = FocalLoss(
             alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma, 
             num_classes=num_global_classes # Pass num_classes for alpha tensor creation
         )
         
-        # User-specific loss only if num_user_classes > 0
-        self.focal_loss_user = None
-        if isinstance(num_user_classes, int) and num_user_classes > 0:
-            self.focal_loss_user = FocalLoss(
-                alpha=self.hparams.focal_loss_alpha, gamma=self.hparams.focal_loss_gamma, 
-                num_classes=num_user_classes # Pass num_classes for alpha tensor creation
-            )
-            print("[INFO] Focal Loss Initialized: Global, User")
-        else:
-             print("[INFO] Focal Loss Initialized: Global Only")
-
-    def forward(self, 
-                graph_batch: Optional[HeteroData] = None, 
-                sequence_batch: Optional[Any] = None, 
-                text_batch: Optional[List[str]] = None, 
-                user_ids: Optional[torch.Tensor] = None,
-                batch_size: Optional[int] = None
-                ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def forward(self, data: Batch) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # Return only global logits
+        # data is a torch_geometric.data.Batch object
         
+        # Determine the effective batch size (total number of transactions in the batch)
+        num_transactions_in_batch = data['transaction'].num_nodes 
+        if num_transactions_in_batch == 0:
+            # Should not happen if dataloader filters empty graphs, but handle defensively
+            print("[WARN] Forward pass received a batch with zero transactions.")
+            # Return dummy outputs matching expected dimensions if possible
+            dummy_logits = torch.empty((0, self.num_global_classes), device=self.device)
+            return dummy_logits, None # No user logits
+
         embeddings_to_fuse = {}
 
-        # --- 1. Graph Encoding --- 
-        if self.graph_encoder and graph_batch:
+        # --- 1. Graph Encoding (GNN) ---
+        if self.use_gnn_encoder and self.graph_encoder:
             try:
-                node_embeddings_dict = self.graph_encoder(graph_batch.x_dict, graph_batch.edge_index_dict)
+                # x_dict and edge_index_dict are directly available from the Batch object
+                # Ensure edge_attr_dict is passed if your GNN uses it and it's in the batch
+                edge_attr_dict = data.edge_attr_dict if hasattr(data, 'edge_attr_dict') else None
                 
-                # --- Extract embeddings for TARGET transaction nodes --- 
-                # Slice the first batch_size nodes from the GNN output
+                node_embeddings_dict = self.graph_encoder(data.x_dict, data.edge_index_dict, edge_attr_dict=edge_attr_dict)
                 if 'transaction' in node_embeddings_dict:
-                     if batch_size is None:
-                          # Try to infer batch_size if not passed (e.g., from user_ids)
-                          if user_ids is not None: batch_size = user_ids.shape[0]
-                          else: raise ValueError("Forward pass needs batch_size if graph_batch is provided.")
-                     
-                     # Ensure we don't slice beyond available nodes
-                     num_nodes_in_batch_output = node_embeddings_dict['transaction'].shape[0]
-                     if batch_size > num_nodes_in_batch_output:
-                         print(f"[WARN] Forward: batch_size ({batch_size}) > GNN output nodes ({num_nodes_in_batch_output}). Slicing available nodes.")
-                         graph_embed = node_embeddings_dict['transaction'][:num_nodes_in_batch_output]
-                     else:
-                         graph_embed = node_embeddings_dict['transaction'][:batch_size]
-                         
-                     if graph_embed is not None:
-                         embeddings_to_fuse['graph'] = graph_embed.to(self.device)
+                    graph_embed = node_embeddings_dict['transaction']
+                    if graph_embed.shape[0] == num_transactions_in_batch:
+                        embeddings_to_fuse['graph'] = graph_embed
+                    else:
+                        print(f"[WARN] GNN output transaction nodes ({graph_embed.shape[0]}) mismatch with batch transaction nodes ({num_transactions_in_batch}). Padding/truncating or error needed.")
+                        # Simple fix: use zeros if mismatch, or ensure GNN outputs correctly sized tensor for all nodes in batch.
+                        # This usually indicates an issue with how GNN handles batching or node indexing.
+                        # For now, let's assume HGT and other PyG GNNs correctly output for all nodes in the batch.
+                        embeddings_to_fuse['graph'] = torch.zeros((num_transactions_in_batch, self.graph_encoder.out_channels), device=self.device)
+
+                else: # GNN did not produce 'transaction' embeddings
+                    print("[WARN] GNN output missing 'transaction' key. Using zeros for graph embeddings.")
+                    embeddings_to_fuse['graph'] = torch.zeros((num_transactions_in_batch, self.graph_encoder.out_channels), device=self.device)
+            except Exception as e:
+                print(f"[ERROR] Graph encoding failed in forward: {e}")
+                import traceback; traceback.print_exc();
+                embeddings_to_fuse['graph'] = torch.zeros((num_transactions_in_batch, self.graph_encoder.out_channels), device=self.device)
+        elif self.use_gnn_encoder: # GNN enabled but no encoder instance
+             embeddings_to_fuse['graph'] = torch.zeros((num_transactions_in_batch, self._model_config.get('graph_encoder_params',{}).get('out_channels',64)), device=self.device)
+
+
+        # --- 2. Text Encoding (Transaction Text) ---
+        if self.use_text_encoder and self.text_encoder:
+            if hasattr(data['transaction'], 'input_ids') and hasattr(data['transaction'], 'attention_mask'):
+                tx_input_ids = data['transaction'].input_ids
+                tx_attention_mask = data['transaction'].attention_mask
+                # Expected shape: (num_transactions_in_batch, seq_len)
+                if tx_input_ids.shape[0] == num_transactions_in_batch:
+                    text_input_dict = {'input_ids': tx_input_ids, 'attention_mask': tx_attention_mask}
+                    text_embed = self.text_encoder(text_input_dict)
+                    embeddings_to_fuse['text'] = text_embed
                 else:
-                    print("[WARN] Forward: HGT output missing 'transaction' embeddings.")
-            except Exception as e:
-                print(f"[ERROR] HGT Encoder forward failed: {e}")
-                # Decide if we should raise or continue without graph embeddings
+                    print(f"[WARN] Transaction text input_ids shape ({tx_input_ids.shape[0]}) mismatch with batch transaction nodes ({num_transactions_in_batch}). Using zeros.")
+                    embeddings_to_fuse['text'] = torch.zeros((num_transactions_in_batch, self.text_encoder.get_output_dim()), device=self.device)
+            else:
+                print("[WARN] Transaction text 'input_ids' or 'attention_mask' not found in batch. Using zeros for text embeddings.")
+                embeddings_to_fuse['text'] = torch.zeros((num_transactions_in_batch, self.text_encoder.get_output_dim()), device=self.device)
+        elif self.use_text_encoder: # Text enabled but no encoder
+            embeddings_to_fuse['text'] = torch.zeros((num_transactions_in_batch, self._model_config.get('text_encoder_params',{}).get('projection_dim') or 768), device=self.device)
 
-        # --- 2. Sequence Encoding --- 
-        if self.sequence_encoder and sequence_batch is not None:
-            try:
-                seq_embed = self.sequence_encoder(sequence_batch, device=self.device)
-                if seq_embed is not None:
-                    embeddings_to_fuse['sequence'] = seq_embed.to(self.device)
-            except Exception as e:
-                print(f"[ERROR] TFT Encoder forward failed: {e}")
-                
-        # --- 3. Text Encoding --- 
-        if self.text_encoder and text_batch is not None:
-            try:
-                text_embed = self.text_encoder(text_batch)
-                if text_embed is not None:
-                    embeddings_to_fuse['text'] = text_embed.to(self.device)
-            except Exception as e:
-                print(f"[ERROR] FinBERT Encoder forward failed: {e}")
-                
-        # --- 4. User Embedding --- 
-        if self.user_embedding and user_ids is not None:
-            try:
-                user_embed = self.user_embedding(user_ids.to(self.device))
-                if user_embed is not None:
-                    embeddings_to_fuse['user'] = user_embed.to(self.device)
-            except Exception as e:
-                print(f"[ERROR] User Embedding forward failed: {e}")
-                
-        # Check shapes and device consistency before fusion
-        ref_batch_size = None
+
+        # --- 4. User Embedding & COA Text ---
+        if self.num_users > 0 and hasattr(data['transaction'], 'user_id_code'):
+            user_ids_for_transactions = data['transaction'].user_id_code # Global user IDs for each transaction
+            
+            # Standard user embedding
+            user_embed = self.user_embedding(user_ids_for_transactions) # Shape: (num_tx_batch, user_embed_dim)
+            
+            combined_user_features = user_embed
+
+            if self.use_coa_text_features and self.text_encoder and \
+               self.user_coa_input_ids_buffer is not None and \
+               self.user_coa_attention_mask_buffer is not None:
+                try:
+                    # Gather pre-tokenized COA for users in this batch
+                    # user_ids_for_transactions might have duplicates, which is fine.
+                    coa_input_ids_batch = self.user_coa_input_ids_buffer[user_ids_for_transactions]
+                    coa_attention_mask_batch = self.user_coa_attention_mask_buffer[user_ids_for_transactions]
+                    
+                    coa_text_input_dict = {'input_ids': coa_input_ids_batch, 'attention_mask': coa_attention_mask_batch}
+                    coa_embed = self.text_encoder(coa_text_input_dict) # Shape: (num_tx_batch, coa_text_out_dim)
+                    
+                    combined_user_features = torch.cat([user_embed, coa_embed], dim=-1)
+                except IndexError as e_coa_idx:
+                    print(f"[ERROR] COA text gathering failed due to IndexError (likely user_id out of bounds for COA buffers): {e_coa_idx}. User IDs: {user_ids_for_transactions.min()}-{user_ids_for_transactions.max()}, Buffer size: {self.user_coa_input_ids_buffer.shape[0]}")
+                    # Fallback: use only standard user_embed, and pad COA part with zeros
+                    zeros_for_coa = torch.zeros((num_transactions_in_batch, self.text_encoder.get_output_dim()), device=self.device)
+                    combined_user_features = torch.cat([user_embed, zeros_for_coa], dim=-1)
+                except Exception as e_coa:
+                    print(f"[ERROR] COA text encoding failed: {e_coa}")
+                    import traceback; traceback.print_exc();
+                    # Fallback: use only standard user_embed, and pad COA part with zeros
+                    zeros_for_coa = torch.zeros((num_transactions_in_batch, self.text_encoder.get_output_dim()), device=self.device)
+                    combined_user_features = torch.cat([user_embed, zeros_for_coa], dim=-1)
+            elif self.use_coa_text_features: # COA enabled but encoder or buffers missing
+                # Pad with zeros for the COA part if it was intended to be used
+                print("[WARN] COA features enabled but encoder or tokenized buffers missing. Using zeros for COA part of user features.")
+                coa_dim = self._model_config.get('text_encoder_params',{}).get('projection_dim') or self.text_encoder.get_output_dim() if self.text_encoder else 768
+                zeros_for_coa = torch.zeros((num_transactions_in_batch, coa_dim), device=self.device)
+                combined_user_features = torch.cat([user_embed, zeros_for_coa], dim=-1)
+
+            embeddings_to_fuse['user'] = combined_user_features
+        elif self.num_users > 0 : # User embeddings enabled but user_id_code missing on transaction
+            print("[WARN] User embeddings enabled but 'user_id_code' not found on transaction. Using zeros for user features.")
+            effective_user_dim_for_fusion = self._model_config['user_embed_dim']
+            if self.use_coa_text_features: 
+                 coa_dim = self._model_config.get('text_encoder_params',{}).get('projection_dim') or self.text_encoder.get_output_dim() if self.text_encoder else 768
+                 effective_user_dim_for_fusion += coa_dim
+            embeddings_to_fuse['user'] = torch.zeros((num_transactions_in_batch, effective_user_dim_for_fusion), device=self.device)
+
+
+        # --- 5. Fusion ---
         if not embeddings_to_fuse:
-            print("[ERROR] Forward: No embeddings available for fusion.")
-            return None, None
+            # This case should ideally be prevented by checks in __init__ or if num_transactions_in_batch is 0
+            print("[ERROR] No embeddings available for fusion. Returning zeros.")
+            global_logits = torch.zeros((num_transactions_in_batch, self.num_global_classes), device=self.device)
+            return global_logits, None
+
+        fused_embeddings = self.fusion_module(embeddings_to_fuse) # Shape: (num_tx_batch, fusion_output_dim)
+
+        # --- 6. Classification ---
+        global_logits = self.global_head(fused_embeddings)
+        
+        # User-specific head is removed for now
+        user_logits = None 
+        
+        return global_logits, user_logits # Return only global logits
+
+    def _calculate_mtl_loss(self, 
+                              global_logits: torch.Tensor, global_target: torch.Tensor, 
+                              user_logits: Optional[torch.Tensor], user_target: Optional[torch.Tensor] # user_target can be None
+                              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # total_loss, global_loss, user_loss (0 if not used)
+        
+        global_loss = self.focal_loss_global(global_logits, global_target)
+        
+        user_loss = torch.tensor(0.0, device=self.device) # Default to 0
+        # User-specific MTL part removed as user_specific_head is removed.
+        # If re-added, this logic would be:
+        # if self.user_specific_head is not None and user_logits is not None and user_target is not None and \
+        #    self.hparams.mtl_weights.get('user', 0.0) > 0:
+        #     user_loss = self.focal_loss_user(user_logits, user_target)
+        # else:
+        #     user_loss = torch.tensor(0.0, device=self.device)
+            
+        total_loss = self.hparams.mtl_weights.get('global', 1.0) * global_loss # + \
+                     # self.hparams.mtl_weights.get('user', 0.0) * user_loss # User part removed
+        
+        return total_loss, global_loss, user_loss
+
+    def _calculate_accuracy(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if logits.numel() == 0 or targets.numel() == 0 or logits.shape[0] != targets.shape[0]:
+            return torch.tensor(0.0, device=self.device) # Or handle as appropriate
+        preds = torch.argmax(logits, dim=1)
+        acc = (preds == targets).float().mean()
+        return acc
+
+    def _step(self, batch: Batch, batch_idx: int, stage: str) -> Optional[torch.Tensor]:
+        # batch is now a torch_geometric.data.Batch object
+        
+        # Targets are on the transaction nodes in the batch
+        global_target = batch['transaction'].y_global 
+        # User-specific target removed for now
+        # user_target = batch['transaction'].y_user if hasattr(batch['transaction'], 'y_user') else None
+
+        if global_target is None or global_target.numel() == 0:
+            print(f"[WARN] {stage}_step: Global target is None or empty. Skipping batch {batch_idx}.")
+            return None
+
+        # Forward pass now only takes the Batch object
+        global_logits, user_logits = self(batch) # user_logits will be None
+
+        if global_logits.shape[0] != global_target.shape[0]:
+            print(f"[ERROR] {stage}_step: Logits batch size ({global_logits.shape[0]}) != Target batch size ({global_target.shape[0]}). Skipping batch {batch_idx}.")
+            return None # Or raise error
+
+        total_loss, global_loss_val, user_loss_val = self._calculate_mtl_loss(
+            global_logits, global_target, 
+            user_logits, None # Pass None for user_target
+        )
+        
+        # Log losses
+        self.log(f'{stage}/total_loss', total_loss, batch_size=batch['transaction'].num_nodes, prog_bar=True)
+        self.log(f'{stage}/global_loss', global_loss_val, batch_size=batch['transaction'].num_nodes)
+        # self.log(f'{stage}/user_loss', user_loss_val, batch_size=batch.num_graphs) # If user MTL re-added
+
+        # Calculate and log accuracies
+        global_acc = self._calculate_accuracy(global_logits, global_target)
+        self.log(f'{stage}/global_acc', global_acc, batch_size=batch['transaction'].num_nodes, prog_bar=True)
+        
+        # if self.user_specific_head and user_logits is not None and user_target is not None:
+        #     user_acc = self._calculate_accuracy(user_logits, user_target)
+        #     self.log(f'{stage}/user_acc', user_acc, batch_size=batch.num_graphs)
+            
+        effective_batch_size = global_logits.shape[0] 
+        if effective_batch_size == 0: effective_batch_size = 1 # Avoid division by zero if somehow all were filtered
+
+        if stage == 'val':
+            print(f"[DEBUG VAL_STEP] Calculated val_loss: {total_loss.item()}, global_loss: {global_loss_val.item()}")
+
+        self.log(f'{stage}_loss', total_loss, on_step=(stage=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=effective_batch_size)
+
+        return total_loss if stage == 'train' else None
+
+    def training_step(self, batch: Batch, batch_idx: int) -> Optional[torch.Tensor]:
+        return self._step(batch, batch_idx, 'train')
+
+    def validation_step(self, batch: Batch, batch_idx: int) -> None:
+        print("[DEBUG VAL_STEP] Entered validation_step") # DEBUG PRINT
+        self._step(batch, batch_idx, 'val')
+
+    def test_step(self, batch: Batch, batch_idx: int) -> None:
+        self._step(batch, batch_idx, 'test')
+
+    def predict_step(self, batch: Batch, batch_idx: int, dataloader_idx: int = 0) -> Dict[str, torch.Tensor]:
+        global_logits, _ = self(batch) # user_logits is None
+        
+        # Get original indices if available on transaction nodes for mapping predictions back
+        original_indices = batch['transaction'].original_index if hasattr(batch['transaction'], 'original_index') else None
+        user_ids = batch['transaction'].user_id_code if hasattr(batch['transaction'], 'user_id_code') else None
+
+        predictions = {'global_logits': global_logits}
+        if original_indices is not None:
+            predictions['original_indices'] = original_indices
+        if user_ids is not None:
+            predictions['user_ids'] = user_ids
+            
+        return predictions
+
+    def configure_optimizers(self):
+        # TODO: Add support for differential learning rates (e.g., for FinBERT)
+        params_to_optimize = []
+        if self.use_text_encoder and self.text_encoder and self.text_encoder.finetune:
+            # Separate FinBERT params if different LR is desired
+            finbert_params = [p for p in self.text_encoder.parameters() if p.requires_grad]
+            other_params = [p for n, p in self.named_parameters() if p.requires_grad and not n.startswith("text_encoder.")]
+            # If coa_finbert_encoder is different and finetuned, add its params too
+            if self.use_coa_text_features and self.text_encoder and \
+               self.text_encoder is not self.coa_finbert_encoder and self.text_encoder.finetune:
+                finbert_params.extend([p for p in self.coa_finbert_encoder.parameters() if p.requires_grad])
+                # Ensure other_params does not include coa_finbert_encoder params
+                other_params = [p for n, p in self.named_parameters() if p.requires_grad and \
+                                not n.startswith("text_encoder.") and not n.startswith("coa_finbert_encoder.")]
+
+            # Example: Different LRs (adjust as needed)
+            # For now, common optimizer for all.
+            # optimizer_grouped_parameters = [
+            #     {'params': finbert_params, 'lr': self.hparams.learning_rate * 0.1}, # Smaller LR for FinBERT
+            #     {'params': other_params, 'lr': self.hparams.learning_rate}
+            # ]
+            # optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=self.hparams.weight_decay)
+            params_to_optimize = self.parameters() # Default: all params together
         else:
-            # Check batch sizes and device
-            for name, emb in embeddings_to_fuse.items():
-                 if ref_batch_size is None: ref_batch_size = emb.shape[0]
-                 if emb.shape[0] != ref_batch_size:
-                      print(f"[ERROR] Forward: Mismatched batch size for {name}: {emb.shape[0]} vs {ref_batch_size}")
-                      return None, None
-                 if emb.device != self.device:
-                      print(f"[ERROR] Forward: Embedding {name} is on wrong device: {emb.device} vs {self.device}")
-                      return None, None
+            params_to_optimize = self.parameters()
 
-        # --- 5. Fusion --- 
-        try:
-            fused_representation, _ = self.fusion_module(embeddings_to_fuse)
-        except Exception as e:
-             print(f"[ERROR] Fusion module forward failed: {e}")
-             # Return Nones if fusion fails
-             return None, None
+        optimizer = torch.optim.AdamW(params_to_optimize, lr=self.hparams.learning_rate, weight_decay=self.hparams.weight_decay)
+        
+        # Learning rate scheduler (optional)
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
+        # return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": "val/total_loss"}
+        return optimizer
 
-        # --- 6. Classify --- 
-        global_logits = None
-        user_specific_logits = None
-        try:
-            if self.global_head:
-                 global_logits = self.global_head(fused_representation)
-            if self.user_specific_head:
-                 user_specific_logits = self.user_specific_head(fused_representation)
-        except Exception as e:
-             print(f"[ERROR] Classifier head forward failed: {e}")
-             # Return Nones if classification fails
-             return None, None
+    # Properties to expose feature dimensions for external use (e.g., logging, analysis)
+    @property
+    def gnn_output_dim(self) -> int:
+        return self.graph_encoder.out_channels if self.use_gnn_encoder and self.graph_encoder else 0
 
-        return global_logits, user_specific_logits 
+    @property
+    def text_output_dim(self) -> int: # For transaction text
+        return self.text_encoder.get_output_dim() if self.use_text_encoder and self.text_encoder else 0
+    
+    @property
+    def coa_text_output_dim(self) -> int:
+        return self.coa_finbert_encoder.get_output_dim() if self.use_coa_text_features and self.coa_finbert_encoder else 0
+
+    @property
+    def user_embedding_dim(self) -> int:
+        return self.user_embedding.embedding_dim if self.user_embedding else 0
+
+    @property
+    def fusion_output_dim(self) -> int:
+        return self.fusion_module.output_dim if self.fusion_module else 0
+
 
     # Comment out the now unused helper method
     # def _get_labels_for_batch(self, original_indices: Optional[torch.Tensor], stage: str, batch_idx: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -350,7 +550,7 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
     def _step(self, batch: Any, batch_idx: int, stage: str) -> Optional[torch.Tensor]:
         """Common logic for train/val/test steps, assuming HGTLoader yields HeteroData."""
         # --- Unpack Batch & Extract Data (Using Slicing based on batch_size) --- 
-        if not isinstance(batch, HeteroData):
+        if not isinstance(batch, Batch):
             print(f"[ERROR] {stage}_step received unexpected batch type: {type(batch)}.")
             return None
         
@@ -394,21 +594,6 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
                         text_batch = tx_store._raw_text[:batch_size]
                     else:
                          print(f"[WARN] {stage}_step (batch {batch_idx}): _raw_text length ({len(tx_store._raw_text)}) < batch_size ({batch_size}).")
-                               
-                # Sequence 
-                if self.use_sequence_encoder and hasattr(tx_store, 'seq_features') and hasattr(tx_store, 'seq_lengths'):
-                    if tx_store.seq_features.shape[0] >= batch_size:
-                        sequence_batch = {
-                            'sequences': tx_store.seq_features[:batch_size],
-                            'lengths': tx_store.seq_lengths[:batch_size]
-                        }
-                        # Add categorical features if they exist
-                        if hasattr(tx_store, 'seq_cat_features') and tx_store.seq_cat_features.shape[0] >= batch_size:
-                             sequence_batch['seq_cat_features'] = tx_store.seq_cat_features[:batch_size]
-                        else:
-                             print(f"[WARN] {stage}_step (batch {batch_idx}): Missing or incorrectly sized seq_cat_features.")
-                    else:
-                         print(f"[WARN] {stage}_step (batch {batch_idx}): seq_features length ({tx_store.seq_features.shape[0]}) < batch_size ({batch_size}).")
                                
                 # Labels 
                 if hasattr(tx_store, 'y_global') and tx_store.y_global.shape[0] >= batch_size:

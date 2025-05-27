@@ -4,10 +4,11 @@
 use_sequence_encoder: false # Set to true to enable TFT/Sequence encoder
 use_graph_encoder: true     # Set to true to enable HGT/Graph encoder
 use_text_encoder: true      # Set to true to enable FinBERT/Text encoder
-use_coa_text_features: false
+use_coa_text_features: true # ENABLED for Chart of Accounts text processing
 # --- General Parameters ---
 user_embed_dim: 64        # Dimension for the user ID embeddings
 max_seq_length: 50        # Max sequence length considered by the sequence encoder (used in DataModule)
+coa_text_max_length: 256  # Max token length for consolidated COA text (used in DataModule)
 
 # --- Graph Encoder (HGT) Parameters ---
 graph_encoder_params:
@@ -73,8 +74,10 @@ sequence_encoder_params:
 
 # --- Text Encoder (FinBERT) Parameters ---
 text_encoder_params:
-  model_name: 'ProsusAI/finbert'  # Or 'bert-base-uncased', etc.
-  max_length: 128                 # Max token length for tokenizer
+  # model_name: ProsusAI/finbert 
+  model_name: ./local_finbert # Path to the local FinBERT model files
+  max_length: 128
+  output_dim: 768 # Standard for FinBERT
   projection_dim: 128             # Project FinBERT output (768) to this dim? (0 = no projection)
   freeze_bert: true               # Freeze base BERT layers during training?
 

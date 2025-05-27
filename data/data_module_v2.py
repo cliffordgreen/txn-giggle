@@ -2,18 +2,375 @@ import torch
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import Dataset, DataLoader 
+from sklearn.model_selection import train_test_split # For splitting file paths
+from torch.utils.data import Dataset, DataLoader, IterableDataset # Added IterableDataset
 from torch_geometric.data import HeteroData, Batch 
-from torch_geometric.loader import HGTLoader 
+# from torch_geometric.loader import HGTLoader # Will be removed
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Union, Any, Iterator # Added Iterator
+from collections import defaultdict # Added
 import pytorch_lightning as pl
 import time 
 import os
 import functools 
-import json # Added for parsing chart_of_accounts if needed
-from sklearn.neighbors import NearestNeighbors # Need this for similar_amount
+import json 
+from sklearn.neighbors import NearestNeighbors 
+import pyarrow as pa
+import pyarrow.ipc as ipc
+import pyarrow.dataset as ds # Added for reading arrow datasets in old code
+import pyarrow.parquet # Explicitly import parquet module
+
+# --- ArrowFilesIterableDataset ---
+class ArrowFilesIterableDataset(IterableDataset):
+    def __init__(self, 
+                 file_paths: List[str], 
+                 data_module_ref: 'TransactionDataModuleV2', 
+                 chunk_size: int = 1, # Number of files to process into one HeteroData object
+                 stage: str = 'fit'):
+        super().__init__()
+        self.file_paths = file_paths
+        self.data_module_ref = data_module_ref
+        self.chunk_size = chunk_size
+        self.stage = stage
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer.")
+        
+        # Store references to pre-fitted/pre-calculated items from the main DataModule
+        self.tokenizer = self.data_module_ref.tokenizer
+        self.user_map = self.data_module_ref.user_map
+        self.category_id_map = self.data_module_ref.category_id_map
+        self.scalers = self.data_module_ref.scalers
+        self.seq_scalers = self.data_module_ref.seq_scalers
+        self.edge_scalers = self.data_module_ref.edge_scalers
+        self.user_coa_texts = self.data_module_ref.user_coa_texts
+        self.text_max_length = self.data_module_ref.text_max_length
+        self.coa_text_max_length = self.data_module_ref.coa_text_max_length
+        self.max_seq_length = self.data_module_ref.max_seq_length
+        self.tx_feat_cols_to_scale = self.data_module_ref.tx_feat_cols_to_scale
+        self.merchant_agg_funcs_named = self.data_module_ref.merchant_agg_funcs_named
+        self.use_gnn_encoder = self.data_module_ref.use_gnn_encoder # To know if merchant nodes/edges are needed
+        
+        if self.tokenizer is None and (self.data_module_ref.use_text_encoder or self.data_module_ref.use_coa_text_features):
+            raise RuntimeError(f"Tokenizer not initialized in DataModule before creating ArrowFilesIterableDataset for stage {self.stage}")
+        if self.user_map is None or self.category_id_map is None:
+            raise RuntimeError(f"User/Category maps not ready in DataModule before creating ArrowFilesIterableDataset for stage {self.stage}")
+        # Scalers might be empty if predicting and no numeric features were scaled, so check stage context
+        if not self.scalers and self.stage != 'predict' and any(self.data_module_ref.node_feature_dims.get(ntype, 0) > 0 for ntype in ['transaction', 'merchant']):
+             print(f"[WARN] ArrowFilesIterableDataset (stage {self.stage}): Scalers might not be fully initialized for all expected node types.")
+
+    def _process_single_file(self, file_path: str) -> Optional[pd.DataFrame]:
+        """Reads a single Parquet file and performs initial per-file preprocessing."""
+        try:
+            print(f"[DEBUG _process_single_file] Processing file: {os.path.basename(file_path)}")
+            table = pa.parquet.read_table(file_path) 
+            df_single = table.to_pandas(split_blocks=True, self_destruct=True) 
+            print(f"[DEBUG _process_single_file] Initial df_single shape: {df_single.shape}, Columns: {df_single.columns.tolist()}")
+
+            if df_single.empty:
+                print(f"[DEBUG _process_single_file] df_single is empty after reading. Skipping.")
+                return None
+
+            required_cols_base = ['company_name']
+            # Determine which form the data is in: nested JSON column or flat columns
+            has_nested_txn_col = 'target_transaction_processed' in df_single.columns
+            has_flat_txn_cols = all(col in df_single.columns for col in ['txn_amount', 'txn_created_date'])
+            has_category_str = 'txn_accepted_category_id_str' in df_single.columns
+            has_category_int = 'txn_accepted_category_id' in df_single.columns
+
+            # If neither the nested column nor the flat columns exist, skip file
+            if not has_nested_txn_col and not has_flat_txn_cols:
+                print(f"[DEBUG _process_single_file] Skipping file – no recognised transaction columns (nested or flat).")
+                return None
+
+            # Category column check (require either str or int form)
+            if not has_category_str and not has_category_int:
+                print(f"[DEBUG _process_single_file] Skipping file – missing category column (txn_accepted_category_id[_str]).")
+                return None
+
+            # Ensure company_name column exists
+            if 'company_name' not in df_single.columns:
+                print(f"[DEBUG _process_single_file] Skipping file – missing 'company_name' column.")
+                return None
+
+            # ------------------------------------------------------------------
+            # 1. Handle category column (ensure string version exists)
+            # ------------------------------------------------------------------
+            if not has_category_str and has_category_int:
+                df_single['txn_accepted_category_id_str'] = df_single['txn_accepted_category_id'].astype(str)
+                print(f"[DEBUG _process_single_file] Created 'txn_accepted_category_id_str' from integer column.")
+
+            # ------------------------------------------------------------------
+            # 2. Extract / harmonise transaction fields
+            # ------------------------------------------------------------------
+            extracted_data = []
+
+            if has_nested_txn_col:
+                # Existing logic for nested JSON column -----------------------
+                print(f"[DEBUG _process_single_file] Processing nested 'target_transaction_processed' column.")
+                for i, row_tuple in enumerate(df_single.itertuples()):
+                    detailed_log = i < 2
+                    txn_dict = {}
+                    target_txn_raw = getattr(row_tuple, 'target_transaction_processed')
+                    if isinstance(target_txn_raw, dict):
+                        txn_dict = target_txn_raw
+                    elif isinstance(target_txn_raw, str) and target_txn_raw.strip():
+                        try:
+                            txn_dict = json.loads(target_txn_raw)
+                            if not isinstance(txn_dict, dict):
+                                txn_dict = {}
+                        except json.JSONDecodeError:
+                            txn_dict = {}
+                    row_extracted = {
+                        'amount': float(txn_dict.get('amount', 0.0)),
+                        'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'),
+                        'description': str(txn_dict.get('description', '')),
+                        'memo': str(txn_dict.get('memo', '')),
+                        'merchant_name': str(txn_dict.get('payee', ''))
+                    }
+                    extracted_data.append(row_extracted)
+            else:
+                # Flat schema ---------------------------------------------------
+                print(f"[DEBUG _process_single_file] Processing flat column schema.")
+                rename_map = {
+                    'txn_amount': 'amount',
+                    'txn_description': 'description',
+                    'txn_memo': 'memo',
+                    'txn_payee': 'merchant_name'
+                }
+                df_single_flat = df_single.rename(columns={k: v for k, v in rename_map.items() if k in df_single.columns})
+                # Timestamps
+                if 'txn_created_date' in df_single_flat.columns:
+                    df_single_flat['timestamp'] = pd.to_datetime(df_single_flat['txn_created_date'], errors='coerce')
+                elif 'txn_ofx_create_date' in df_single_flat.columns:
+                    df_single_flat['timestamp'] = pd.to_datetime(df_single_flat['txn_ofx_create_date'], errors='coerce')
+                else:
+                    df_single_flat['timestamp'] = pd.NaT
+                # Ensure mandatory columns exist even if NaN so later logic can run
+                for col in ['amount', 'description', 'memo', 'merchant_name']:
+                    if col not in df_single_flat.columns:
+                        df_single_flat[col] = '' if col in ['description', 'memo', 'merchant_name'] else 0.0
+                extracted_data = df_single_flat[['amount', 'timestamp', 'description', 'memo', 'merchant_name']].to_dict('records')
+
+            extracted_df = pd.DataFrame(extracted_data, index=df_single.index)
+
+            # ------------------------------------------------------------------
+            # 3. Combine with original dataframe (drop nested JSON column if exists)
+            # ------------------------------------------------------------------
+            df_processed = pd.concat([
+                df_single.drop(columns=['target_transaction_processed'], errors='ignore'),
+                extracted_df
+            ], axis=1)
+
+            # ------------------------------------------------------------------
+            # 4. Chart of accounts handling ------------------------------------
+            # ------------------------------------------------------------------
+            if 'chart_of_accounts_processed' not in df_processed.columns:
+                if 'chart_of_accounts' in df_processed.columns:
+                    def _parse_coa(val):
+                        if isinstance(val, list):
+                            return val
+                        if isinstance(val, str) and val.strip():
+                            try:
+                                loaded = json.loads(val)
+                                return loaded if isinstance(loaded, list) else []
+                            except json.JSONDecodeError:
+                                return []
+                        return []
+                    df_processed['chart_of_accounts_processed'] = df_processed['chart_of_accounts'].apply(_parse_coa)
+                    print("[DEBUG _process_single_file] Parsed 'chart_of_accounts' into 'chart_of_accounts_processed'.")
+                else:
+                    df_processed['chart_of_accounts_processed'] = [[] for _ in range(len(df_processed))]
+                    print("[DEBUG _process_single_file] Added empty 'chart_of_accounts_processed' column (not present in file).")
+            # num_chart_of_accounts
+            if 'num_chart_of_accounts' not in df_processed.columns:
+                df_processed['num_chart_of_accounts'] = df_processed['chart_of_accounts_processed'].apply(lambda x: len(x) if isinstance(x, list) else 0)
+
+            df_processed['weekday'] = df_processed['timestamp'].dt.weekday.fillna(0).astype(int)
+            df_processed['hour'] = df_processed['timestamp'].dt.hour.fillna(0).astype(int)
+            df_processed['txn_accepted_category_id_str'] = df_processed['txn_accepted_category_id_str'].fillna('UNKNOWN').astype(str)
+            df_processed['company_name'] = df_processed['company_name'].fillna('UNKNOWN').astype(str)
+
+            default_cols = {
+                'industry_name': ('UNKNOWN', str), 
+                'num_chart_of_accounts': (0, int),
+            }
+            for col_name, (default_val, dtype) in default_cols.items():
+                 if col_name not in df_processed.columns: 
+                     df_processed[col_name] = default_val
+                     print(f"[DEBUG _process_single_file] Column '{col_name}' missing, added with default: {default_val}")
+                 else:
+                     if dtype == int:
+                         df_processed[col_name] = pd.to_numeric(df_processed[col_name],errors='coerce').fillna(default_val)
+                     else: # str
+                         df_processed[col_name] = df_processed[col_name].fillna(default_val)
+                 df_processed[col_name] = df_processed[col_name].astype(dtype)
+
+            cols_to_keep_static = self.data_module_ref.cols_to_keep_after_single_file_proc
+            final_df = df_processed[[col for col in cols_to_keep_static if col in df_processed.columns]]
+            print(f"[DEBUG _process_single_file] Final df shape before returning: {final_df.shape}. Kept columns: {final_df.columns.tolist()}")
+            if final_df.empty:
+                print(f"[DEBUG _process_single_file] FINAL DATAFRAME IS EMPTY.")
+            return final_df
+
+        except Exception as e:
+            print(f"[CRITICAL ERROR] _process_single_file unhandled exception for {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _process_chunk_to_heterodata(self, current_chunk_file_paths: List[str]) -> Optional[HeteroData]:
+        chunk_dfs = []
+        for fp in current_chunk_file_paths:
+            df_file = self._process_single_file(fp)
+            if df_file is not None and not df_file.empty:
+                chunk_dfs.append(df_file)
+        if not chunk_dfs:
+            print(f"[DEBUG _process_chunk_to_heterodata] Stage: {self.stage}, Files: {current_chunk_file_paths}, RESULT: EARLY EXIT (no valid dfs in chunk)")
+            return None
+        chunk_df = pd.concat(chunk_dfs, ignore_index=True)
+        if chunk_df.empty: return None
+
+        map_user_str_to_int = {v: k for k, v in self.user_map.items()}
+        map_cat_str_to_int = {v: k for k, v in self.category_id_map.items()}
+        unknown_user_code = map_user_str_to_int.get('UNKNOWN', -1)
+        unknown_category_code = map_cat_str_to_int.get('UNKNOWN', -1)
+        chunk_df['user_id_code'] = chunk_df['company_name'].map(map_user_str_to_int).fillna(unknown_user_code).astype(int)
+        chunk_df['category_id'] = chunk_df['txn_accepted_category_id_str'].map(map_cat_str_to_int).fillna(unknown_category_code).astype(int)
+        chunk_df.sort_values(['user_id_code', 'timestamp'], inplace=True)
+        chunk_df.reset_index(drop=True, inplace=True)
+
+        graph_chunk = HeteroData()
+        num_transactions_chunk = len(chunk_df)
+        graph_chunk['transaction'].num_nodes = num_transactions_chunk
+        
+        # Raw features for transaction
+        df = chunk_df
+        for col in ['amount', 'hour', 'weekday', 'num_chart_of_accounts']:
+            if col not in df.columns: df[col] = 0.0 if col =='amount' else 0 # default values
+        amount = df['amount'].fillna(0.0); num_coa = df['num_chart_of_accounts'].fillna(0).astype(int)
+        hour = df['hour'].fillna(0).astype(int); day = df['weekday'].fillna(0).astype(int)
+        hour_sin = np.sin(2*np.pi*hour/24); hour_cos = np.cos(2*np.pi*hour/24)
+        day_sin = np.sin(2*np.pi*day/7); day_cos = np.cos(2*np.pi*day/7)
+        raw_tx_features = np.column_stack([amount, num_coa, hour_sin, hour_cos, day_sin, day_cos]).astype(np.float64)
+        
+        # Scale transaction features
+        final_tx_features = raw_tx_features.copy()
+        tx_scaler = self.scalers.get('transaction')
+        if tx_scaler is not None:
+            num_cols_to_scale = len(self.tx_feat_cols_to_scale)
+            # Ensure raw_tx_features has enough columns before slicing
+            if raw_tx_features.shape[1] >= num_cols_to_scale:
+                scaled_part = (raw_tx_features[:, :num_cols_to_scale] - tx_scaler.mean_) / (np.maximum(tx_scaler.scale_, 1e-8))
+                final_tx_features = np.concatenate([scaled_part, raw_tx_features[:, num_cols_to_scale:]], axis=1)
+            else:
+                print(f"[WARN] _process_chunk_to_heterodata: raw_tx_features ({raw_tx_features.shape}) has fewer columns than tx_feat_cols_to_scale ({num_cols_to_scale}). Using raw features for transactions.")
+        graph_chunk['transaction'].x = torch.tensor(final_tx_features, dtype=torch.float)
+
+        # Merchant features and nodes (if GNN is used)
+        if self.use_gnn_encoder:
+            merchant_col = 'merchant_name'
+            if merchant_col in df.columns:
+                merchants_in_chunk = df[merchant_col].dropna().unique()
+                merchant_map_chunk = {name: i for i, name in enumerate(merchants_in_chunk)}
+                num_merchants_in_chunk = len(merchant_map_chunk)
+                if num_merchants_in_chunk > 0:
+                    graph_chunk['merchant'].num_nodes = num_merchants_in_chunk
+                    merchant_stats_chunk_df = df[pd.notna(df[merchant_col])].groupby(merchant_col).agg(**self.merchant_agg_funcs_named)
+                    merchant_stats_chunk_df = merchant_stats_chunk_df.fillna(0).reindex(merchants_in_chunk, fill_value=0)
+                    raw_merchant_features = merchant_stats_chunk_df[list(self.merchant_agg_funcs_named.keys())].values.astype(np.float64)
+                    
+                    final_merchant_features = raw_merchant_features.copy()
+                    merchant_scaler = self.scalers.get('merchant')
+                    if merchant_scaler is not None:
+                        final_merchant_features = (raw_merchant_features - merchant_scaler.mean_) / (np.maximum(merchant_scaler.scale_, 1e-8))
+                    graph_chunk['merchant'].x = torch.tensor(final_merchant_features, dtype=torch.float)
+                else: # No merchants found in this chunk after dropna/unique
+                    graph_chunk['merchant'].num_nodes = 0
+                    graph_chunk['merchant'].x = torch.empty((0, len(self.merchant_agg_funcs_named) if self.merchant_agg_funcs_named else 8), dtype=torch.float) # default to 8 if funcs_named is empty
+            else: # No merchant column in the dataframe chunk
+                graph_chunk['merchant'].num_nodes = 0
+                graph_chunk['merchant'].x = torch.empty((0, len(self.merchant_agg_funcs_named) if self.merchant_agg_funcs_named else 8), dtype=torch.float)
+
+        graph_chunk['transaction'].y_global = torch.tensor(chunk_df['category_id'].values, dtype=torch.long)
+        graph_chunk['transaction'].user_id_code = torch.tensor(chunk_df['user_id_code'].values, dtype=torch.long) # Global user IDs
+        graph_chunk['transaction'].original_index = torch.tensor(chunk_df.index.values, dtype=torch.long) # Index within this chunk_df
+
+        if self.data_module_ref.use_text_encoder:
+            text_cols = ['description', 'memo', 'merchant_name']
+            raw_tx_texts_chunk = chunk_df[text_cols].astype(str).agg(' || '.join, axis=1).tolist()
+            tokenized_tx = self.tokenizer(raw_tx_texts_chunk, padding='max_length', truncation=True, max_length=self.text_max_length, return_tensors='pt')
+            graph_chunk['transaction'].input_ids = tokenized_tx['input_ids']
+            graph_chunk['transaction'].attention_mask = tokenized_tx['attention_mask']
+
+        if self.data_module_ref.use_sequence_encoder:
+            all_seq_features_chunk, all_seq_lengths_chunk = [], []
+            sequence_feature_dim = 6
+            for idx in range(num_transactions_chunk):
+                row = chunk_df.iloc[idx]; user = row['user_id_code']; time = row['timestamp']
+                start = max(0, idx - self.max_seq_length)
+                prev_txs = chunk_df.iloc[start:idx][chunk_df.iloc[start:idx]['user_id_code'] == user]
+                seq_feats = []
+                if not prev_txs.empty:
+                    for _, p_row in prev_txs.iterrows():
+                        td = (time - p_row['timestamp']).total_seconds() if pd.notna(time) and pd.notna(p_row['timestamp']) else 0
+                        td_scaled = td; scaler_td = self.seq_scalers.get('time_delta')
+                        if scaler_td: td_scaled = (td - scaler_td.mean_[0]) / (np.maximum(scaler_td.scale_[0],1e-8))
+                        h, d = p_row['hour'], p_row['weekday']
+                        seq_feats.append([p_row['amount'],np.sin(2*np.pi*d/7),np.cos(2*np.pi*d/7),np.sin(2*np.pi*h/24),np.cos(2*np.pi*h/24),td_scaled])
+                all_seq_lengths_chunk.append(len(seq_feats))
+                all_seq_features_chunk.append(torch.tensor(seq_feats[-self.max_seq_length:], dtype=torch.float) if seq_feats else torch.empty((0,sequence_feature_dim),dtype=torch.float))
+            graph_chunk['transaction'].seq_features = pad_sequence(all_seq_features_chunk, batch_first=True, padding_value=0.0)
+            graph_chunk['transaction'].seq_lengths = torch.tensor(all_seq_lengths_chunk, dtype=torch.long)
+
+        if self.use_gnn_encoder and graph_chunk.get('merchant') and graph_chunk['merchant'].num_nodes > 0:
+            tx_map_chunk = {orig_idx: i for i, orig_idx in enumerate(chunk_df.index)}
+            edge_list_tx_merch, attr_list_tx_merch = [], []
+            merchant_stats_map = chunk_df.groupby(merchant_col)['amount'].agg(['mean','std']).fillna(0).to_dict('index')
+            for idx_in_chunkdf, row_data in chunk_df.iterrows():
+                merch_name = row_data[merchant_col]
+                if pd.notna(merch_name) and merch_name in merchant_map_chunk:
+                    tx_node_local = tx_map_chunk[idx_in_chunkdf]
+                    merch_node_local = merchant_map_chunk[merch_name]
+                    edge_list_tx_merch.append([tx_node_local, merch_node_local])
+                    stats = merchant_stats_map.get(merch_name, {'mean':0,'std':0})
+                    attr_list_tx_merch.append([(float(row_data['amount']) - stats['mean'])/(stats['std']+1e-8 if stats['std'] != 0 else 1e-8)]) # Avoid div by zero if std is exactly 0
+            if edge_list_tx_merch:
+                graph_chunk['transaction', 'belongs_to', 'merchant'].edge_index = torch.tensor(edge_list_tx_merch, dtype=torch.long).t().contiguous()
+                graph_chunk['transaction', 'belongs_to', 'merchant'].edge_attr = torch.tensor(attr_list_tx_merch, dtype=torch.float)
+        
+        mask = torch.ones(num_transactions_chunk, dtype=torch.bool)
+        if self.stage == 'fit': graph_chunk['transaction'].train_mask = mask
+        elif self.stage == 'validate': graph_chunk['transaction'].val_mask = mask
+        else: graph_chunk['transaction'].test_mask = mask # Covers test and predict
+
+        if graph_chunk is None or not hasattr(graph_chunk, 'num_nodes') or graph_chunk.num_nodes == 0:
+            print(f"[DEBUG _process_chunk_to_heterodata] Stage: {self.stage}, Files: {current_chunk_file_paths}, RESULT: EMPTY Graph (num_nodes=0 or None)")
+        else:
+            print(f"[DEBUG _process_chunk_to_heterodata] Stage: {self.stage}, Files: {current_chunk_file_paths}, RESULT: Graph with num_nodes={graph_chunk.num_nodes}")
+
+        return graph_chunk
+
+    def __iter__(self) -> Iterator[HeteroData]:
+        if self.stage == 'validate':
+            print(f"[DEBUG __iter__ VAL] Entered __iter__ for validation. Files: {self.file_paths}")
+
+        worker_info = torch.utils.data.get_worker_info()
+        files_to_process_by_worker = self.file_paths
+        if worker_info is not None:
+            per_worker = int(np.ceil(len(self.file_paths) / float(worker_info.num_workers)))
+            iter_start = worker_info.id * per_worker
+            iter_end = min(iter_start + per_worker, len(self.file_paths))
+            files_to_process_by_worker = self.file_paths[iter_start:iter_end]
+
+        for i in range(0, len(files_to_process_by_worker), self.chunk_size):
+            current_chunk_file_paths = files_to_process_by_worker[i : i + self.chunk_size]
+            if not current_chunk_file_paths: continue
+            if self.stage == 'validate':
+                print(f"[DEBUG __iter__ VAL] About to call _process_chunk_to_heterodata for chunk: {current_chunk_file_paths}")
+            graph_data = self._process_chunk_to_heterodata(current_chunk_file_paths)
+            if graph_data is not None and graph_data['transaction'].num_nodes > 0:
+                yield graph_data
 
 # --- SingleBatchIterable Class (Keep if used for testing/overfitting) ---
 class SingleBatchIterable:
@@ -38,39 +395,55 @@ class SingleBatchIterable:
     def __len__(self):
         return 1
 
-# --- V2 DataModule with HGTLoader --- 
+# --- V2 DataModule with IterableDataset --- 
 class TransactionDataModuleV2(pl.LightningDataModule):
     """
-    DataModule V2: Prepares HeteroData graph and uses HGTLoader.
-    Adapts to new data format with company_name, txn_accepted_category_id_str, etc.
-    Removes 'category' node type.
+    DataModule V2: Processes Arrow files iteratively using ArrowFilesIterableDataset.
+    Handles per-chunk graph creation, feature engineering, and global state management 
+    (scalers, maps) fitted on training data.
     """
-    def __init__(self,
-                 transactions_df_ref: pd.DataFrame, # Changed from transactions_df
+    def __init__(self, 
+                 file_paths: List[str], 
                  batch_size: int = 32,
+                 iterable_dataset_chunk_size: int = 1,
+                 shuffle_files_before_split: bool = True,
                  num_workers: int = 0, 
                  max_seq_length: int = 50,
                  text_model_name: str = 'bert-base-uncased',
                  text_max_length: int = 128,
-                 num_hgt_layers: int = 2, 
-                 hgt_num_samples: Optional[Dict[str, List[int]]] = None, 
                  val_ratio: float = 0.1,
                  test_ratio: float = 0.1,
                  use_sequence_encoder: bool = True,
                  use_text_encoder: bool = True,
                  use_gnn_encoder: bool = True,
                  use_coa_text_features: bool = True,
-                 # --- Arguments for loading pre-fitted state --- 
+                 coa_text_max_length: int = 256,
                  fitted_scalers: Optional[Dict[str, StandardScaler]] = None,
                  fitted_seq_scalers: Optional[Dict[str, StandardScaler]] = None,
                  fitted_edge_scalers: Optional[Dict[str, StandardScaler]] = None,
                  fitted_user_map: Optional[Dict[int, Any]] = None,
-                 fitted_category_id_map: Optional[Dict[int, Any]] = None
+                 fitted_category_id_map: Optional[Dict[int, Any]] = None,
+                 model_config: Optional[Dict] = None,
+                 include_edge_types: Optional[List[str]] = None
                  ):
         super().__init__()
-        # Expects preprocessed df from train_new.load_data
-        self.transactions_df = transactions_df_ref.copy() 
+        self.save_hyperparameters(
+            ignore=[
+                'file_paths', 'fitted_scalers', 'user_map', 
+                'category_id_map', 'user_coa_texts', 'global_user_coa_tensors',
+                'graph_metadata' # Avoid saving potentially large tensors/data in hparams
+            ]
+        )
+        self._model_config = model_config # Store model_config
+
+        self.all_file_paths = sorted(list(set(file_paths))) # Ensure unique and sorted
+        self.is_predicting = (fitted_scalers is not None and fitted_user_map is not None and fitted_category_id_map is not None)
+
+        if shuffle_files_before_split and not self.is_predicting:
+            np.random.RandomState(seed=42).shuffle(self.all_file_paths)
+
         self.batch_size = batch_size
+        self.iterable_dataset_chunk_size = iterable_dataset_chunk_size
         self.num_workers = num_workers
         self.max_seq_length = max_seq_length
         self.text_model_name = text_model_name
@@ -81,854 +454,878 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         self.use_text_encoder = use_text_encoder
         self.use_gnn_encoder = use_gnn_encoder
         self.use_coa_text_features = use_coa_text_features
+        self.coa_text_max_length = coa_text_max_length
 
-        # Store/Create HGT sampling config
-        self.num_hgt_layers = num_hgt_layers
-        self.hgt_num_samples = hgt_num_samples
-        if self.hgt_num_samples is None:
-            # Simple default: Sample 15 neighbors in first layer, 10 in second
-            default_samples_per_layer = [15, 10]
-            # Define KNOWN node types used in the graph (NO 'category')
-            node_types_in_graph = ['transaction', 'merchant'] 
-            self.hgt_num_samples = {ntype: default_samples_per_layer[:self.num_hgt_layers] for ntype in node_types_in_graph}
-            print(f"[WARN] hgt_num_samples not provided. Using default based on num_hgt_layers={self.num_hgt_layers}: {self.hgt_num_samples}")
-        else:
-            # Validate provided config against expected node types
-            expected_node_types = {'transaction', 'merchant'} # Only these are expected now
-            for ntype, samples in self.hgt_num_samples.items():
-                if ntype not in expected_node_types:
-                    print(f"[WARN] hgt_num_samples contains unexpected node type '{ntype}'. It will be ignored.")
-                    continue # Don't validate length if type is unused
-                if len(samples) != self.num_hgt_layers:
-                    raise ValueError(f"Length of hgt_num_samples for '{ntype}' ({len(samples)}) must match num_hgt_layers ({self.num_hgt_layers})")
-            # Ensure required node types are present if GNN is used
-            if self.use_gnn_encoder:
-                for req_type in expected_node_types:
-                    if req_type not in self.hgt_num_samples:
-                         print(f"[WARN] hgt_num_samples missing required node type '{req_type}' for GNN. Adding default.")
-                         default_samples_per_layer = [15, 10]
-                         self.hgt_num_samples[req_type] = default_samples_per_layer[:self.num_hgt_layers]
-        
-        print(f"Initializing TransactionDataModuleV2 (HGTLoader - No Category Node)...")
-        print(f"  Modality Flags: GNN={self.use_gnn_encoder}, Sequence={self.use_sequence_encoder}, Text={self.use_text_encoder}")
-
-        # Store pre-fitted state if provided
         self.fitted_scalers = fitted_scalers
         self.fitted_seq_scalers = fitted_seq_scalers
         self.fitted_edge_scalers = fitted_edge_scalers
         self.fitted_user_map = fitted_user_map
         self.fitted_category_id_map = fitted_category_id_map
-        self.is_predicting = (fitted_scalers is not None) # Flag if we are in prediction mode
-
-        # Placeholders
+        
         self.tokenizer = None
-        self.full_graph_data: Optional[HeteroData] = None
         self.node_feature_dims: Dict[str, int] = {}
         self.edge_feature_dims: Dict[Tuple[str, str, str], int] = {}
-        self.sequence_feature_dim: Optional[int] = None
+        self.sequence_feature_dim: Optional[int] = 6 
+        
         self.scalers: Dict[str, StandardScaler] = {} if fitted_scalers is None else fitted_scalers
         self.seq_scalers: Dict[str, StandardScaler] = {} if fitted_seq_scalers is None else fitted_seq_scalers
         self.edge_scalers: Dict[str, StandardScaler] = {} if fitted_edge_scalers is None else fitted_edge_scalers
         self.user_map = None if fitted_user_map is None else fitted_user_map
         self.category_id_map = None if fitted_category_id_map is None else fitted_category_id_map
-        self.num_users = 0
-        self.num_global_classes = 0
-        self.num_user_classes = 0 # No user-specific target assumed
-        self.train_indices: Optional[torch.Tensor] = None
-        self.val_indices: Optional[torch.Tensor] = None
-        self.test_indices: Optional[torch.Tensor] = None
+        
+        self.num_users = len(self.user_map) if self.user_map else 0
+        self.num_global_classes = len(self.category_id_map) if self.category_id_map else 0
+        self.user_coa_texts: Dict[int, str] = {} 
+        self.raw_user_coa_data: Dict[str, Any] = {}
 
-        # --- Pre-process DataFrame (simplified as most done in load_data) --- 
-        start_time = time.time()
-        print("Pre-processing DataFrame (ID mapping)...")
-        # Timestamp, amount, time features assumed present from load_data
+        # --- File Path Splitting ---
+        if not self.all_file_paths:
+            raise ValueError("Received an empty list of file_paths for the DataModule.")
 
-        # Target Category ID handling (factorize the string ID)
-        target_col = 'txn_accepted_category_id_str'
-        if target_col not in self.transactions_df.columns:
-            raise ValueError(f"Missing required target column: '{target_col}'")
-        # Ensure fillna happened in load_data
-        if self.transactions_df[target_col].isnull().any():
-            print(f"[WARN] Target column '{target_col}' still contains NaNs after load_data. Filling with 'UNKNOWN'.")
-            self.transactions_df[target_col] = self.transactions_df[target_col].fillna('UNKNOWN')
-            
-        # Use fitted maps if provided (predicting), otherwise factorize
         if self.is_predicting:
-            print("  Using provided category_id and user maps.")
-            # Map strings to known ints, use -1 for unknowns
-            map_cat_str_to_int = {v: k for k, v in self.category_id_map.items()}
-            map_user_str_to_int = {v: k for k, v in self.user_map.items()}
-            self.transactions_df['category_id'] = self.transactions_df[target_col].map(map_cat_str_to_int).fillna(-1).astype(int)
-            self.transactions_df['user_id_code'] = self.transactions_df['company_name'].map(map_user_str_to_int).fillna(-1).astype(int)
-            self.num_global_classes = len(self.category_id_map)
-            self.num_users = len(self.user_map)
-            if (self.transactions_df['user_id_code'] == -1).any():
-                print(f"[WARN] Found {(self.transactions_df['user_id_code'] == -1).sum()} users in prediction data not present in training user_map.")
+            self.train_files: List[str] = []
+            self.val_files: List[str] = []
+            self.predict_files: List[str] = list(self.all_file_paths)
+            self.test_files: List[str] = [] 
+            print(f"Prediction mode: Using all {len(self.predict_files)} files for prediction set.")
         else:
-            print("  Factorizing category_id and user maps from data.")
-            codes, uniques = pd.factorize(self.transactions_df[target_col], sort=True)
-            self.transactions_df['category_id'] = codes 
-            self.category_id_map = {code: unique_val for code, unique_val in enumerate(uniques)}
-            self.num_global_classes = len(uniques)
+            self.predict_files = []
+            # Ensure val_ratio and test_ratio are floats for comparison
+            current_val_ratio = float(self.val_ratio) if self.val_ratio is not None else 0.1 # Default to 0.1 if None
+            current_test_ratio = float(self.test_ratio) if self.test_ratio is not None else 0.1 # Default to 0.1 if None
+
+            if len(self.all_file_paths) == 1:
+                print(f"[INFO] Only 1 file available. Using it for training. Validation and testing will be skipped.")
+                self.train_files = list(self.all_file_paths)
+                self.val_files = []
+                self.test_files = []
+            elif len(self.all_file_paths) == 2:
+                if current_val_ratio > 0 and current_test_ratio == 0:
+                    print(f"[INFO] 2 files available. Assigning 1 for training and 1 for validation.")
+                    # Ensure consistent assignment for reproducibility if shuffle_files_before_split is False
+                    self.train_files = [self.all_file_paths[0]]
+                    self.val_files = [self.all_file_paths[1]]
+                    self.test_files = []
+                elif current_test_ratio > 0 and current_val_ratio == 0:
+                    print(f"[INFO] 2 files available. Assigning 1 for training and 1 for testing.")
+                    self.train_files = [self.all_file_paths[0]]
+                    self.test_files = [self.all_file_paths[1]]
+                    self.val_files = []
+                elif current_val_ratio > 0 and current_test_ratio > 0: # Both want a share, prioritize test
+                    print(f"[INFO] 2 files available with val_ratio > 0 and test_ratio > 0. Assigning 1 for training and 1 for testing (test takes precedence over val). Val will be empty.")
+                    self.train_files = [self.all_file_paths[0]]
+                    self.test_files = [self.all_file_paths[1]]
+                    self.val_files = []
+                else: # Both ratios are 0 or invalid
+                    print(f"[INFO] 2 files available. Both val_ratio and test_ratio are 0. Assigning both for training.")
+                    self.train_files = list(self.all_file_paths)
+                    self.val_files = []
+                    self.test_files = []
+            elif len(self.all_file_paths) < 3 and (current_val_ratio > 0 or current_test_ratio > 0): # This case should be covered by len == 1 or 2 now
+                 print(f"[WARN] Not enough files ({len(self.all_file_paths)}) for a full train/val/test split with ratios val={current_val_ratio}, test={current_test_ratio}. Using all for training. This path should ideally not be hit if len 1 or 2 handled.")
+                 self.train_files = list(self.all_file_paths)
+                 self.val_files = [] 
+                 self.test_files = []
+            elif current_val_ratio == 0 and current_test_ratio == 0 : # Use all for training if ratios are zero
+                 self.train_files = list(self.all_file_paths)
+                 self.val_files = []
+                 self.test_files = []
+            else: # Proceed with splitting for 3+ files
+                if not (0 <= current_val_ratio < 1 and 0 <= current_test_ratio < 1 and (current_val_ratio + current_test_ratio) < 1):
+                    raise ValueError(f"Invalid val_ratio ({current_val_ratio}) or test_ratio ({current_test_ratio}). Sum must be < 1.")
+
+                train_intermediate_files, self.test_files = train_test_split(
+                    self.all_file_paths, test_size=current_test_ratio, random_state=42, shuffle=False) 
+                
+                if not train_intermediate_files: 
+                     self.train_files = []
+                     self.val_files = []
+                     if not self.test_files: 
+                          print("[WARN] No files left for train, val, or test after splitting.")
+                elif current_val_ratio == 0: 
+                    self.train_files = train_intermediate_files
+                    self.val_files = []
+                else:
+                    if (1.0 - current_test_ratio) <= 0 : 
+                        effective_val_ratio = 0 
+                        if train_intermediate_files: 
+                             self.train_files = train_intermediate_files
+                             self.val_files = []
+                        else: 
+                             self.train_files = []
+                             self.val_files = []
+                    elif not train_intermediate_files: 
+                         self.train_files = []
+                         self.val_files = []
+                    else:
+                        effective_val_ratio = current_val_ratio / (1.0 - current_test_ratio)
+                        if effective_val_ratio >= 1.0 and train_intermediate_files: 
+                             self.train_files = []
+                             self.val_files = train_intermediate_files
+                        elif effective_val_ratio == 0 and train_intermediate_files: 
+                             self.train_files = train_intermediate_files
+                             self.val_files = []
+                        elif train_intermediate_files: 
+                             self.train_files, self.val_files = train_test_split(
+                                 train_intermediate_files, test_size=effective_val_ratio, random_state=42, shuffle=False)
+                        else: 
+                             self.train_files = []
+                             self.val_files = []
             
-            user_codes, user_uniques = pd.factorize(self.transactions_df['company_name'], sort=True)
-            self.transactions_df['user_id_code'] = user_codes 
-            self.user_map = {code: uid for code, uid in enumerate(user_uniques)}
-            self.num_users = len(user_uniques)
+            if not self.train_files and not self.is_predicting and (self.val_files or self.test_files):
+                print("[WARN] Training file list is empty after split, but val/test files exist. This might indicate an issue with ratios or dataset size.")
+
+
+        print(f"File splits: Train={len(self.train_files)}, Val={len(self.val_files)}, Test={len(self.test_files)}, Predict={len(self.predict_files)}")
         
-        print(f"Final Counts: Global Classes={self.num_global_classes}, Users={self.num_users}")
-        print(f"DataFrame pre-processing finished in {time.time() - start_time:.2f}s")
-
-    def prepare_data(self):
-        if self.use_text_encoder:
-            print(f"Downloading/loading tokenizer: {self.text_model_name}")
-            try:
-                 _ = AutoTokenizer.from_pretrained(self.text_model_name)
-                 print("Tokenizer ready.")
-            except Exception as e:
-                 print(f"[ERROR] Failed to download/load tokenizer '{self.text_model_name}': {e}")
-                 raise e
-
-    def setup(self, stage: Optional[str] = None):
-        # Added check for prediction stage
-        is_predict_stage = (stage == 'predict')
-        if is_predict_stage and not self.is_predicting:
-            raise ValueError("Setup stage is 'predict', but no pre-fitted state was provided during __init__.")
-        if not is_predict_stage and self.is_predicting:
-             print("[WARN] Pre-fitted state was provided during __init__, but setup stage is not 'predict'. Using fitted state anyway.")
-             # Allow using fitted state even if stage is fit/test for simplicity
-
-        if self.full_graph_data is not None and self.train_indices is not None: # Check if already set up for fit/test
-             if not is_predict_stage:
-                 print("DataModuleV2 already set up for fit/test.")
-                 return
-             # Allow re-setup for predict stage if needed, but maybe graph exists?
-             # If graph exists, maybe just assign test mask?
-             if self.test_indices is not None:
-                  print("DataModuleV2 graph exists, assigning predict mask.")
-                  self._assign_masks_to_graph(predict_only=True) # New flag needed
-                  return 
-
-        print(f"--- Starting DataModuleV2 Setup for stage: {stage} ---")
-        setup_start_time = time.time()
-        
-        # Initialize tokenizer FIRST if text encoder is used
-        if self.tokenizer is None and self.use_text_encoder:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.text_model_name)
-            print("Tokenizer initialized.")
-
-        # Ensure the DataFrame is sorted for consistent splitting and processing
-        self.transactions_df.sort_values(['user_id_code', 'timestamp'], inplace=True)
-        self.transactions_df.reset_index(drop=True, inplace=True) # Reset index after sort
-
-        # **Step 1: Split data indices (or assign for prediction)**
-        if is_predict_stage:
-            print("Assigning all indices to test set for prediction...")
-            self.train_indices = torch.tensor([], dtype=torch.long)
-            self.val_indices = torch.tensor([], dtype=torch.long)
-            self.test_indices = torch.arange(len(self.transactions_df), dtype=torch.long)
-            print(f"Split complete (predict): #Test={len(self.test_indices)}")
-        else:
-            print("Splitting data indices (time-based within users)...")
-            self.train_indices, self.val_indices, self.test_indices = self._split_data_indices()
-            print(f"Split complete: #Train={len(self.train_indices)}, #Val={len(self.val_indices)}, #Test={len(self.test_indices)}")
-
-        # **Step 2: Build the full graph structure and calculate raw node features**
-        print("Calculating raw features for graph nodes...")
-        raw_features = {} 
-        if self.use_gnn_encoder:
-            raw_features = self._calculate_raw_features() 
-
-        # **Step 3: Fit scalers ONLY on TRAINING data (Skip if predicting)**
-        if not self.is_predicting: # Only fit if not using pre-fitted state
-            print("Fitting scalers on TRAINING data...")
-            self._fit_scalers(raw_features, self.train_indices) 
-        else:
-            print("Skipping scaler fitting (using pre-loaded scalers).")
-            # Ensure edge scaler exists if needed and not provided
-            if self.use_gnn_encoder and 'amount_dist' not in self.edge_scalers: 
-                 self._create_proxy_edge_scaler() # New helper needed
-
-        # **Step 4: Build Graph with SCALED features (using fitted scalers)**
-        print("Building full graph data with scaled features...")
-        if self.use_gnn_encoder:
-             # Pass train_indices (needed for amount_dist scaling even in predict? Check _build_graph)
-             # _build_graph_and_edges uses self.scalers which are now populated
-            self._build_graph_and_edges(raw_features, self.train_indices) 
-        else:
-            self._build_minimal_graph() 
-
-        # **Step 5: Prepare and Add Sequences (uses full graph data)**
-        if self.use_sequence_encoder:
-            # Pass train_indices for fitting sequence scalers if not predicting
-            # _prepare_and_add_sequences needs update to handle self.is_predicting
-            self._prepare_and_add_sequences(self.train_indices) 
-
-        # Assign masks to the graph data AFTER it's built
-        self._assign_masks_to_graph(predict_only=is_predict_stage)
-            
-        print(f"--- DataModuleV2 Setup finished in {time.time() - setup_start_time:.2f}s ---")
-
-    # --- Helper Methods for Setup ---
-    def _calculate_raw_features(self) -> Dict[str, np.ndarray]:
-        df = self.transactions_df
-        raw_features_dict = {}
-        print("Calculating raw transaction features (vectorized)...")
-        # Features: amount, num_chart_of_accounts (scaled), time features (not scaled)
         self.tx_feat_cols_to_scale = ['amount', 'num_chart_of_accounts'] 
-        self.tx_feat_cols_no_scale = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
-        
-        # Ensure required columns exist
-        if 'amount' not in df.columns: raise ValueError("Missing 'amount' column")
-        if 'hour' not in df.columns: raise ValueError("Missing 'hour' column")
-        if 'weekday' not in df.columns: raise ValueError("Missing 'weekday' column")
-        if 'num_chart_of_accounts' not in df.columns: raise ValueError("Missing 'num_chart_of_accounts' column")
-
-        amount = df['amount'].fillna(0.0)
-        num_coa = df['num_chart_of_accounts'].fillna(0).astype(int)
-        hour = df['hour'].fillna(0).astype(int)
-        day = df['weekday'].fillna(0).astype(int)
-        
-        hour_sin = np.sin(2 * np.pi * hour / 24)
-        hour_cos = np.cos(2 * np.pi * hour / 24)
-        day_sin = np.sin(2 * np.pi * day / 7)
-        day_cos = np.cos(2 * np.pi * day / 7)
-        
-        # Stack scaled features first, then non-scaled
-        tx_features_array = np.column_stack([amount, num_coa, hour_sin, hour_cos, day_sin, day_cos])
-        raw_features_dict['transaction'] = tx_features_array.astype(np.float64)
-        print(f"  Raw transaction features calculated. Shape: {raw_features_dict['transaction'].shape}")
-        
-        # Define aggregation functions (can reuse)
-        agg_funcs_named = {
+        self.merchant_agg_funcs_named = {
             'amount_mean': ('amount', 'mean'), 'amount_std': ('amount', lambda x: x.std(ddof=0)),
             'amount_max': ('amount', 'max'), 'amount_min': ('amount', 'min'),
             'amount_count': ('amount', 'count'), 'amount_median': ('amount', 'median'),
             'amount_q25': ('amount', lambda x: x.quantile(0.25)), 'amount_q75': ('amount', lambda x: x.quantile(0.75))
         }
-        
-        print("Calculating raw merchant features (vectorized)... using 'merchant_name'")
-        merchant_col = 'merchant_name' # Use the column derived from payee
-        if merchant_col not in df.columns: raise ValueError("Missing 'merchant_name' column")
-        merchant_ids = df[merchant_col].dropna().unique()
-        num_merchants = len(merchant_ids)
-        if num_merchants > 0:
-            merchant_stats = df[pd.notna(df[merchant_col])].groupby(merchant_col).agg(**agg_funcs_named)
-            merchant_stats = merchant_stats.fillna(0).reindex(merchant_ids, fill_value=0)
-            final_merchant_cols = list(agg_funcs_named.keys())
-            raw_features_dict['merchant'] = merchant_stats[final_merchant_cols].values.astype(np.float64)
-        else:
-            raw_features_dict['merchant'] = np.zeros((0, 8), dtype=np.float64)
-        print(f"  Raw merchant features calculated. Shape: {raw_features_dict['merchant'].shape}")
-        
-        # Category features are removed
-        print("Skipping category features (node type removed).")
-        
-        return raw_features_dict
+        # Static list of columns to keep after _process_single_file
+        self.cols_to_keep_after_single_file_proc = [
+            'txn_accepted_category_id_str', 'company_name', 'industry_name', 
+            'num_chart_of_accounts', 'chart_of_accounts_processed', 
+            'amount', 'timestamp', 'description', 'memo', 'merchant_name', 
+            'weekday', 'hour'
+        ]
 
-    def _fit_scalers(self, raw_features: Dict[str, np.ndarray], train_indices: torch.Tensor):
-        print("Fitting scalers (using only training data where applicable)...")
-        train_indices_np = train_indices.numpy()
+        print(f"TransactionDataModuleV2 (Iterable) initialized. Iterable chunk size: {self.iterable_dataset_chunk_size}")
+        print(f"  Modality Flags: GNN={self.use_gnn_encoder}, Sequence={self.use_sequence_encoder}, Text={self.use_text_encoder}, COA_Text={self.use_coa_text_features}")
 
-        for node_type, features in raw_features.items():
-            if features.size > 0 and features.shape[0] > 0:
-                if node_type == 'transaction':
-                    num_cols_to_scale = len(self.tx_feat_cols_to_scale) # amount, num_coa
-                    if features.shape[1] >= num_cols_to_scale and num_cols_to_scale > 0:
-                        scaler = StandardScaler()
-                        # Ensure train_indices_np are valid indices for features array
-                        valid_train_indices = train_indices_np[train_indices_np < features.shape[0]]
-                        if len(valid_train_indices) > 0:
-                             # Fit only on the columns designated for scaling
-                             scaler.fit(features[valid_train_indices, :num_cols_to_scale])
-                             self.scalers[node_type] = scaler
-                             print(f"  Fitted scaler for 'transaction' features ({self.tx_feat_cols_to_scale}) using {len(valid_train_indices)} training samples.")
-                        else:
-                             print(f"  [WARN] No valid training indices found for fitting 'transaction' scaler.")
-                             self.scalers[node_type] = None # Indicate scaler couldn't be fitted
-                    else:
-                         print(f"  [WARN] Not enough columns in transaction features ({features.shape[1]}) to scale {num_cols_to_scale} columns.")
-                         self.scalers[node_type] = None
-                elif node_type == 'merchant': 
-                    # Fit merchant scaler globally (as before)
-                    scaler = StandardScaler()
-                    scaler.fit(features)
-                    self.scalers[node_type] = scaler
-                    print(f"  Fitted scaler GLOBALLY for '{node_type}'.")
-                # No 'category' node type anymore
+    def _process_single_file(self, file_path: str) -> Optional[pd.DataFrame]:
+        """Reads a single Parquet file and performs initial per-file preprocessing."""
+        try:
+            print(f"[DEBUG _process_single_file] Processing file: {os.path.basename(file_path)}")
+            table = pa.parquet.read_table(file_path) 
+            df_single = table.to_pandas(split_blocks=True, self_destruct=True) 
+            print(f"[DEBUG _process_single_file] Initial df_single shape: {df_single.shape}, Columns: {df_single.columns.tolist()}")
+
+            if df_single.empty:
+                print(f"[DEBUG _process_single_file] df_single is empty after reading. Skipping.")
+                return None
+
+            required_cols_base = ['company_name']
+            # Determine which form the data is in: nested JSON column or flat columns
+            has_nested_txn_col = 'target_transaction_processed' in df_single.columns
+            has_flat_txn_cols = all(col in df_single.columns for col in ['txn_amount', 'txn_created_date'])
+            has_category_str = 'txn_accepted_category_id_str' in df_single.columns
+            has_category_int = 'txn_accepted_category_id' in df_single.columns
+
+            # If neither the nested column nor the flat columns exist, skip file
+            if not has_nested_txn_col and not has_flat_txn_cols:
+                print(f"[DEBUG _process_single_file] Skipping file – no recognised transaction columns (nested or flat).")
+                return None
+
+            # Category column check (require either str or int form)
+            if not has_category_str and not has_category_int:
+                print(f"[DEBUG _process_single_file] Skipping file – missing category column (txn_accepted_category_id[_str]).")
+                return None
+
+            # Ensure company_name column exists
+            if 'company_name' not in df_single.columns:
+                print(f"[DEBUG _process_single_file] Skipping file – missing 'company_name' column.")
+                return None
+
+            # ------------------------------------------------------------------
+            # 1. Handle category column (ensure string version exists)
+            # ------------------------------------------------------------------
+            if not has_category_str and has_category_int:
+                df_single['txn_accepted_category_id_str'] = df_single['txn_accepted_category_id'].astype(str)
+                print(f"[DEBUG _process_single_file] Created 'txn_accepted_category_id_str' from integer column.")
+
+            # ------------------------------------------------------------------
+            # 2. Extract / harmonise transaction fields
+            # ------------------------------------------------------------------
+            extracted_data = []
+
+            if has_nested_txn_col:
+                # Existing logic for nested JSON column -----------------------
+                print(f"[DEBUG _process_single_file] Processing nested 'target_transaction_processed' column.")
+                for i, row_tuple in enumerate(df_single.itertuples()):
+                    detailed_log = i < 2
+                    txn_dict = {}
+                    target_txn_raw = getattr(row_tuple, 'target_transaction_processed')
+                    if isinstance(target_txn_raw, dict):
+                        txn_dict = target_txn_raw
+                    elif isinstance(target_txn_raw, str) and target_txn_raw.strip():
+                        try:
+                            txn_dict = json.loads(target_txn_raw)
+                            if not isinstance(txn_dict, dict):
+                                txn_dict = {}
+                        except json.JSONDecodeError:
+                            txn_dict = {}
+                    row_extracted = {
+                        'amount': float(txn_dict.get('amount', 0.0)),
+                        'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'),
+                        'description': str(txn_dict.get('description', '')),
+                        'memo': str(txn_dict.get('memo', '')),
+                        'merchant_name': str(txn_dict.get('payee', ''))
+                    }
+                    extracted_data.append(row_extracted)
             else:
-                print(f"  Skipping scaler fitting for empty features: '{node_type}'")
-                self.scalers[node_type] = None
+                # Flat schema ---------------------------------------------------
+                print(f"[DEBUG _process_single_file] Processing flat column schema.")
+                rename_map = {
+                    'txn_amount': 'amount',
+                    'txn_description': 'description',
+                    'txn_memo': 'memo',
+                    'txn_payee': 'merchant_name'
+                }
+                df_single_flat = df_single.rename(columns={k: v for k, v in rename_map.items() if k in df_single.columns})
+                # Timestamps
+                if 'txn_created_date' in df_single_flat.columns:
+                    df_single_flat['timestamp'] = pd.to_datetime(df_single_flat['txn_created_date'], errors='coerce')
+                elif 'txn_ofx_create_date' in df_single_flat.columns:
+                    df_single_flat['timestamp'] = pd.to_datetime(df_single_flat['txn_ofx_create_date'], errors='coerce')
+                else:
+                    df_single_flat['timestamp'] = pd.NaT
+                # Ensure mandatory columns exist even if NaN so later logic can run
+                for col in ['amount', 'description', 'memo', 'merchant_name']:
+                    if col not in df_single_flat.columns:
+                        df_single_flat[col] = '' if col in ['description', 'memo', 'merchant_name'] else 0.0
+                extracted_data = df_single_flat[['amount', 'timestamp', 'description', 'memo', 'merchant_name']].to_dict('records')
 
-        # Defer sequence scaler fitting to _prepare_and_add_sequences
-        self.seq_scalers['time_delta'] = None 
+            extracted_df = pd.DataFrame(extracted_data, index=df_single.index)
 
-        # Edge scaler for amount_dist uses transaction scaler's scale value for the 'amount' column (index 0)
-        if self.use_gnn_encoder and 'transaction' in self.scalers and self.scalers['transaction'] is not None:
-             amount_dist_scaler_proxy = StandardScaler()
-             amount_dist_scaler_proxy.mean_ = np.array([0.0])
-             # Use scale_ from the fitted transaction scaler for the amount column (index 0)
-             # Ensure scaler has enough dimensions before accessing index 0
-             if self.scalers['transaction'].scale_.shape[0] > 0:
-                 scale_val = np.maximum(self.scalers['transaction'].scale_[0:1], 1e-8)
-                 amount_dist_scaler_proxy.scale_ = scale_val
-                 self.edge_scalers['amount_dist'] = amount_dist_scaler_proxy
-                 print("  Created proxy edge scaler for 'amount_dist' based on train transaction scaler (amount column).")
-             else:
-                 self.edge_scalers['amount_dist'] = None
-                 print("  [WARN] Skipping scaler fitting for edge 'amount_dist' (transaction scaler scale_ is empty).")
-        else:
-             self.edge_scalers['amount_dist'] = None
-             print("  [INFO] Skipping scaler fitting for edge 'amount_dist' (transaction scaler not available).")
+            # ------------------------------------------------------------------
+            # 3. Combine with original dataframe (drop nested JSON column if exists)
+            # ------------------------------------------------------------------
+            df_processed = pd.concat([
+                df_single.drop(columns=['target_transaction_processed'], errors='ignore'),
+                extracted_df
+            ], axis=1)
 
-        # Add creation of proxy edge scaler here as well
-        self._create_proxy_edge_scaler()
+            # ------------------------------------------------------------------
+            # 4. Chart of accounts handling ------------------------------------
+            # ------------------------------------------------------------------
+            if 'chart_of_accounts_processed' not in df_processed.columns:
+                if 'chart_of_accounts' in df_processed.columns:
+                    def _parse_coa(val):
+                        if isinstance(val, list):
+                            return val
+                        if isinstance(val, str) and val.strip():
+                            try:
+                                loaded = json.loads(val)
+                                return loaded if isinstance(loaded, list) else []
+                            except json.JSONDecodeError:
+                                return []
+                        return []
+                    df_processed['chart_of_accounts_processed'] = df_processed['chart_of_accounts'].apply(_parse_coa)
+                    print("[DEBUG _process_single_file] Parsed 'chart_of_accounts' into 'chart_of_accounts_processed'.")
+                else:
+                    df_processed['chart_of_accounts_processed'] = [[] for _ in range(len(df_processed))]
+                    print("[DEBUG _process_single_file] Added empty 'chart_of_accounts_processed' column (not present in file).")
+            # num_chart_of_accounts
+            if 'num_chart_of_accounts' not in df_processed.columns:
+                df_processed['num_chart_of_accounts'] = df_processed['chart_of_accounts_processed'].apply(lambda x: len(x) if isinstance(x, list) else 0)
 
-    def _create_proxy_edge_scaler(self):
-        if self.use_gnn_encoder and 'transaction' in self.scalers and self.scalers['transaction'] is not None:
-             if self.scalers['transaction'].scale_.shape[0] > 0:
-                 scale_val = np.maximum(self.scalers['transaction'].scale_[0:1], 1e-8)
-                 # Only create if not already loaded
-                 if 'amount_dist' not in self.edge_scalers or self.edge_scalers['amount_dist'] is None:
-                      amount_dist_scaler_proxy = StandardScaler()
-                      amount_dist_scaler_proxy.mean_ = np.array([0.0])
-                      amount_dist_scaler_proxy.scale_ = scale_val
-                      self.edge_scalers['amount_dist'] = amount_dist_scaler_proxy
-                      print("  Created proxy edge scaler for 'amount_dist' based on transaction scaler (amount column).")
-             # else: print warn? (Already done in fit_scalers)
-        # else: print warn? (Already done in fit_scalers)
+            df_processed['weekday'] = df_processed['timestamp'].dt.weekday.fillna(0).astype(int)
+            df_processed['hour'] = df_processed['timestamp'].dt.hour.fillna(0).astype(int)
+            df_processed['txn_accepted_category_id_str'] = df_processed['txn_accepted_category_id_str'].fillna('UNKNOWN').astype(str)
+            df_processed['company_name'] = df_processed['company_name'].fillna('UNKNOWN').astype(str)
 
-    def _build_graph_and_edges(self, raw_features: Dict[str, np.ndarray], train_indices: torch.Tensor):
-        print("Building graph structure and applying SCALED features...")
-        data = HeteroData()
-        df = self.transactions_df # Use the sorted, reset_index df
-        num_transactions = len(df)
-        # Create node index map based on the DataFrame's index (0 to N-1)
-        tx_map = {idx: i for i, idx in enumerate(df.index)} 
-        
-        # Map merchant names to unique integer node indices
-        merchant_col = 'merchant_name'
-        merchant_ids = df[merchant_col].dropna().unique()
-        merchant_map = {name: i for i, name in enumerate(merchant_ids)}
-        num_merchants = len(merchant_map)
-        
-        # No category map needed here
+            default_cols = {
+                'industry_name': ('UNKNOWN', str), 
+                'num_chart_of_accounts': (0, int),
+            }
+            for col_name, (default_val, dtype) in default_cols.items():
+                 if col_name not in df_processed.columns: 
+                     df_processed[col_name] = default_val
+                     print(f"[DEBUG _process_single_file] Column '{col_name}' missing, added with default: {default_val}")
+                 else:
+                     if dtype == int:
+                         df_processed[col_name] = pd.to_numeric(df_processed[col_name],errors='coerce').fillna(default_val)
+                     else: # str
+                         df_processed[col_name] = df_processed[col_name].fillna(default_val)
+                 df_processed[col_name] = df_processed[col_name].astype(dtype)
 
-        data['transaction'].num_nodes = num_transactions
-        if num_merchants > 0: data['merchant'].num_nodes = num_merchants
-        # No category nodes
+            cols_to_keep_static = self.cols_to_keep_after_single_file_proc
+            final_df = df_processed[[col for col in cols_to_keep_static if col in df_processed.columns]]
+            print(f"[DEBUG _process_single_file] Final df shape before returning: {final_df.shape}. Kept columns: {final_df.columns.tolist()}")
+            if final_df.empty:
+                print(f"[DEBUG _process_single_file] FINAL DATAFRAME IS EMPTY.")
+            return final_df
 
-        print("  Adding scaled node features...")
-        for node_type, raw_feat_array in raw_features.items():
-            if raw_feat_array.size > 0: 
-                final_features = raw_feat_array.copy() # Start with raw features
-                if node_type in self.scalers and self.scalers[node_type] is not None:
-                    scaler = self.scalers[node_type]
-                    if node_type == 'transaction':
-                        num_cols_to_scale = len(self.tx_feat_cols_to_scale)
-                        # Apply scaler fitted on training data TO ALL transaction nodes
-                        scaled_part = (raw_feat_array[:, :num_cols_to_scale] - scaler.mean_) / (np.maximum(scaler.scale_, 1e-8))
-                        non_scaled_part = raw_feat_array[:, num_cols_to_scale:]
-                        final_features = np.concatenate([scaled_part, non_scaled_part], axis=1)
-                        print(f"    Applied TRAIN-fitted scaler to ALL 'transaction' nodes ({self.tx_feat_cols_to_scale}).")
-                    elif node_type == 'merchant': # Apply globally fitted scaler to merchant nodes
-                        final_features = (raw_feat_array - scaler.mean_) / (np.maximum(scaler.scale_, 1e-8))
-                        print(f"    Applied GLOBALLY-fitted scaler to '{node_type}' nodes.")
-                    
-                    data[node_type].x = torch.tensor(final_features, dtype=torch.float)
-                    self.node_feature_dims[node_type] = data[node_type].x.shape[1]
-                else: 
-                    # Use raw features if scaler wasn't fitted or is None
-                    print(f"    Using RAW features for '{node_type}' (scaler not available or fitted).")
-                    data[node_type].x = torch.tensor(raw_feat_array, dtype=torch.float)
-                    self.node_feature_dims[node_type] = data[node_type].x.shape[1]
-            else:
-                 print(f"    Skipping node features for empty raw features: '{node_type}'")
-        
-        print("  Adding labels, user IDs, original indices...")
-        # Use df.index directly as original_index if df index is 0 to N-1
-        data['transaction'].original_index = torch.tensor(df.index.values, dtype=torch.long) 
-        # Use the factorized integer 'category_id' column for labels
-        data['transaction'].y_global = torch.tensor(df['category_id'].values, dtype=torch.long)
-        # No y_user assumed in this version
-        # data['transaction'].y_user = ... 
-        data['transaction'].user_id_code = torch.tensor(df['user_id_code'].values, dtype=torch.long)
-        
-        # Updated text feature extraction
-        text_cols = ['description', 'memo', 'merchant_name'] 
-        coa_text_list = []
-        if self.use_text_encoder and self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns:
-            print("  Including chart of accounts text...")
-            for coa_json_str in df['chart_of_accounts_processed'].fillna('[]'):
-                try:
-                    coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
-                    # Combine account names and descriptions
-                    acc_texts = [f"{acc.get('account_name', '')} {acc.get('account_description', '')}".strip() for acc in coa_list if isinstance(acc, dict)]
-                    coa_text_list.append(" || ".join(filter(None, acc_texts)))
-                except (json.JSONDecodeError, TypeError):
-                    coa_text_list.append("") # Append empty string on error
-        elif self.use_text_encoder and self.use_coa_text_features: # COA enabled but column missing
-            print("  [WARN] use_coa_text_features is True, but 'chart_of_accounts_processed' column not found. COA text will be empty.")
-            coa_text_list = ["" for _ in range(len(df))] # Ensure list exists
-        else: # COA text disabled or text encoder disabled
-            coa_text_list = ["" for _ in range(len(df))] # Ensure list exists
+        except Exception as e:
+            print(f"[CRITICAL ERROR] _process_single_file unhandled exception for {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
-        # Combine transaction text and chart of accounts text
-        raw_text_combined = []
-        for i in range(len(df)):
-            tx_parts = [str(df.iloc[i].get(col, '')) for col in text_cols]
-            tx_text = ' || '.join(filter(None, tx_parts))
-            coa_text = coa_text_list[i]
-            combined = f"{tx_text} || CHART: {coa_text}" if coa_text else tx_text
-            raw_text_combined.append(combined)
-        
-        data['transaction']._raw_text = raw_text_combined
-        if self.use_text_encoder: print(f"  Combined raw text features created (COA included: {self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns}).")
-
-        print("  Creating edges and edge features...")
-        edge_index_dict = {}
-        edge_attr_dict = {}
-        
-        # Edge calculations remain largely the same, using the node indices from maps
-        # 1. Transaction -> Merchant
-        if num_merchants > 0:
-            edge_list, attr_list = [], []
-            # Use merchant_name (derived from payee) for grouping
-            merchant_stats_map = df.groupby(merchant_col)['amount'].agg(['mean', 'std']).fillna(0).to_dict('index')
-            for idx, row in df.iterrows():
-                merchant_name = row[merchant_col]
-                if pd.notna(merchant_name) and merchant_name in merchant_map:
-                    tx_node_idx = tx_map[idx]; merchant_node_idx = merchant_map[merchant_name]
-                    edge_list.append([tx_node_idx, merchant_node_idx])
-                    stats = merchant_stats_map.get(merchant_name, {'mean': 0, 'std': 0})
-                    # Ensure row amount is float before calculation
-                    row_amount = float(row['amount'])
-                    amount_zscore = (row_amount - stats['mean']) / (stats['std'] + 1e-8)
-                    attr_list.append([amount_zscore])
-            if edge_list:
-                edge_index_dict[('transaction', 'belongs_to', 'merchant')] = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-                edge_attr_dict[('transaction', 'belongs_to', 'merchant')] = torch.tensor(attr_list, dtype=torch.float)
-                self.edge_feature_dims[('transaction', 'belongs_to', 'merchant')] = 1
-
-        # 2. Merchant -> Category - REMOVED
-        # print("Skipping Merchant -> Category edges.")
-
-        # 3. Transaction -> Transaction (temporal) 
-        edge_list, attr_list = [], []
-        # df is already sorted by user_id_code, then timestamp
-        # tx_map maps df index (0..N-1) to node index (0..N-1)
-        for i in range(num_transactions):
-            ts_i = df.iloc[i]['timestamp']
-            user_i = df.iloc[i]['user_id_code'] # Use the factorized user code
-            if pd.isna(ts_i): continue 
-            tx_node_i = tx_map[df.index[i]] # Get node index for row i
-            # Look ahead only within the same user
-            for k in range(1, 6): 
-                j = i + k
-                if j >= num_transactions: break
-                user_j = df.iloc[j]['user_id_code'] # Use factorized user code
-                if user_j != user_i: break # Stop if we reach next user
-                ts_j = df.iloc[j]['timestamp']
-                if pd.isna(ts_j): continue
-                time_diff_seconds = abs((ts_i - ts_j).total_seconds())
-                if time_diff_seconds <= 86400 * 1: 
-                    tx_node_j = tx_map[df.index[j]] # Get node index for row j
-                    edge_list.extend([[tx_node_i, tx_node_j], [tx_node_j, tx_node_i]])
-                    time_diff_norm = min(time_diff_seconds / 86400.0, 1.0)
-                    attr_list.extend([[time_diff_norm, 1.0], [time_diff_norm, 0.0]]) # Add direction
-                else: # Optimization: if time diff > 1 day, subsequent diffs will also be > 1 day
-                    break 
-        if edge_list:
-            edge_index_dict[('transaction', 'temporal', 'transaction')] = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-            edge_attr_dict[('transaction', 'temporal', 'transaction')] = torch.tensor(attr_list, dtype=torch.float)
-            self.edge_feature_dims[('transaction', 'temporal', 'transaction')] = 2
-
-        # 4. Transaction -> Transaction (similar_amount)
-        edge_list, raw_dist_list, amount_ratio_list, direction_list = [], [], [], []
-        # Get raw amounts from the correct place (first col of scaled feats) 
-        # Need to get from original df before scaling for KNN
-        raw_tx_amounts = df['amount'].fillna(0.0).values 
-
-        if num_transactions > 1 and raw_tx_amounts.size > 0:
-            try:
-                 k_neighbors = min(5, num_transactions - 1)
-                 nn = NearestNeighbors(n_neighbors=k_neighbors + 1, metric='minkowski', p=1, algorithm='auto')
-                 nn.fit(raw_tx_amounts.reshape(-1, 1))
-                 distances, indices = nn.kneighbors(raw_tx_amounts.reshape(-1, 1))
-                 for i in range(num_transactions):
-                     tx_node_i = tx_map[df.index[i]] 
-                     # Only connect nodes within the same user? - NO, KNN is global amount similarity
-                     for k in range(1, k_neighbors + 1):
-                         j_pos = indices[i, k]
-                         if j_pos < num_transactions: 
-                            tx_node_j = tx_map[df.index[j_pos]]
-                            # Ensure i != j_pos to avoid self-loops from KNN
-                            if tx_node_i == tx_node_j: continue 
-                            dist = distances[i, k]
-                            edge_list.extend([[tx_node_i, tx_node_j], [tx_node_j, tx_node_i]])
-                            raw_dist_list.extend([dist, dist])
-                            amount_i = raw_tx_amounts[i]; amount_j = raw_tx_amounts[j_pos]
-                            amount_ratio = min(amount_i, amount_j) / (max(amount_i, amount_j) + 1e-8) if max(amount_i, amount_j) > 1e-8 else 1.0
-                            amount_ratio_list.extend([amount_ratio, amount_ratio])
-                            direction_list.extend([1.0, 0.0])
-            except Exception as e_knn:
-                 print(f"[ERROR] KNN for similar_amount failed: {e_knn}")
-        
-        if edge_list:
-            scaled_dist_values = None
-            # Use the proxy scaler created in _fit_scalers (based on train transaction scale)
-            if 'amount_dist' in self.edge_scalers and self.edge_scalers['amount_dist'] is not None:
-                try:
-                    scaler = self.edge_scalers['amount_dist']
-                    raw_dist_array = np.array(raw_dist_list, dtype=np.float64).reshape(-1, 1)
-                    # Apply scaling: (dist - 0) / scale
-                    scaled_dist = (raw_dist_array / (np.maximum(scaler.scale_, 1e-8))).flatten() 
-                    print("  Applied TRAIN-based scaler to 'amount_dist' edge feature.")
-                    scaled_dist_values = scaled_dist
-                except Exception as e_scale:
-                    print(f"[WARN] Failed to scale amount_dist: {e_scale}. Using raw distances.")
-            if scaled_dist_values is None:
-                scaled_dist_values = np.array(raw_dist_list) # Fallback to raw
-            
-            # Combine attributes
-            if len(scaled_dist_values) == len(amount_ratio_list) == len(direction_list):
-                final_attr_list = [[scaled_dist_values[idx], amount_ratio_list[idx], direction_list[idx]]
-                                   for idx in range(len(scaled_dist_values))]
-                edge_index_dict[('transaction', 'similar_amount', 'transaction')] = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-                edge_attr_dict[('transaction', 'similar_amount', 'transaction')] = torch.tensor(final_attr_list, dtype=torch.float)
-                self.edge_feature_dims[('transaction', 'similar_amount', 'transaction')] = 3
-            else:
-                print(f"[WARN] Length mismatch in similar_amount attributes.")
-
-        # Assign edges to graph
-        print("  Assigning final edge data...")
-        for edge_type, index_tensor in edge_index_dict.items():
-            data[edge_type].edge_index = index_tensor
-            if edge_type in edge_attr_dict:
-                data[edge_type].edge_attr = edge_attr_dict[edge_type]
-        self.full_graph_data = data 
-        print("Graph building complete.")
-
-    def _build_minimal_graph(self):
-        print("[INFO] Building minimal graph data...")
-        self.full_graph_data = HeteroData()
-        df = self.transactions_df
-        num_transactions = len(df) # Renamed from num_nodes for clarity
-        self.full_graph_data['transaction'].num_nodes = num_transactions
-        self.full_graph_data['transaction'].original_index = torch.tensor(df.index.values, dtype=torch.long)
-        # Use the factorized integer 'category_id' for labels
-        self.full_graph_data['transaction'].y_global = torch.tensor(df['category_id'].values, dtype=torch.long)
-        # No y_user
-        self.full_graph_data['transaction'].user_id_code = torch.tensor(df['user_id_code'].values, dtype=torch.long)
-        
-        # Updated text feature extraction for minimal graph
-        text_cols = ['description', 'memo', 'merchant_name'] 
-        coa_text_list = []
-        if self.use_text_encoder and self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns:
-            for coa_json_str in df['chart_of_accounts_processed'].fillna('[]'):
-                try:
-                    coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
-                    acc_texts = [f"{acc.get('account_name', '')} {acc.get('account_description', '')}".strip() for acc in coa_list if isinstance(acc, dict)]
-                    coa_text_list.append(" || ".join(filter(None, acc_texts)))
-                except (json.JSONDecodeError, TypeError):
-                    coa_text_list.append("") 
-        elif self.use_text_encoder and self.use_coa_text_features: # COA enabled but column missing
-            print("  [WARN] Minimal graph: use_coa_text_features is True, but 'chart_of_accounts_processed' column not found.") # Optional print
-            coa_text_list = ["" for _ in range(len(df))]
-        else: # COA text disabled or text encoder disabled
-            coa_text_list = ["" for _ in range(len(df))]
-
-        raw_text_combined = []
-        for i in range(len(df)):
-            tx_parts = [str(df.iloc[i].get(col, '')) for col in text_cols]
-            tx_text = ' || '.join(filter(None, tx_parts))
-            coa_text = coa_text_list[i]
-            combined = f"{tx_text} || CHART: {coa_text}" if coa_text else tx_text
-            raw_text_combined.append(combined)
-        
-        self.full_graph_data['transaction']._raw_text = raw_text_combined
-        print("Built minimal graph data.")
-
-    def _prepare_and_add_sequences(self, train_indices: torch.Tensor):
-        if self.full_graph_data is None: raise RuntimeError("Graph data not built.")
-        if not self.use_sequence_encoder: 
-            print("[INFO] Skipping sequence preparation as use_sequence_encoder=False")
-            return 
-        if hasattr(self.full_graph_data['transaction'], 'seq_features'): return 
-             
-        print("Preparing sequence features...")
-        df_sorted = self.transactions_df 
-        num_transactions = len(df_sorted)
-        train_indices_np = train_indices.numpy()
-
-        # --- Fit sequence scalers only if NOT predicting --- 
-        if not self.is_predicting:
-            print("  Fitting sequence scalers on TRAINING data...")
-            all_train_time_deltas = []
-            for current_pos_in_sorted in train_indices_np:
-                 # Ensure index is valid
-                 if current_pos_in_sorted >= num_transactions: continue
-
-                 current_row = df_sorted.iloc[current_pos_in_sorted]
-                 user_id_code = current_row['user_id_code']; current_time = current_row['timestamp']
-                 start_idx_in_sorted = max(0, current_pos_in_sorted - self.max_seq_length)
-                 prev_txs_window_df = df_sorted.iloc[start_idx_in_sorted:current_pos_in_sorted]
-                 # Filter window to only include transactions from the same user
-                 prev_txs_user_df = prev_txs_window_df[prev_txs_window_df['user_id_code'] == user_id_code]
-
-                 if not prev_txs_user_df.empty:
-                     # Calculate time deltas within this training sequence
-                     if pd.notna(current_time):
-                         time_diffs = (current_time - prev_txs_user_df['timestamp']).dt.total_seconds()
-                         valid_time_diffs = time_diffs[pd.notna(time_diffs)].clip(lower=0).tolist()
-                         all_train_time_deltas.extend(valid_time_diffs)
-            
-            # Fit time_delta scaler
-            if all_train_time_deltas:
-                 time_delta_array = np.array(all_train_time_deltas).reshape(-1, 1)
-                 scaler_td = StandardScaler().fit(time_delta_array)
-                 self.seq_scalers['time_delta'] = scaler_td
-                 print(f"    Fitted time_delta scaler on training sequences.")
-            else:
-                 print(f"    [WARN] No valid time deltas found in training sequences to fit scaler.")
-                 self.seq_scalers['time_delta'] = None
-        else:
-            print("  Skipping sequence scaler fitting (using pre-loaded scaler).")
-            # Ensure the key exists even if None was loaded
-            if 'time_delta' not in self.seq_scalers:
-                 self.seq_scalers['time_delta'] = None
-
-        # --- Generate sequences for ALL transactions (apply fitted/loaded scalers) ---
-        print("  Generating sequences for ALL transactions...")
-        all_seq_features = []
-        all_seq_lengths = []
-        self.sequence_feature_dim = 6 
-
-        for node_idx in range(num_transactions):
-            # We iterate through node indices 0..N-1, which correspond to df_sorted rows
-            current_pos_in_sorted = node_idx 
-                 
-            current_row = df_sorted.iloc[current_pos_in_sorted]
-            user_id_code = current_row['user_id_code']; current_time = current_row['timestamp']
-            start_idx_in_sorted = max(0, current_pos_in_sorted - self.max_seq_length)
-            prev_txs_window_df = df_sorted.iloc[start_idx_in_sorted:current_pos_in_sorted]
-            # Filter window to only include transactions from the same user
-            prev_txs_user_df = prev_txs_window_df[prev_txs_window_df['user_id_code'] == user_id_code]
-
-            seq_features_for_tx = []
-
-            if not prev_txs_user_df.empty:
-                for _, prev_row in prev_txs_user_df.iterrows():
-                    time_delta = 0.0
-                    if pd.notna(current_time) and pd.notna(prev_row['timestamp']):
-                         time_delta_seconds = (current_time - prev_row['timestamp']).total_seconds()
-                         time_delta = max(0.0, time_delta_seconds) 
-                    amount = prev_row['amount'] if pd.notna(prev_row['amount']) else 0.0
-                    # Amount scaling for sequences - should we fit a separate scaler?
-                    # For now, don't scale amount in sequences, only time_delta.
-                    time_delta_val = time_delta
-                    # Check if scaler exists and is not None before applying
-                    if 'time_delta' in self.seq_scalers and self.seq_scalers['time_delta'] is not None:
-                         scaler_td = self.seq_scalers['time_delta']
-                         time_delta_val = (time_delta - scaler_td.mean_[0]) / (np.maximum(scaler_td.scale_[0], 1e-8))
-                    hour = prev_row['hour']; day = prev_row['weekday']
-                    hour_sin = np.sin(2*np.pi*hour/24); hour_cos = np.cos(2*np.pi*hour/24)
-                    day_sin = np.sin(2*np.pi*day/7); day_cos = np.cos(2*np.pi*day/7)
-                    scaled_feat = [amount, day_sin, day_cos, hour_sin, hour_cos, time_delta_val]
-                    seq_features_for_tx.append(scaled_feat)
-
-            if seq_features_for_tx: # Check if real features were added
-                seq_tensor = torch.tensor(seq_features_for_tx, dtype=torch.float)
-                # Apply max_seq_length limit - window slicing already limits input rows
-                # but final check ensures tensor length constraint
-                if seq_tensor.shape[0] > self.max_seq_length:
-                    seq_tensor = seq_tensor[-self.max_seq_length:, :]
-                seq_len = len(seq_tensor)
-            else:
-                seq_tensor = torch.zeros((0, self.sequence_feature_dim), dtype=torch.float)
-                seq_len = 0
-                
-            all_seq_features.append(seq_tensor)
-            all_seq_lengths.append(seq_len)
-
-        max_len_found = max(all_seq_lengths) if all_seq_lengths else 0
-        print(f"  Max sequence length found: {max_len_found}")
-        if not all_seq_features:
-             padded_sequences = torch.empty((num_transactions, 0, self.sequence_feature_dim), dtype=torch.float)
-        else:
-             padded_sequences = pad_sequence(all_seq_features, batch_first=True, padding_value=0.0)
-        
-        # No padding for categorical features
-
-        self.full_graph_data['transaction'].seq_features = padded_sequences
-        self.full_graph_data['transaction'].seq_lengths = torch.tensor(all_seq_lengths, dtype=torch.long)
-        print(f"Added sequence features. Padded reals shape: {padded_sequences.shape}") # Removed cat shape log
-
-    def _split_data_indices(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        df = self.transactions_df # Assumes sorted by user_id_code, timestamp
-        print("Creating train/val/test indices: Time-based split within each user...")
-        
-        all_train_indices = []
-        all_val_indices = []
-        all_test_indices = []
-
-        # Group by user_id_code
-        user_groups = df.groupby('user_id_code', sort=False) # Use sort=False as df is already sorted
-
-        for user_code, group in user_groups:
-            n_transactions = len(group)
-            indices = group.index.tolist() # Get DataFrame indices (0 to N-1)
-
-            if n_transactions < 3: # Assign all to train if too few transactions
-                all_train_indices.extend(indices)
-            else:
-                n_train = int(n_transactions * (1.0 - self.val_ratio - self.test_ratio))
-                n_val = int(n_transactions * self.val_ratio)
-                # Ensure n_train and n_val are at least 1 if ratios > 0
-                if self.val_ratio > 0 and n_val == 0: n_val = 1
-                if (1.0 - self.val_ratio - self.test_ratio) > 0 and n_train == 0: n_train = 1
-                # Ensure n_train + n_val doesn't exceed total
-                if n_train + n_val >= n_transactions:
-                    n_val = max(0, n_transactions - n_train) # Prioritize training data
-
-                n_test = n_transactions - n_train - n_val
-
-                # Split indices based on time order (since df is sorted)
-                all_train_indices.extend(indices[:n_train])
-                all_val_indices.extend(indices[n_train : n_train + n_val])
-                all_test_indices.extend(indices[n_train + n_val :])
-
-        # Convert lists to tensors
-        train_indices_tensor = torch.tensor(sorted(all_train_indices), dtype=torch.long)
-        val_indices_tensor = torch.tensor(sorted(all_val_indices), dtype=torch.long)
-        test_indices_tensor = torch.tensor(sorted(all_test_indices), dtype=torch.long)
-
-        # Store split sizes
-        self.num_train_samples = len(train_indices_tensor)
-        self.num_val_samples = len(val_indices_tensor)
-        self.num_test_samples = len(test_indices_tensor)
-
-        print(f"Split Method: Time-based within users (approx ratios: "
-              f"Tr={1-self.val_ratio-self.test_ratio:.2f}, "
-              f"V={self.val_ratio:.2f}, Te={self.test_ratio:.2f})")
-        
-        # Return the tensors containing the DataFrame indices for each split
-        return train_indices_tensor, val_indices_tensor, test_indices_tensor
-
-    # New helper to assign masks AFTER graph is built
-    def _assign_masks_to_graph(self, predict_only: bool = False):
-        if self.full_graph_data is None or not hasattr(self.full_graph_data['transaction'], 'num_nodes'):
-            print("[WARN] Cannot assign masks, graph data not available.")
+    def prepare_data(self):
+        # This method is for downloading, and one-time global setup like fitting scalers, building maps.
+        # Pass 1: Iterate through files to fit scalers and build global maps (user_map, category_id_map)
+        # and collect raw COA data.
+        if self.is_predicting: # Check if we are in prediction mode with pre-fitted state
+            print("Prepare_data: In prediction mode with pre-fitted state. Skipping scaler/map fitting.")
+            if self.fitted_user_map: self.num_users = len(self.fitted_user_map)
+            if self.fitted_category_id_map: self.num_global_classes = len(self.fitted_category_id_map)
+            if self.use_coa_text_features and not self.user_coa_texts and self.num_users > 0: 
+                # If predicting and COA is used but texts not loaded, initialize empty dict for safety
+                print("[WARN] Prediction mode: use_coa_text_features=True, but self.user_coa_texts is empty. Initializing empty COA texts.")
+                self.user_coa_texts = {i: "" for i in range(self.num_users)}
+            if self.tokenizer is None and (self.use_text_encoder or self.use_coa_text_features):
+                 self._init_tokenizer()
             return
         
-        num_nodes = self.full_graph_data['transaction'].num_nodes
-        train_mask = torch.zeros(num_nodes, dtype=torch.bool)
-        val_mask = torch.zeros(num_nodes, dtype=torch.bool)
-        test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        # Proceed with fitting if not in predict mode or if essential fitted state is missing
+        print(f"--- Starting DataModuleV2 Prepare Data (Pass 1: Scalers, Maps, COA Collection) ---")
+        prepare_start_time = time.time()
 
-        if predict_only:
-            # Only assign test mask using self.test_indices (which covers all nodes)
-            if self.test_indices is not None:
-                 test_mask[self.test_indices] = True
-                 print("Assigned predict mask (all nodes) to graph data.")
-            else:
-                 print("[WARN] predict_only=True but test_indices is None.")
+        if self.tokenizer is None and (self.use_text_encoder or self.use_coa_text_features):
+            self._init_tokenizer()
+
+        all_transaction_features_to_scale_collector = [] 
+        all_merchant_transactions_collector: Dict[str, List[float]] = defaultdict(list) 
+        all_sequence_time_deltas_collector = []
+        category_id_strings_collector = set()
+        user_company_names_collector = set()
+        self.raw_user_coa_data = {} 
+
+        # self.tx_feat_cols_to_scale and self.merchant_agg_funcs_named are already set in __init__
+
+        files_for_pass1 = self.train_files # CRITICAL: Use only training files for fitting
+        if not files_for_pass1:
+            print("[WARN] No training files available for Pass 1 (scaler fitting, map building). Scalers/maps might be empty or suboptimal.")
+            # Optionally, could raise an error or use all_file_paths with a strong warning if this path is critical
+            # For now, proceed, and scalers/maps might end up empty if no train_files.
         else:
-            # Assign train/val/test masks as before for fit/test stages
-            if self.train_indices is not None:
-                train_mask[self.train_indices] = True
-            if self.val_indices is not None:
-                val_mask[self.val_indices] = True
-            if self.test_indices is not None:
-                test_mask[self.test_indices] = True
-            print("Assigned train/val/test masks to graph data.")
-
-        self.full_graph_data['transaction'].train_mask = train_mask
-        self.full_graph_data['transaction'].val_mask = val_mask
-        self.full_graph_data['transaction'].test_mask = test_mask
+            print(f"Iterating over {len(files_for_pass1)} training files for Pass 1 (scaler fitting, map building)...")
         
-    # --- Dataloader Methods using HGTLoader --- 
-    def train_dataloader(self) -> HGTLoader:
-        print("Creating train HGTLoader...")
-        if self.train_indices is None: self.setup('fit')
-        if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
-        if self.train_indices is None or len(self.train_indices) == 0: raise ValueError("Training set empty.")
-        # Filter hgt_num_samples to only include node types actually present in the graph
-        valid_hgt_num_samples = {k:v for k,v in self.hgt_num_samples.items() if k in self.full_graph_data.node_types}
-        if not valid_hgt_num_samples: 
-             print("[WARN] No valid node types for HGT sampling specified or detected. GNN might not function correctly.")
-             # If GNN is enabled, we need *something* here, even if it's just transaction nodes.
-             if self.use_gnn_encoder and 'transaction' in self.full_graph_data.node_types:
-                 print("  Defaulting to sampling only for 'transaction' node.")
-                 valid_hgt_num_samples = {'transaction': self.hgt_num_samples.get('transaction', [15, 10][:self.num_hgt_layers])}
-             else:
-                 raise ValueError("No valid node types for HGT sampling found.") # Cannot proceed
+        for file_idx, file_path in enumerate(files_for_pass1):
+            if file_idx % 200 == 0 and file_idx > 0: 
+                 print(f"    Processed {file_idx}/{len(files_for_pass1)} training files for Pass 1...")
+            
+            df_file = self._process_single_file(file_path)
+            if df_file is None or df_file.empty:
+                continue
 
-        # Move graph data to CPU before passing to loader if it's not already
-        graph_data_cpu = self.full_graph_data.cpu()
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=True,
-                         input_nodes=('transaction', self.train_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+            if not df_file[self.tx_feat_cols_to_scale].empty:
+                 all_transaction_features_to_scale_collector.append(df_file[self.tx_feat_cols_to_scale].values)
 
-    def val_dataloader(self) -> HGTLoader:
-        print("Creating val HGTLoader...")
-        if self.val_indices is None: self.setup('fit')
-        if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
-        if self.val_indices is None or len(self.val_indices) == 0: raise ValueError("Validation set empty.")
-        valid_hgt_num_samples = {k:v for k,v in self.hgt_num_samples.items() if k in self.full_graph_data.node_types}
-        if not valid_hgt_num_samples: 
-            print("[WARN] No valid node types for HGT sampling specified or detected during validation.")
-            if self.use_gnn_encoder and 'transaction' in self.full_graph_data.node_types:
-                 print("  Defaulting to sampling only for 'transaction' node.")
-                 valid_hgt_num_samples = {'transaction': self.hgt_num_samples.get('transaction', [15, 10][:self.num_hgt_layers])}
+            # Collect raw data for merchant features
+            for _, row in df_file.iterrows():
+                merchant_name_str = str(row['merchant_name'])
+                amount_val = float(row['amount'])
+                if merchant_name_str != 'UNKNOWN' and pd.notna(amount_val):
+                    all_merchant_transactions_collector[merchant_name_str].append(amount_val)
+
+            # Collect raw data for sequence time delta scaler (intra-file, per-user)
+            df_file_sorted_for_seq = df_file.sort_values(['company_name', 'timestamp'])
+            for _, user_group in df_file_sorted_for_seq.groupby('company_name', sort=False):
+                if len(user_group) > 1:
+                    time_diffs_seconds = user_group['timestamp'].diff().dt.total_seconds()
+                    # Keep only positive time differences (current - previous)
+                    valid_time_diffs = time_diffs_seconds[time_diffs_seconds > 0].tolist()
+                    all_sequence_time_deltas_collector.extend(valid_time_diffs)
+
+            category_id_strings_collector.update(df_file['txn_accepted_category_id_str'].unique())
+            user_company_names_collector.update(df_file['company_name'].unique())
+
+            if self.use_coa_text_features:
+                for _, row in df_file.iterrows():
+                    company_name_str = str(row['company_name'])
+                    if company_name_str != 'UNKNOWN' and company_name_str not in self.raw_user_coa_data:
+                        self.raw_user_coa_data[company_name_str] = row['chart_of_accounts_processed'] 
+        
+        if not self.is_predicting: # This block should only run if we are fitting, not using pre-fitted state
+            self._fit_scalers_from_collected(
+                all_transaction_features_to_scale_collector,
+                all_merchant_transactions_collector, 
+                all_sequence_time_deltas_collector
+            )
+            self._create_mappings_from_collected(category_id_strings_collector, user_company_names_collector)
+            self._process_collected_coa_text()
+        
+        print(f"Final Counts after Pass 1: Global Classes={self.num_global_classes}, Users={self.num_users}")
+        print(f"--- DataModuleV2 Prepare Data (Pass 1) finished in {time.time() - prepare_start_time:.2f}s ---")
+
+    def _init_tokenizer(self):
+        print(f"Downloading/loading tokenizer: {self.text_model_name}")
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.text_model_name, force_download=True)
+            print("Tokenizer ready.")
+        except Exception as e:
+            print(f"[ERROR] Failed to download/load tokenizer '{self.text_model_name}': {e}")
+            raise e
+
+    def _fit_scalers_from_collected(self, 
+                                    all_transaction_features_to_scale_collector,
+                                    all_merchant_transactions_collector: Dict[str, List[float]],
+                                    all_sequence_time_deltas_collector: List[float]):
+        print("Fitting scalers based on collected data...")
+        # 1. Transaction Feature Scaler
+        if all_transaction_features_to_scale_collector:
+            all_tx_scale_np = np.concatenate(all_transaction_features_to_scale_collector, axis=0)
+            if all_tx_scale_np.shape[0] > 0 and all_tx_scale_np.shape[1] == len(self.tx_feat_cols_to_scale):
+                tx_scaler = StandardScaler().fit(all_tx_scale_np)
+                self.scalers['transaction'] = tx_scaler
+                print(f"  Fitted scaler for 'transaction' features ({self.tx_feat_cols_to_scale}).")
+                # Create proxy edge scaler after transaction scaler is fitted
+                self._create_proxy_edge_scaler() 
             else:
-                 raise ValueError("No valid node types for HGT sampling found.")
-        graph_data_cpu = self.full_graph_data.cpu()
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
-                         input_nodes=('transaction', self.val_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
-
-    def test_dataloader(self) -> HGTLoader:
-        print("Creating test HGTLoader...")
-        if self.test_indices is None: self.setup('test')
-        if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
-        if self.test_indices is None or len(self.test_indices) == 0: raise ValueError("Test set empty.")
-        valid_hgt_num_samples = {k:v for k,v in self.hgt_num_samples.items() if k in self.full_graph_data.node_types}
-        if not valid_hgt_num_samples: 
-            print("[WARN] No valid node types for HGT sampling specified or detected during testing.")
-            if self.use_gnn_encoder and 'transaction' in self.full_graph_data.node_types:
-                 print("  Defaulting to sampling only for 'transaction' node.")
-                 valid_hgt_num_samples = {'transaction': self.hgt_num_samples.get('transaction', [15, 10][:self.num_hgt_layers])}
+                print(f"  [WARN] Not enough data or mismatched columns for transaction scaler. Data shape: {all_tx_scale_np.shape if isinstance(all_tx_scale_np, np.ndarray) else 'N/A'}")
+                self.scalers['transaction'] = None
+        else:
+            print("  [WARN] No data collected for transaction feature scaler.")
+            self.scalers['transaction'] = None
+        
+        # 2. Merchant Feature Scaler
+        if all_merchant_transactions_collector:
+            merchant_names_fit = list(all_merchant_transactions_collector.keys())
+            merchant_features_to_scale_list = []
+            for merchant_name_item in merchant_names_fit:
+                amounts = pd.Series(all_merchant_transactions_collector[merchant_name_item])
+                if not amounts.empty:
+                    stats = [
+                        amounts.mean(),
+                        amounts.std(ddof=0),
+                        amounts.max(),
+                        amounts.min(),
+                        amounts.count(),
+                        amounts.median(),
+                        amounts.quantile(0.25),
+                        amounts.quantile(0.75)
+                    ]
+                    merchant_features_to_scale_list.append(stats)
+            
+            if merchant_features_to_scale_list:
+                merchant_features_np = np.array(merchant_features_to_scale_list, dtype=np.float64)
+                # Fill any NaNs that might result from single-transaction merchants (e.g. std becomes NaN)
+                merchant_features_np = np.nan_to_num(merchant_features_np, nan=0.0)
+                if merchant_features_np.shape[0] > 0:
+                    merchant_scaler = StandardScaler().fit(merchant_features_np)
+                    self.scalers['merchant'] = merchant_scaler
+                    # Store the merchant names in the order their features were used for fitting the scaler
+                    # This isn't strictly necessary if _calculate_raw_features re-computes and re-orders
+                    # but good for consistency check if needed.
+                    # self.fitted_merchant_order_for_scaler = merchant_names_fit 
+                    print(f"  Fitted scaler for 'merchant' features. Input shape: {merchant_features_np.shape}")
+                else:
+                    print("  [WARN] No valid merchant features computed for scaler fitting.")
+                    self.scalers['merchant'] = None
             else:
-                 raise ValueError("No valid node types for HGT sampling found.")
-        graph_data_cpu = self.full_graph_data.cpu()
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
-                         input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+                print("  [WARN] No merchant transaction data processed for scaler fitting.")
+                self.scalers['merchant'] = None
 
-    # Add predict_dataloader
-    def predict_dataloader(self) -> HGTLoader:
-        print("Creating predict HGTLoader...")
-        if self.test_indices is None: self.setup('predict') # Ensure setup is called
-        if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
-        if self.test_indices is None or len(self.test_indices) == 0: 
-             # If test_indices is still empty after setup('predict'), something went wrong
-             raise ValueError("Prediction set empty or test indices not assigned correctly during setup.")
+        # 3. Edge attribute scaler (merchant amount diff) -------------------
+        edge_attr_values = []  # Collect normalized differences to fit scaler
+        for merchant_name_item, amounts_list in all_merchant_transactions_collector.items():
+            if len(amounts_list) < 2:
+                continue  # std would be zero
+            mean_val = np.mean(amounts_list)
+            std_val = np.std(amounts_list, ddof=0)
+            if std_val == 0:
+                continue
+            normalized_diffs = [(amt - mean_val) / std_val for amt in amounts_list]
+            edge_attr_values.extend(normalized_diffs)
+
+        if edge_attr_values:
+            edge_attr_np = np.array(edge_attr_values).reshape(-1, 1)
+            edge_scaler = StandardScaler().fit(edge_attr_np)
+            edge_key = ('transaction', 'belongs_to', 'merchant')
+            self.edge_scalers[edge_key] = edge_scaler
+            print(f"  Fitted scaler for edge attribute {edge_key}. Input shape: {edge_attr_np.shape}")
+        else:
+            print("  [WARN] Not enough data to fit edge attribute scaler. Edge attributes will remain unscaled.")
+            self.edge_scalers[('transaction', 'belongs_to', 'merchant')] = None
+
+        # 4. Sequence Time Delta Scaler
+        if all_sequence_time_deltas_collector:
+            time_delta_array = np.array(all_sequence_time_deltas_collector).reshape(-1, 1)
+            if time_delta_array.shape[0] > 0:
+                time_delta_scaler = StandardScaler().fit(time_delta_array)
+                self.seq_scalers['time_delta'] = time_delta_scaler
+                print(f"  Fitted scaler for sequence 'time_delta'. Input shape: {time_delta_array.shape}")
+            else:
+                print("  [WARN] No valid time deltas collected for sequence scaler fitting.")
+                self.seq_scalers['time_delta'] = None
+        else:
+            print("  [WARN] No time deltas collected for sequence scaler fitting.")
+            self.seq_scalers['time_delta'] = None
+
+        # self.scalers['merchant'] = None # Removed old placeholder
+        # self.seq_scalers['time_delta'] = None # Removed old placeholder
+        # print("  Merchant and sequence scaler fitting need full integration for iterative loading.") # Removed old message
+
+    def _create_mappings_from_collected(self, category_id_strings_collector, user_company_names_collector):
+        print("Creating ID mappings...")
+        sorted_cat_strings = sorted(list(s for s in category_id_strings_collector if pd.notna(s) and s != 'UNKNOWN'))
+        self.category_id_map = {code: name for code, name in enumerate(sorted_cat_strings)}
+        if 'UNKNOWN' not in self.category_id_map.values(): # Ensure UNKNOWN is in map if present
+            unknown_code = len(self.category_id_map)
+            self.category_id_map[unknown_code] = 'UNKNOWN'
+        self.num_global_classes = len(self.category_id_map)
+        print(f"  Created category_id_map: {self.num_global_classes} classes (incl. UNKNOWN if present).")
+
+        sorted_user_names = sorted(list(s for s in user_company_names_collector if pd.notna(s) and s != 'UNKNOWN'))
+        self.user_map = {code: name for code, name in enumerate(sorted_user_names)}
+        if 'UNKNOWN' not in self.user_map.values(): # Ensure UNKNOWN is in map
+            unknown_user_code = len(self.user_map)
+            self.user_map[unknown_user_code] = 'UNKNOWN'
+        self.num_users = len(self.user_map)
+        print(f"  Created user_map: {self.num_users} users (incl. UNKNOWN if present).")
+
+    def _process_collected_coa_text(self):
+        """Consolidates COA entries and tokenizes them for all users."""
+        if not hasattr(self, 'all_user_coa_data_collector') or not self.all_user_coa_data_collector:
+            print("[WARN] _process_collected_coa_text: No COA data collected. Skipping COA processing.")
+            self.user_coa_texts = {}
+            self.global_user_coa_tensors = None # Ensure it's defined
+            return
+
+        if self.tokenizer is None:
+            self._init_tokenizer() # Ensure tokenizer is initialized
+
+        print(f"[INFO] Processing collected COA text for {len(self.all_user_coa_data_collector)} users.")
+        self.user_coa_texts = {}
+        processed_coa_for_tokenization = []
+        user_ids_for_tokenization = [] # Keep track of user_id_code for ordering
+
+        # First, consolidate texts for each user
+        for user_id_code, coa_entries in self.all_user_coa_data_collector.items():
+            full_text_parts = []
+            for entry in coa_entries:
+                name = entry.get('name', '')
+                description = entry.get('description', '')
+                tax_type = entry.get('tax_type', '')
+                # Only include non-empty parts
+                parts = [p for p in [name, description, tax_type] if isinstance(p, str) and p.strip()]
+                if parts:
+                    full_text_parts.append("; ".join(parts))
+            
+            consolidated_text = " || ".join(full_text_parts) if full_text_parts else "" # Use || as separator like transaction text
+            self.user_coa_texts[user_id_code] = consolidated_text
+            # Add to list for batch tokenization, ensuring order matches user_map if possible
+            # or at least a consistent order for the buffer
+            processed_coa_for_tokenization.append(consolidated_text)
+            user_ids_for_tokenization.append(user_id_code)
+
+        if not processed_coa_for_tokenization:
+            print("[INFO] No actual COA text to tokenize after consolidation.")
+            self.global_user_coa_tensors = None
+            return
+
+        print(f"[INFO] Tokenizing COA texts for {len(processed_coa_for_tokenization)} users with max_length={self.coa_text_max_length}")
+        # Tokenize all collected COA texts at once
+        try:
+            tokenized_coa = self.tokenizer(
+                processed_coa_for_tokenization,
+                padding='max_length', 
+                truncation=True, 
+                max_length=self.coa_text_max_length, 
+                return_tensors='pt'
+            )
+            self.global_user_coa_tensors = {
+                'input_ids': tokenized_coa['input_ids'],
+                'attention_mask': tokenized_coa['attention_mask']
+            }
+            # To ensure the tensors in global_user_coa_tensors are indexed by user_id_code correctly later,
+            # we need a mapping from the original user_id_code to its row index in these tensors.
+            # The simplest way is to sort user_ids_for_tokenization and re-index the tensors accordingly
+            # if the model strictly requires user_id_code to be a direct index.
+            # However, the model will receive user_tokenized_coa_tensors and index into them using user_id_codes from the batch.
+            # The current AdvancedTransactionCategorizationModel expects user_tokenized_coa_tensors to be a dict of tensors
+            # where the first dimension corresponds to user_id_code if user_id_codes are contiguous and 0-indexed.
+            # Let's assume user_map gives contiguous 0-indexed user_id_codes.
+            # We need to ensure the order in global_user_coa_tensors matches the order of user_map.
+            
+            num_mapped_users = len(self.user_map)
+            # Create placeholder tensors based on the full user map size
+            final_coa_input_ids = torch.zeros((num_mapped_users, self.coa_text_max_length), dtype=torch.long)
+            final_coa_attention_mask = torch.zeros((num_mapped_users, self.coa_text_max_length), dtype=torch.long)
+
+            # Fill these tensors using the user_id_code from user_ids_for_tokenization as index
+            for i, user_id_code in enumerate(user_ids_for_tokenization):
+                if user_id_code < num_mapped_users: # Safety check
+                    final_coa_input_ids[user_id_code] = tokenized_coa['input_ids'][i]
+                    final_coa_attention_mask[user_id_code] = tokenized_coa['attention_mask'][i]
+                else:
+                    print(f"[WARN] User ID code {user_id_code} from COA data is out of bounds for user_map size {num_mapped_users}. Skipping.")
+
+            self.global_user_coa_tensors = {
+                'input_ids': final_coa_input_ids,
+                'attention_mask': final_coa_attention_mask
+            }
+
+            print(f"[INFO] Global COA tensors created. Shapes: input_ids {self.global_user_coa_tensors['input_ids'].shape}, attention_mask {self.global_user_coa_tensors['attention_mask'].shape}")
+
+        except Exception as e:
+            print(f"[ERROR] Failed to tokenize global COA texts: {e}")
+            import traceback
+            traceback.print_exc()
+            self.global_user_coa_tensors = None
+
+    def _create_proxy_edge_scaler(self):
+        """Creates a dummy edge scaler so that downstream code expecting an entry in self.edge_scalers will not fail.
+        Currently, the only edge attribute is the normalized merchant amount diff which is already on a comparable
+        scale.  We therefore create an identity StandardScaler (mean=0, scale=1) for that single-dimensional edge
+        feature and store it under the canonical edge key.
+        """
+        from sklearn.preprocessing import StandardScaler
+        edge_key = ('transaction', 'belongs_to', 'merchant')
+        if edge_key in self.edge_scalers:
+            return  # already exists
+        dummy_scaler = StandardScaler()
+        # Manually set fitted attributes for a 1-d feature so that transform can be called if needed.
+        dummy_scaler.mean_ = np.array([0.0])
+        dummy_scaler.scale_ = np.array([1.0])
+        self.edge_scalers[edge_key] = dummy_scaler
+        print(f"[INFO] Created proxy edge scaler for edge {edge_key}.")
+
+    def setup(self, stage: Optional[str] = None):
+        if not self.is_predicting: # Fit/Test stage
+            if self.user_map is None or not self.scalers or self.num_global_classes == 0 : # Check if prepare_data needs to be run
+                print(f"Prepare_data (Pass 1) not yet run or incomplete for stage '{stage}'. Running it now using train_files...")
+                self.prepare_data() # This uses self.train_files
+            else:
+                print(f"Prepare_data (Pass 1) already run for stage '{stage}'. Using existing scalers/maps.")
+                # Ensure num_users and num_global_classes are set if prepare_data was run previously
+                if self.user_map and self.num_users == 0: self.num_users = len(self.user_map)
+                if self.category_id_map and self.num_global_classes == 0: self.num_global_classes = len(self.category_id_map)
+
+        else: # is_predicting is True
+            print(f"Setup for stage '{stage}' (predict_mode=True). Using pre-fitted state.")
+            if not self.fitted_scalers or not self.fitted_user_map or not self.fitted_category_id_map:
+                raise ValueError("Predict stage: Pre-fitted scalers, user_map, and category_id_map are required.")
+            # Ensure num_users, num_global_classes are set from fitted maps
+            self.num_users = len(self.fitted_user_map) if self.fitted_user_map else 0
+            self.num_global_classes = len(self.fitted_category_id_map) if self.fitted_category_id_map else 0
+            
+            if self.tokenizer is None and (self.use_text_encoder or self.use_coa_text_features):
+                 self._init_tokenizer()
+            # For COA text in prediction: user_coa_texts should have been loaded by `load_state`.
+            # If not loaded and COA features are used, initialize to empty to avoid errors.
+            if self.use_coa_text_features and not self.user_coa_texts and self.num_users > 0:
+                 print("[WARN] Predict mode: use_coa_text_features=True, but self.user_coa_texts is empty. Initializing empty COA texts.")
+                 self.user_coa_texts = {i: "" for i in range(self.num_users)}
+
+        # Ensure COA texts are processed and global COA tensors are created if needed
+        if self.use_coa_text_features and not hasattr(self, 'global_user_coa_tensors'):
+             if not hasattr(self, 'user_coa_texts') or not self.user_coa_texts:
+                print("[WARN] setup: COA texts not processed in prepare_data. global_user_coa_tensors might be missing.")
+             # This implies _process_collected_coa_text should have been called in prepare_data
+             # If it wasn't, or if it failed, global_user_coa_tensors might be None.
+             # For safety, let's call it here if user_coa_texts exists from a previous run but tensors are missing.
+             # However, _process_collected_coa_text relies on all_user_coa_data_collector from prepare_data.
+             # So, this logic should primarily be in prepare_data.
+             # Here, we just check.
+             if self.global_user_coa_tensors is None:
+                 print("[WARN] setup: global_user_coa_tensors is None. COA features in model might not work.")
+
+        # --- Define Feature Dimensions and Metadata for the Model ---
+        # These should be determined AFTER scalers/maps are fitted in prepare_data
+        self.node_feature_dims = {}
+        self.edge_feature_dims = {}
+        self.sequence_feature_dim = 0 # Set to 0 as sequence encoder is removed
+
+        # Transaction node features
+        # Base: amount, num_coa, hour_sin, hour_cos, day_sin, day_cos (6 features)
+        # If scaled, dim remains same. This is the dim of graph_chunk['transaction'].x
+        # From _process_chunk_to_heterodata: raw_tx_features = np.column_stack([amount, num_coa, hour_sin, hour_cos, day_sin, day_cos])
+        self.node_feature_dims['transaction'] = 6 # Update if more base features are added
+        # If tx_feat_cols_to_scale changes, this might need adjustment if it affects final feature vector length
+
+        # User node features (not explicitly created as separate nodes in HeteroData for GNN input, but model uses user_id_code)
+        # The user embedding itself is handled by the model.
+        # If COA text is used, its embedding is concatenated by the model.
+        self.node_feature_dims['user'] = self._model_config.get('user_embed_dim', 64) # Placeholder, actual user node data for HGT might be different
+        if self.use_coa_text_features:
+            # The COA text feature is handled by the text_encoder within the model, not added to HGT's user node input here.
+            # HGT user node input dim doesn't change due to COA, but the effective user feature dim in fusion does.
+            pass 
+
+        # Merchant node features (if GNN is used)
+        if self.use_gnn_encoder:
+            # Based on merchant_agg_funcs_named in _process_chunk_to_heterodata
+            # Example: ['amount_mean', 'amount_std', 'amount_count', 'time_std', 'unique_users']
+            # The number of features is len(self.merchant_agg_funcs_named)
+            if self.merchant_agg_funcs_named:
+                self.node_feature_dims['merchant'] = len(self.merchant_agg_funcs_named)
+            else: # Default fallback if merchant_agg_funcs_named is somehow empty but GNN is on
+                self.node_feature_dims['merchant'] = 8 # Matching default in _process_chunk_to_heterodata
+        
+        # Sequence features (REMOVED)
+        # if self.use_sequence_encoder:
+            # self.sequence_feature_dim = 6 # amount, day_sin, day_cos, hour_sin, hour_cos, time_delta_scaled
+
+        # Edge features
+        if self.use_gnn_encoder: 
+            # ('transaction', 'belongs_to', 'merchant') has 1 edge attribute: normalized amount diff
+            self.edge_feature_dims[('transaction', 'belongs_to', 'merchant')] = 1
+            # Add other edge types if they exist and have features
+
+        # --- Define Graph Metadata for HGT --- 
+        node_types = ['transaction', 'user'] # 'user' is implicit via user_id_code for embedding lookup
+        edge_types_list = []
+        if self.use_gnn_encoder and 'merchant' in self.node_feature_dims:
+            node_types.append('merchant')
+            edge_types_list.append(('transaction', 'belongs_to', 'merchant'))
+            # If users were explicit nodes linked to transactions for GNN:
+            # node_types.append('user') 
+            # edge_types_list.append(('user', 'performs', 'transaction'))
+            # edge_types_list.append(('transaction', 'performed_by', 'user'))
+
+        self.graph_metadata = {
+            'node_types': node_types,
+            'edge_types': edge_types_list
+        }
+        print(f"[INFO] DataModule setup complete for stage: {stage}. Node dims: {self.node_feature_dims}, Edge dims: {self.edge_feature_dims}, Graph Metadata: {self.graph_metadata}")
+        if self.use_coa_text_features:
+            if self.global_user_coa_tensors:
+                print(f"Global COA Tensors available. input_ids shape: {self.global_user_coa_tensors['input_ids'].shape}")
+            else:
+                print("[WARN] Global COA Tensors are None after setup. COA features may not work.")
+
+    def _get_dataloader(self, file_list: List[str], stage: str) -> Optional[DataLoader]:
+        if not file_list:
+            # For 'validate' stage, PyTorch Lightning handles a None dataloader by skipping validation.
+            if stage == 'validate': 
+                print(f"[INFO] No files provided for stage '{stage}'. Returning None for DataLoader (validation will be skipped).")
+                return None
+            # For other stages like 'fit' or 'test', missing files is usually an error.
+            # However, predict might also have an empty list if no files are meant for prediction.
+            # Let's allow predict to also return None if file_list is empty and handle it in predict_dataloader.
+            if stage == 'predict':
+                print(f"[INFO] No files provided for stage '{stage}'. Returning None for DataLoader.")
+                return None
+            raise ValueError(f"No files provided for DataLoader stage '{stage}', and it's not 'validate' or 'predict'. File list is empty.")
+
+        dataset = ArrowFilesIterableDataset(
+            file_paths=file_list, 
+            data_module_ref=self, 
+            chunk_size=self.iterable_dataset_chunk_size,
+            stage=stage
+        )
+        return DataLoader(
+            dataset, 
+            batch_size=self.batch_size, # This batches the HeteroData objects yielded by dataset
+            num_workers=self.num_workers,
+            collate_fn=Batch.from_data_list, # PyG's collate function for HeteroData
+            persistent_workers=(self.num_workers > 0) # Ensure this is only True if num_workers > 0
+        )
+
+    # --- Dataloader Methods using IterableDataset --- 
+    def train_dataloader(self) -> DataLoader:
+        print(f"Creating Iterable train DataLoader (chunk_size={self.iterable_dataset_chunk_size}, dl_batch_size={self.batch_size})...")
+        if not self.train_files:
+             # This case should ideally be handled by robust file splitting or raise error in __init__.
+             # Raising error here if no train files, as training is not possible.
+             raise ValueError("No training files specified for train_dataloader. Training cannot proceed.")
+        return self._get_dataloader(self.train_files, 'fit')
+
+    def val_dataloader(self) -> Optional[DataLoader]:
+        # Reverted temporary debugging changes.
+        # Original logic:
+        if not self.val_files:
+            # print("[DEBUG DATAMODULE] val_files is empty. Attempting to use train_files for validation for debugging purposes.")
+            # if not self.train_files:
+            #     print("[DEBUG DATAMODULE] train_files is also empty. No validation data available.")
+            #     return None
+            # print(f"[DEBUG DATAMODULE] Using first train file for validation: {self.train_files[:1]}")
+            # return self._get_dataloader(self.train_files[:1], stage='validate')
+            print("[INFO] No validation files specified. val_dataloader will be None, and validation will be skipped.")
+            return None
+        return self._get_dataloader(self.val_files, stage='validate')
+
+    def test_dataloader(self) -> Optional[DataLoader]: # Can be None if no test files
+        print(f"Creating Iterable test DataLoader (chunk_size={self.iterable_dataset_chunk_size}, dl_batch_size={self.batch_size})...")
+        files_to_use = self.test_files # By default use test_files
+        
+        if self.is_predicting: # If in full prediction mode, test_dataloader might use predict_files if test_files is empty
+            if not self.test_files and self.predict_files:
+                print("[INFO] test_dataloader in prediction mode: No test_files, using predict_files instead.")
+                files_to_use = self.predict_files
+            elif not self.test_files and not self.predict_files:
+                print("[WARN] test_dataloader: No test_files or predict_files available. Returning None.")
+                return None
+        elif not self.test_files:
+             print("[WARN] test_dataloader: No test_files available. Returning None.")
+             return None
              
-        # Use the same sampling logic as test_dataloader
-        valid_hgt_num_samples = {k:v for k,v in self.hgt_num_samples.items() if k in self.full_graph_data.node_types}
-        if not valid_hgt_num_samples: 
-            print("[WARN] No valid node types for HGT sampling specified or detected during prediction.")
-            if self.use_gnn_encoder and 'transaction' in self.full_graph_data.node_types:
-                 print("  Defaulting to sampling only for 'transaction' node.")
-                 valid_hgt_num_samples = {'transaction': self.hgt_num_samples.get('transaction', [15, 10][:self.num_hgt_layers])}
-            else:
-                 raise ValueError("No valid node types for HGT sampling found.")
-                 
-        graph_data_cpu = self.full_graph_data.cpu()
-        # Input nodes should be the test_indices, which contain all nodes for predict stage
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
-                         input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        if not files_to_use: # Final check
+            print("[WARN] test_dataloader: No files to use after logic. Returning None.")
+            return None
+        return self._get_dataloader(files_to_use, 'test')
+
+    def predict_dataloader(self) -> Optional[DataLoader]: # Can be None if no predict files
+        print(f"Creating Iterable predict DataLoader (chunk_size={self.iterable_dataset_chunk_size}, dl_batch_size={self.batch_size})...")
+        if not self.predict_files:
+            print("[WARN] No predict_files specified for predict_dataloader. Returning None.")
+            return None
+        return self._get_dataloader(self.predict_files, 'predict')
+        
+    def get_state(self) -> Dict[str, Any]:
+        # Method to get serializable state for saving (scalers, maps, config)
+        # Ensure scalers are serializable (they are by default with pickle)
+        return {
+            'fitted_scalers': self.scalers,
+            'fitted_seq_scalers': self.seq_scalers,
+            'fitted_edge_scalers': self.edge_scalers,
+            'fitted_user_map': self.user_map,
+            'fitted_category_id_map': self.category_id_map,
+            'user_coa_texts': self.user_coa_texts, # Essential for COA features in predict
+            'num_users': self.num_users,
+            'num_global_classes': self.num_global_classes,
+            # Store relevant config used by IterableDataset too
+            'text_model_name': self.text_model_name,
+            'text_max_length': self.text_max_length,
+            'coa_text_max_length': self.coa_text_max_length,
+            'max_seq_length': self.max_seq_length,
+            # Modality flags are also important for consistent behavior in predict
+            'use_sequence_encoder': self.use_sequence_encoder,
+            'use_text_encoder': self.use_text_encoder,
+            'use_gnn_encoder': self.use_gnn_encoder,
+            'use_coa_text_features': self.use_coa_text_features,
+            # Store expected feature dimensions if determined statically
+            'node_feature_dims': self.node_feature_dims,
+            'edge_feature_dims': self.edge_feature_dims,
+            'sequence_feature_dim': self.sequence_feature_dim
+        }
+
+    @classmethod
+    def load_state(cls, state: Dict[str, Any], all_file_paths_for_predict: List[str], batch_size: int, iterable_dataset_chunk_size: int, num_workers: int) -> 'TransactionDataModuleV2':
+        # Create a new instance in prediction mode
+        # Pass relevant config from state if needed by __init__
+        dm = cls(
+            file_paths=all_file_paths_for_predict, 
+            batch_size=batch_size,
+            iterable_dataset_chunk_size=iterable_dataset_chunk_size,
+            num_workers=num_workers,
+            val_ratio=0, test_ratio=0, 
+            shuffle_files_before_split=False, 
+            text_model_name=state.get('text_model_name', 'bert-base-uncased'),
+            text_max_length=state.get('text_max_length', 128),
+            coa_text_max_length=state.get('coa_text_max_length', 256),
+            max_seq_length=state.get('max_seq_length', 50),
+            use_sequence_encoder=state.get('use_sequence_encoder', True),
+            use_text_encoder=state.get('use_text_encoder', True),
+            use_gnn_encoder=state.get('use_gnn_encoder', True), 
+            use_coa_text_features=state.get('use_coa_text_features', True),
+            fitted_scalers=state.get('fitted_scalers'), # Use .get for safety
+            fitted_seq_scalers=state.get('fitted_seq_scalers'),
+            fitted_edge_scalers=state.get('fitted_edge_scalers'),
+            fitted_user_map=state.get('fitted_user_map'),
+            fitted_category_id_map=state.get('fitted_category_id_map')
+        )
+        dm.user_coa_texts = state.get('user_coa_texts', {})
+        # Ensure num_users and num_global_classes are correctly set from loaded maps
+        dm.num_users = len(dm.user_map) if dm.user_map else 0
+        dm.num_global_classes = len(dm.category_id_map) if dm.category_id_map else 0
+        
+        dm.is_predicting = True 
+        
+        dm.node_feature_dims = state.get('node_feature_dims', {})
+        dm.edge_feature_dims = state.get('edge_feature_dims', {})
+        dm.sequence_feature_dim = state.get('sequence_feature_dim')
+
+        dm.setup('predict') 
+        return dm
+
+# End of TransactionDataModuleV2
 
 
