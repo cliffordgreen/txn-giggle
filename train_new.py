@@ -242,6 +242,15 @@ def load_data_with_scalers(data_dir: str, stats: Dict[str, Any], max_transaction
         raise ValueError("No valid data chunks were loaded")
     
     final_df = pd.concat(processed_chunks, ignore_index=True)
+    
+    # Ensure clean index for graph building
+    final_df.reset_index(drop=True, inplace=True)
+    
+    # Verify index is continuous
+    if not final_df.index.equals(pd.RangeIndex(len(final_df))):
+        print(f"[WARN] Index discontinuity in streaming, forcing reset...")
+        final_df.index = pd.RangeIndex(len(final_df))
+    
     print(f"Final dataset: {len(final_df):,} transactions")
     return final_df
 
@@ -457,11 +466,36 @@ def train_advanced_streaming(
     # === PASS 2: Load Data Subset ===
     df = load_data_with_scalers(data_dir, stats, max_transactions)
     
+    # DEBUG: Check DataFrame index integrity
+    print(f"[DEBUG] df.index range: {df.index.min()} to {df.index.max()}, len={len(df)}")
+    print(f"[DEBUG] df.index is continuous: {df.index.equals(pd.RangeIndex(len(df)))}")
+    print(f"[DEBUG] df.index dtype: {df.index.dtype}")
+    if not df.index.equals(pd.RangeIndex(len(df))):
+        print(f"[DEBUG] Index discontinuity detected! Expected 0-{len(df)-1}, but got min={df.index.min()}, max={df.index.max()}")
+        print(f"[DEBUG] First 10 index values: {df.index[:10].tolist()}")
+        print(f"[DEBUG] Last 10 index values: {df.index[-10:].tolist()}")
+    
     # === Continue with existing training logic ===
     num_global_classes = len(stats['category_map'])
     num_user_classes = 0 # Global-only prediction
     num_users = len(stats['user_map'])
     print(f"Dataset stats: #Global={num_global_classes}, #Users={num_users}, #Transactions={len(df):,}")
+
+    # DEBUGGING: Check for -1 user_id_codes
+    if 'user_id_code' in df.columns and (df['user_id_code'] == -1).any():
+        print(f"[!!!! DEBUG !!!!] Found {(df['user_id_code'] == -1).sum()} transactions with user_id_code == -1 in the DataFrame 'df'.")
+        problematic_companies = df.loc[df['user_id_code'] == -1, 'company_name'].unique()
+        print(f"[!!!! DEBUG !!!!] Unique company_names that mapped to -1 (first 10): {problematic_companies[:10]}")
+        # Check if these problematic_companies are in stats['user_map']
+        for comp in problematic_companies[:5]: # Check a few
+            # Ensure comp is a string for the dictionary lookup
+            comp_str = str(comp)
+            if comp_str in stats['user_map']:
+                print(f"[!!!! DEBUG !!!!] Problematic company '{comp_str}' IS in stats['user_map'] with ID {stats['user_map'][comp_str]} but df['user_id_code'] was -1. This is unexpected.")
+            else:
+                print(f"[!!!! DEBUG !!!!] Problematic company '{comp_str}' IS NOT in stats['user_map']. This is the primary issue.")
+    else:
+        print("[!!!! DEBUG !!!!] No user_id_code == -1 found in DataFrame 'df'.")
     
     # Create DataModule with pre-computed scalers
     print("Initializing TransactionDataModuleV2 with pre-computed scalers...")
