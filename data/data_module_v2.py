@@ -757,6 +757,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         data['transaction'].num_nodes = num_transactions
         if num_merchants > 0: data['merchant'].num_nodes = num_merchants
         if num_categories > 0: data['category'].num_nodes = num_categories
+        
+        print(f"  Graph node counts: transaction={num_transactions}, merchant={num_merchants}, category={num_categories}")
 
         print("  Adding scaled node features...")
         for node_type, raw_feat_array in raw_features.items():
@@ -815,13 +817,18 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             for idx, row in df.iterrows():
                 merchant_name = row[merchant_col]
                 if pd.notna(merchant_name) and merchant_name in merchant_map:
-                    tx_node_idx = tx_map[idx]; merchant_node_idx = merchant_map[merchant_name]
-                    edge_list.append([tx_node_idx, merchant_node_idx])
-                    stats = merchant_stats_map.get(merchant_name, {'mean': 0, 'std': 0})
-                    # Ensure row amount is float before calculation
-                    row_amount = float(row['amount'])
-                    amount_zscore = (row_amount - stats['mean']) / (stats['std'] + 1e-8)
-                    attr_list.append([amount_zscore])
+                    tx_node_idx = tx_map[idx]
+                    merchant_node_idx = merchant_map[merchant_name]
+                    
+                    # Additional bounds validation
+                    if (0 <= tx_node_idx < num_transactions and 
+                        0 <= merchant_node_idx < num_merchants):
+                        edge_list.append([tx_node_idx, merchant_node_idx])
+                        stats = merchant_stats_map.get(merchant_name, {'mean': 0, 'std': 0})
+                        # Ensure row amount is float before calculation
+                        row_amount = float(row['amount'])
+                        amount_zscore = (row_amount - stats['mean']) / (stats['std'] + 1e-8)
+                        attr_list.append([amount_zscore])
             if edge_list:
                 edge_index_dict[('transaction', 'belongs_to', 'merchant')] = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
                 edge_attr_dict[('transaction', 'belongs_to', 'merchant')] = torch.tensor(attr_list, dtype=torch.float)
@@ -834,12 +841,17 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             merchant_category_confidence = df.groupby(merchant_col)['category_id'].agg(lambda x: x.value_counts(normalize=True).max() if not x.empty else 0)
             
             for merchant_name, primary_cat_id in merchant_primary_category.items():
-                if pd.notna(merchant_name) and merchant_name in merchant_map and pd.notna(primary_cat_id) and primary_cat_id in category_map:
+                if (pd.notna(merchant_name) and merchant_name in merchant_map and 
+                    pd.notna(primary_cat_id) and primary_cat_id != -1 and primary_cat_id in category_map):
                     merchant_node_idx = merchant_map[merchant_name]
                     category_node_idx = category_map[primary_cat_id]
-                    edge_list.append([merchant_node_idx, category_node_idx])
-                    confidence = merchant_category_confidence.get(merchant_name, 0)
-                    attr_list.append([confidence])
+                    
+                    # Additional bounds validation
+                    if (0 <= merchant_node_idx < num_merchants and 
+                        0 <= category_node_idx < num_categories):
+                        edge_list.append([merchant_node_idx, category_node_idx])
+                        confidence = merchant_category_confidence.get(merchant_name, 0)
+                        attr_list.append([confidence])
                     
             if edge_list:
                 edge_index_dict[('merchant', 'categorized_as', 'category')] = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -866,9 +878,14 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                 time_diff_seconds = abs((ts_i - ts_j).total_seconds())
                 if time_diff_seconds <= 86400 * 1: 
                     tx_node_j = tx_map[df.index[j]] # Get node index for row j
-                    edge_list.extend([[tx_node_i, tx_node_j], [tx_node_j, tx_node_i]])
-                    time_diff_norm = min(time_diff_seconds / 86400.0, 1.0)
-                    attr_list.extend([[time_diff_norm, 1.0], [time_diff_norm, 0.0]]) # Add direction
+                    
+                    # Additional bounds validation
+                    if (0 <= tx_node_i < num_transactions and 
+                        0 <= tx_node_j < num_transactions and 
+                        tx_node_i != tx_node_j):
+                        edge_list.extend([[tx_node_i, tx_node_j], [tx_node_j, tx_node_i]])
+                        time_diff_norm = min(time_diff_seconds / 86400.0, 1.0)
+                        attr_list.extend([[time_diff_norm, 1.0], [time_diff_norm, 0.0]]) # Add direction
                 else: # Optimization: if time diff > 1 day, subsequent diffs will also be > 1 day
                     break 
         if edge_list:
@@ -893,17 +910,20 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                      # Only connect nodes within the same user? - NO, KNN is global amount similarity
                      for k in range(1, k_neighbors + 1):
                          j_pos = indices[i, k]
-                         if j_pos < num_transactions: 
+                         if j_pos < num_transactions and j_pos < len(df): 
                             tx_node_j = tx_map[df.index[j_pos]]
-                            # Ensure i != j_pos to avoid self-loops from KNN
-                            if tx_node_i == tx_node_j: continue 
-                            dist = distances[i, k]
-                            edge_list.extend([[tx_node_i, tx_node_j], [tx_node_j, tx_node_i]])
-                            raw_dist_list.extend([dist, dist])
-                            amount_i = raw_tx_amounts[i]; amount_j = raw_tx_amounts[j_pos]
-                            amount_ratio = min(amount_i, amount_j) / (max(amount_i, amount_j) + 1e-8) if max(amount_i, amount_j) > 1e-8 else 1.0
-                            amount_ratio_list.extend([amount_ratio, amount_ratio])
-                            direction_list.extend([1.0, 0.0])
+                            
+                            # Additional bounds validation
+                            if (0 <= tx_node_i < num_transactions and 
+                                0 <= tx_node_j < num_transactions and 
+                                tx_node_i != tx_node_j):
+                                dist = distances[i, k]
+                                edge_list.extend([[tx_node_i, tx_node_j], [tx_node_j, tx_node_i]])
+                                raw_dist_list.extend([dist, dist])
+                                amount_i = raw_tx_amounts[i]; amount_j = raw_tx_amounts[j_pos]
+                                amount_ratio = min(amount_i, amount_j) / (max(amount_i, amount_j) + 1e-8) if max(amount_i, amount_j) > 1e-8 else 1.0
+                                amount_ratio_list.extend([amount_ratio, amount_ratio])
+                                direction_list.extend([1.0, 0.0])
             except Exception as e_knn:
                  print(f"[ERROR] KNN for similar_amount failed: {e_knn}")
         
