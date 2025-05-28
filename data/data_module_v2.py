@@ -88,13 +88,13 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         if self.hgt_num_samples is None:
             # Simple default: Sample 15 neighbors in first layer, 10 in second
             default_samples_per_layer = [15, 10]
-            # Define KNOWN node types used in the graph (NO 'category')
-            node_types_in_graph = ['transaction', 'merchant'] 
+            # Define KNOWN node types used in the graph (including 'category')
+            node_types_in_graph = ['transaction', 'merchant', 'category'] 
             self.hgt_num_samples = {ntype: default_samples_per_layer[:self.num_hgt_layers] for ntype in node_types_in_graph}
             print(f"[WARN] hgt_num_samples not provided. Using default based on num_hgt_layers={self.num_hgt_layers}: {self.hgt_num_samples}")
         else:
             # Validate provided config against expected node types
-            expected_node_types = {'transaction', 'merchant'} # Only these are expected now
+            expected_node_types = {'transaction', 'merchant', 'category'} # All expected node types
             for ntype, samples in self.hgt_num_samples.items():
                 if ntype not in expected_node_types:
                     print(f"[WARN] hgt_num_samples contains unexpected node type '{ntype}'. It will be ignored.")
@@ -119,6 +119,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         self.fitted_user_map = fitted_user_map
         self.fitted_category_id_map = fitted_category_id_map
         self.is_predicting = (fitted_scalers is not None) # Flag if we are in prediction mode
+        self.use_precomputed_scalers = (fitted_scalers is not None)  # Flag for pre-computed scalers
 
         # Placeholders
         self.tokenizer = None
@@ -239,15 +240,17 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         if self.use_gnn_encoder:
             raw_features = self._calculate_raw_features() 
 
-        # **Step 3: Fit scalers ONLY on TRAINING data (Skip if predicting)**
-        if not self.is_predicting: # Only fit if not using pre-fitted state
+        # **Step 3: Fit scalers ONLY on TRAINING data (Skip if using pre-computed)**
+        if not self.use_precomputed_scalers: # Only fit if not using pre-computed scalers
             print("Fitting scalers on TRAINING data...")
             self._fit_scalers(raw_features, self.train_indices) 
         else:
-            print("Skipping scaler fitting (using pre-loaded scalers).")
+            print("Using pre-computed scalers from statistics pass...")
+            # Load pre-computed scalers
+            self._load_precomputed_scalers()
             # Ensure edge scaler exists if needed and not provided
             if self.use_gnn_encoder and 'amount_dist' not in self.edge_scalers: 
-                 self._create_proxy_edge_scaler() # New helper needed
+                 self._create_proxy_edge_scaler()
 
         # **Step 4: Build Graph with SCALED features (using fitted scalers)**
         print("Building full graph data with scaled features...")
@@ -274,8 +277,12 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         df = self.transactions_df
         raw_features_dict = {}
         print("Calculating raw transaction features (vectorized)...")
-        # Features: amount, num_chart_of_accounts (scaled), time features (not scaled)
-        self.tx_feat_cols_to_scale = ['amount', 'num_chart_of_accounts'] 
+        # Features: amount (scaled), num_chart_of_accounts (log-normalized), COA features (scaled), time features (not scaled)
+        self.tx_feat_cols_to_scale = ['amount']  # Continuous features
+        self.tx_feat_cols_to_normalize = ['num_chart_of_accounts']  # Count features (log transform)
+        self.tx_feat_cols_coa_scale = ['coa_size', 'hierarchy_depth', 'type_diversity', 
+                                       'code_complexity', 'naming_consistency', 
+                                       'description_richness', 'balance_diversity', 'recent_accounts']  # COA features
         self.tx_feat_cols_no_scale = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
         
         # Ensure required columns exist
@@ -286,6 +293,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
 
         amount = df['amount'].fillna(0.0)
         num_coa = df['num_chart_of_accounts'].fillna(0).astype(int)
+        # Apply log transformation to count features (log1p to handle 0 values)
+        num_coa_log = np.log1p(num_coa)
         hour = df['hour'].fillna(0).astype(int)
         day = df['weekday'].fillna(0).astype(int)
         
@@ -294,8 +303,12 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         day_sin = np.sin(2 * np.pi * day / 7)
         day_cos = np.cos(2 * np.pi * day / 7)
         
-        # Stack scaled features first, then non-scaled
-        tx_features_array = np.column_stack([amount, num_coa, hour_sin, hour_cos, day_sin, day_cos])
+        # Extract COA features
+        coa_features = self._extract_transaction_coa_features(df)
+        print(f"  COA features extracted. Shape: {coa_features.shape}")
+        
+        # Stack: continuous (to scale), log-normalized counts (to scale), COA features (to scale), cyclical (no scale)
+        tx_features_array = np.column_stack([amount, num_coa_log, coa_features, hour_sin, hour_cos, day_sin, day_cos])
         raw_features_dict['transaction'] = tx_features_array.astype(np.float64)
         print(f"  Raw transaction features calculated. Shape: {raw_features_dict['transaction'].shape}")
         
@@ -321,10 +334,301 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             raw_features_dict['merchant'] = np.zeros((0, 8), dtype=np.float64)
         print(f"  Raw merchant features calculated. Shape: {raw_features_dict['merchant'].shape}")
         
-        # Category features are removed
-        print("Skipping category features (node type removed).")
+        # Category features calculation
+        print("Calculating raw category features (vectorized)...")
+        valid_categories = df['category_id'].dropna().unique()
+        valid_categories = [c for c in valid_categories if isinstance(c, (int, np.integer)) and c != -1]
+        num_categories = len(valid_categories)
+        
+        if num_categories > 0:
+            category_stats = df[df['category_id'].isin(valid_categories)].groupby('category_id').agg(**agg_funcs_named)
+            category_stats = category_stats.fillna(0).reindex(valid_categories, fill_value=0)
+            final_category_cols = list(agg_funcs_named.keys())
+            raw_features_dict['category'] = category_stats[final_category_cols].values.astype(np.float64)
+        else:
+            raw_features_dict['category'] = np.zeros((0, 8), dtype=np.float64)
+        print(f"  Raw category features calculated. Shape: {raw_features_dict['category'].shape}")
         
         return raw_features_dict
+
+    def _extract_transaction_coa_features(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract COA features for each transaction."""
+        print("Extracting transaction-level COA features (vectorized)...")
+        
+        def analyze_transaction_coa(coa_json_str) -> List[float]:
+            """Analyze COA structure for a single transaction."""
+            try:
+                if pd.isna(coa_json_str):
+                    return self._default_coa_features()
+                    
+                coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
+                if not isinstance(coa_list, list) or len(coa_list) == 0:
+                    return self._default_coa_features()
+                
+                # Extract basic info
+                account_codes = [acc.get('account_code', '') for acc in coa_list if isinstance(acc, dict)]
+                account_names = [acc.get('account_name', '') for acc in coa_list if isinstance(acc, dict)]
+                account_descriptions = [acc.get('account_description', '') for acc in coa_list if isinstance(acc, dict)]
+                
+                return [
+                    len(coa_list),  # COA size at this point in time
+                    self._calculate_hierarchy_depth(account_codes),
+                    self._calculate_account_type_diversity(account_codes, account_names),
+                    self._calculate_code_complexity(account_codes),
+                    self._calculate_naming_consistency(account_names),
+                    self._calculate_description_richness(account_descriptions),
+                    self._calculate_account_balance_diversity(coa_list),
+                    self._calculate_recent_accounts_indicator(coa_list)
+                ]
+                
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                return self._default_coa_features()
+        
+        # Apply vectorized processing
+        if 'chart_of_accounts_processed' in df.columns:
+            coa_feature_series = df['chart_of_accounts_processed'].apply(analyze_transaction_coa)
+            return np.array(coa_feature_series.tolist())
+        else:
+            # Return default features if COA column missing
+            return np.array([self._default_coa_features() for _ in range(len(df))])
+
+    def _default_coa_features(self) -> List[float]:
+        """Default features for missing/invalid COA data."""
+        return [0.0] * 8  # 8 COA features
+
+    def _calculate_hierarchy_depth(self, account_codes: List[str]) -> float:
+        """Calculate average hierarchy depth from account codes."""
+        if not account_codes:
+            return 0.0
+        
+        depths = []
+        for code in account_codes:
+            code_str = str(code).strip()
+            if not code_str:
+                continue
+                
+            # Heuristic: count digits for depth (e.g., 1000=1, 1100=2, 1110=3)
+            if code_str.isdigit():
+                # For numeric codes, estimate depth by significant digits
+                depth = len(code_str.rstrip('0')) if code_str.rstrip('0') else 1
+            else:
+                # For alphanumeric codes, count separators + 1
+                depth = code_str.count('-') + code_str.count('.') + code_str.count('_') + 1
+            depths.append(min(depth, 10))  # Cap at reasonable depth
+        
+        return np.mean(depths) if depths else 0.0
+
+    def _calculate_account_type_diversity(self, account_codes: List[str], account_names: List[str]) -> float:
+        """Calculate diversity of account types (assets, liabilities, etc.)."""
+        account_types = set()
+        
+        for code, name in zip(account_codes, account_names):
+            account_type = self._infer_account_type(code, name)
+            account_types.add(account_type)
+        
+        # Return normalized diversity (0-1)
+        max_types = 6  # asset, liability, equity, revenue, expense, other
+        return len(account_types) / max_types
+
+    def _infer_account_type(self, code: str, name: str) -> str:
+        """Infer account type from code and name patterns."""
+        code_str = str(code).lower().strip()
+        name_str = str(name).lower().strip()
+        
+        # Standard account code ranges (first digit)
+        if code_str and code_str[0].isdigit():
+            first_digit = code_str[0]
+            if first_digit == '1': return 'asset'
+            elif first_digit == '2': return 'liability' 
+            elif first_digit == '3': return 'equity'
+            elif first_digit == '4': return 'revenue'
+            elif first_digit in ['5', '6', '7']: return 'expense'
+        
+        # Name-based inference
+        asset_keywords = ['cash', 'bank', 'receivable', 'inventory', 'equipment', 'asset']
+        liability_keywords = ['payable', 'loan', 'debt', 'accrued', 'liability']
+        equity_keywords = ['equity', 'capital', 'retained', 'stock']
+        revenue_keywords = ['sales', 'revenue', 'income', 'service', 'fees']
+        expense_keywords = ['expense', 'cost', 'salary', 'rent', 'utilities', 'depreciation']
+        
+        if any(kw in name_str for kw in asset_keywords): return 'asset'
+        elif any(kw in name_str for kw in liability_keywords): return 'liability'
+        elif any(kw in name_str for kw in equity_keywords): return 'equity'
+        elif any(kw in name_str for kw in revenue_keywords): return 'revenue'
+        elif any(kw in name_str for kw in expense_keywords): return 'expense'
+        
+        return 'other'
+
+    def _calculate_code_complexity(self, account_codes: List[str]) -> float:
+        """Calculate complexity/structure of account codes."""
+        if not account_codes:
+            return 0.0
+        
+        complexities = []
+        for code in account_codes:
+            code_str = str(code).strip()
+            if not code_str:
+                continue
+                
+            # Complexity indicators
+            length_score = min(len(code_str) / 10.0, 1.0)  # Normalize length
+            separator_score = min((code_str.count('-') + code_str.count('.') + code_str.count('_')) / 3.0, 1.0)
+            alphanumeric_score = 0.2 if any(c.isalpha() for c in code_str) and any(c.isdigit() for c in code_str) else 0.0
+            
+            complexity = (length_score + separator_score + alphanumeric_score) / 3.0
+            complexities.append(complexity)
+        
+        return np.mean(complexities) if complexities else 0.0
+
+    def _calculate_naming_consistency(self, account_names: List[str]) -> float:
+        """Calculate consistency of naming conventions."""
+        if len(account_names) < 2:
+            return 1.0  # Perfect consistency for 0-1 accounts
+        
+        # Simple heuristic: consistency in capitalization and word patterns
+        capitalization_patterns = set()
+        word_counts = []
+        
+        for name in account_names:
+            name_str = str(name).strip()
+            if not name_str:
+                continue
+                
+            # Capitalization pattern
+            if name_str.isupper():
+                capitalization_patterns.add('upper')
+            elif name_str.islower():
+                capitalization_patterns.add('lower')
+            elif name_str.istitle():
+                capitalization_patterns.add('title')
+            else:
+                capitalization_patterns.add('mixed')
+            
+            # Word count
+            word_counts.append(len(name_str.split()))
+        
+        # Consistency scores
+        cap_consistency = 1.0 - (len(capitalization_patterns) - 1) / 3.0  # Normalize to 0-1
+        word_count_consistency = 1.0 - (np.std(word_counts) / (np.mean(word_counts) + 1e-8)) if word_counts else 1.0
+        word_count_consistency = max(0.0, min(1.0, word_count_consistency))
+        
+        return (cap_consistency + word_count_consistency) / 2.0
+
+    def _calculate_description_richness(self, descriptions: List[str]) -> float:
+        """Calculate richness of account descriptions."""
+        if not descriptions:
+            return 0.0
+        
+        total_chars = 0
+        non_empty_count = 0
+        
+        for desc in descriptions:
+            desc_str = str(desc).strip()
+            if desc_str:
+                total_chars += len(desc_str)
+                non_empty_count += 1
+        
+        if non_empty_count == 0:
+            return 0.0
+        
+        # Average description length (normalized)
+        avg_length = total_chars / non_empty_count
+        return min(avg_length / 100.0, 1.0)  # Normalize to [0, 1], cap at 100 chars
+
+    def _calculate_account_balance_diversity(self, coa_list: List[Dict]) -> float:
+        """Calculate diversity of account balances."""
+        balances = []
+        for acc in coa_list:
+            if isinstance(acc, dict) and 'balance' in acc:
+                try:
+                    balance = float(acc['balance'])
+                    balances.append(abs(balance))
+                except (ValueError, TypeError):
+                    continue
+        
+        if len(balances) < 2:
+            return 0.0
+        
+        # Coefficient of variation (normalized diversity)
+        mean_balance = np.mean(balances)
+        if mean_balance < 1e-8:
+            return 0.0
+        
+        cv = np.std(balances) / mean_balance
+        return min(cv / 2.0, 1.0)  # Normalize and cap
+
+    def _calculate_recent_accounts_indicator(self, coa_list: List[Dict]) -> float:
+        """Estimate proportion of recently added accounts."""
+        if not coa_list:
+            return 0.0
+        
+        recent_indicators = 0
+        total_accounts = len(coa_list)
+        
+        for acc in coa_list:
+            if not isinstance(acc, dict):
+                continue
+                
+            acc_code = str(acc.get('account_code', '')).lower()
+            acc_name = str(acc.get('account_name', '')).lower()
+            
+            # Heuristics for recent/temporary accounts
+            recent_patterns = [
+                acc_code.endswith('99'), acc_code.endswith('00'),  # Common for new accounts
+                'new' in acc_name, 'temp' in acc_name, 'misc' in acc_name,
+                'other' in acc_name, 'suspense' in acc_name
+            ]
+            
+            if any(recent_patterns):
+                recent_indicators += 1
+        
+        return recent_indicators / total_accounts
+
+    def _extract_text_features(self, df: pd.DataFrame) -> List[str]:
+        """Extract and combine text features including COA text (DRY principle)."""
+        text_cols = ['description', 'memo', 'merchant_name']
+        
+        # Extract COA text using vectorized operations
+        coa_text_series = self._extract_coa_text_vectorized(df)
+        
+        # Vectorized transaction text extraction
+        tx_text_parts = df[text_cols].fillna('').astype(str)
+        tx_text_series = tx_text_parts.apply(lambda row: ' || '.join(filter(None, row)), axis=1)
+        
+        # Combine transaction and COA text
+        combined_text = []
+        for tx_text, coa_text in zip(tx_text_series, coa_text_series):
+            combined = f"{tx_text} || CHART: {coa_text}" if coa_text else tx_text
+            combined_text.append(combined)
+            
+        return combined_text
+
+    def _extract_coa_text_vectorized(self, df: pd.DataFrame) -> pd.Series:
+        """Extract COA text features using vectorized pandas operations."""
+        if not (self.use_text_encoder and self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns):
+            return pd.Series([""] * len(df))
+        
+        print("  Including chart of accounts text (vectorized)...")
+        
+        def parse_coa_text(coa_json_str):
+            """Parse individual COA JSON string."""
+            try:
+                if pd.isna(coa_json_str):
+                    return ""
+                coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
+                if not isinstance(coa_list, list):
+                    return ""
+                # Combine account names and descriptions
+                acc_texts = [
+                    f"{acc.get('account_name', '')} {acc.get('account_description', '')}".strip() 
+                    for acc in coa_list if isinstance(acc, dict)
+                ]
+                return " || ".join(filter(None, acc_texts))
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                return ""
+        
+        # Apply vectorized parsing
+        return df['chart_of_accounts_processed'].apply(parse_coa_text)
 
     def _fit_scalers(self, raw_features: Dict[str, np.ndarray], train_indices: torch.Tensor):
         print("Fitting scalers (using only training data where applicable)...")
@@ -333,16 +637,18 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         for node_type, features in raw_features.items():
             if features.size > 0 and features.shape[0] > 0:
                 if node_type == 'transaction':
-                    num_cols_to_scale = len(self.tx_feat_cols_to_scale) # amount, num_coa
+                    num_cols_to_scale = (len(self.tx_feat_cols_to_scale) + 
+                                        len(self.tx_feat_cols_to_normalize) + 
+                                        len(self.tx_feat_cols_coa_scale))  # amount + num_coa_log + COA features
                     if features.shape[1] >= num_cols_to_scale and num_cols_to_scale > 0:
                         scaler = StandardScaler()
                         # Ensure train_indices_np are valid indices for features array
                         valid_train_indices = train_indices_np[train_indices_np < features.shape[0]]
                         if len(valid_train_indices) > 0:
-                             # Fit only on the columns designated for scaling
+                             # Fit on both continuous and log-normalized features
                              scaler.fit(features[valid_train_indices, :num_cols_to_scale])
                              self.scalers[node_type] = scaler
-                             print(f"  Fitted scaler for 'transaction' features ({self.tx_feat_cols_to_scale}) using {len(valid_train_indices)} training samples.")
+                             print(f"  Fitted scaler for 'transaction' features ({self.tx_feat_cols_to_scale + self.tx_feat_cols_to_normalize + self.tx_feat_cols_coa_scale}) using {len(valid_train_indices)} training samples.")
                         else:
                              print(f"  [WARN] No valid training indices found for fitting 'transaction' scaler.")
                              self.scalers[node_type] = None # Indicate scaler couldn't be fitted
@@ -355,7 +661,12 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                     scaler.fit(features)
                     self.scalers[node_type] = scaler
                     print(f"  Fitted scaler GLOBALLY for '{node_type}'.")
-                # No 'category' node type anymore
+                elif node_type == 'category':
+                    # Fit category scaler globally
+                    scaler = StandardScaler()
+                    scaler.fit(features)
+                    self.scalers[node_type] = scaler
+                    print(f"  Fitted scaler GLOBALLY for '{node_type}'.")
             else:
                 print(f"  Skipping scaler fitting for empty features: '{node_type}'")
                 self.scalers[node_type] = None
@@ -398,6 +709,30 @@ class TransactionDataModuleV2(pl.LightningDataModule):
              # else: print warn? (Already done in fit_scalers)
         # else: print warn? (Already done in fit_scalers)
 
+    def _load_precomputed_scalers(self):
+        """Load pre-computed scalers from fitted_scalers."""
+        if self.fitted_scalers and 'transaction' in self.fitted_scalers:
+            # Convert pre-computed scaler parameters to StandardScaler-like objects
+            scaler_params = self.fitted_scalers['transaction']
+            
+            # Create a mock StandardScaler object
+            from sklearn.preprocessing import StandardScaler
+            mock_scaler = StandardScaler()
+            mock_scaler.mean_ = scaler_params['mean_']
+            mock_scaler.scale_ = scaler_params['scale_']
+            
+            self.scalers['transaction'] = mock_scaler
+            print(f"  Loaded pre-computed transaction scaler with {len(scaler_params['mean_'])} features")
+        
+        # Load other scalers if available
+        if self.fitted_scalers:
+            for scaler_name, scaler_params in self.fitted_scalers.items():
+                if scaler_name != 'transaction' and isinstance(scaler_params, dict):
+                    mock_scaler = StandardScaler()
+                    mock_scaler.mean_ = scaler_params['mean_']
+                    mock_scaler.scale_ = scaler_params['scale_']
+                    self.scalers[scaler_name] = mock_scaler
+
     def _build_graph_and_edges(self, raw_features: Dict[str, np.ndarray], train_indices: torch.Tensor):
         print("Building graph structure and applying SCALED features...")
         data = HeteroData()
@@ -412,11 +747,15 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         merchant_map = {name: i for i, name in enumerate(merchant_ids)}
         num_merchants = len(merchant_map)
         
-        # No category map needed here
+        # Create category map
+        valid_categories = df['category_id'].dropna().unique()
+        valid_categories = [c for c in valid_categories if isinstance(c, (int, np.integer)) and c != -1]
+        category_map = {cat_id: i for i, cat_id in enumerate(valid_categories)}
+        num_categories = len(category_map)
 
         data['transaction'].num_nodes = num_transactions
         if num_merchants > 0: data['merchant'].num_nodes = num_merchants
-        # No category nodes
+        if num_categories > 0: data['category'].num_nodes = num_categories
 
         print("  Adding scaled node features...")
         for node_type, raw_feat_array in raw_features.items():
@@ -425,12 +764,14 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                 if node_type in self.scalers and self.scalers[node_type] is not None:
                     scaler = self.scalers[node_type]
                     if node_type == 'transaction':
-                        num_cols_to_scale = len(self.tx_feat_cols_to_scale)
+                        num_cols_to_scale = (len(self.tx_feat_cols_to_scale) + 
+                                            len(self.tx_feat_cols_to_normalize) + 
+                                            len(self.tx_feat_cols_coa_scale))
                         # Apply scaler fitted on training data TO ALL transaction nodes
                         scaled_part = (raw_feat_array[:, :num_cols_to_scale] - scaler.mean_) / (np.maximum(scaler.scale_, 1e-8))
                         non_scaled_part = raw_feat_array[:, num_cols_to_scale:]
                         final_features = np.concatenate([scaled_part, non_scaled_part], axis=1)
-                        print(f"    Applied TRAIN-fitted scaler to ALL 'transaction' nodes ({self.tx_feat_cols_to_scale}).")
+                        print(f"    Applied TRAIN-fitted scaler to ALL 'transaction' nodes ({self.tx_feat_cols_to_scale + self.tx_feat_cols_to_normalize + self.tx_feat_cols_coa_scale}).")
                     elif node_type == 'merchant': # Apply globally fitted scaler to merchant nodes
                         final_features = (raw_feat_array - scaler.mean_) / (np.maximum(scaler.scale_, 1e-8))
                         print(f"    Applied GLOBALLY-fitted scaler to '{node_type}' nodes.")
@@ -454,33 +795,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # data['transaction'].y_user = ... 
         data['transaction'].user_id_code = torch.tensor(df['user_id_code'].values, dtype=torch.long)
         
-        # Updated text feature extraction
-        text_cols = ['description', 'memo', 'merchant_name'] 
-        coa_text_list = []
-        if self.use_text_encoder and self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns:
-            print("  Including chart of accounts text...")
-            for coa_json_str in df['chart_of_accounts_processed'].fillna('[]'):
-                try:
-                    coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
-                    # Combine account names and descriptions
-                    acc_texts = [f"{acc.get('account_name', '')} {acc.get('account_description', '')}".strip() for acc in coa_list if isinstance(acc, dict)]
-                    coa_text_list.append(" || ".join(filter(None, acc_texts)))
-                except (json.JSONDecodeError, TypeError):
-                    coa_text_list.append("") # Append empty string on error
-        elif self.use_text_encoder and self.use_coa_text_features: # COA enabled but column missing
-            print("  [WARN] use_coa_text_features is True, but 'chart_of_accounts_processed' column not found. COA text will be empty.")
-            coa_text_list = ["" for _ in range(len(df))] # Ensure list exists
-        else: # COA text disabled or text encoder disabled
-            coa_text_list = ["" for _ in range(len(df))] # Ensure list exists
-
-        # Combine transaction text and chart of accounts text
-        raw_text_combined = []
-        for i in range(len(df)):
-            tx_parts = [str(df.iloc[i].get(col, '')) for col in text_cols]
-            tx_text = ' || '.join(filter(None, tx_parts))
-            coa_text = coa_text_list[i]
-            combined = f"{tx_text} || CHART: {coa_text}" if coa_text else tx_text
-            raw_text_combined.append(combined)
+        # Extract text features using refactored method
+        raw_text_combined = self._extract_text_features(df)
         
         data['transaction']._raw_text = raw_text_combined
         if self.use_text_encoder: print(f"  Combined raw text features created (COA included: {self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns}).")
@@ -510,8 +826,24 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                 edge_attr_dict[('transaction', 'belongs_to', 'merchant')] = torch.tensor(attr_list, dtype=torch.float)
                 self.edge_feature_dims[('transaction', 'belongs_to', 'merchant')] = 1
 
-        # 2. Merchant -> Category - REMOVED
-        # print("Skipping Merchant -> Category edges.")
+        # 2. Merchant -> Category (categorized_as)
+        if num_merchants > 0 and num_categories > 0:
+            edge_list, attr_list = [], []
+            merchant_primary_category = df.groupby(merchant_col)['category_id'].agg(lambda x: x.mode()[0] if not x.mode().empty else -1)
+            merchant_category_confidence = df.groupby(merchant_col)['category_id'].agg(lambda x: x.value_counts(normalize=True).max() if not x.empty else 0)
+            
+            for merchant_name, primary_cat_id in merchant_primary_category.items():
+                if pd.notna(merchant_name) and merchant_name in merchant_map and pd.notna(primary_cat_id) and primary_cat_id in category_map:
+                    merchant_node_idx = merchant_map[merchant_name]
+                    category_node_idx = category_map[primary_cat_id]
+                    edge_list.append([merchant_node_idx, category_node_idx])
+                    confidence = merchant_category_confidence.get(merchant_name, 0)
+                    attr_list.append([confidence])
+                    
+            if edge_list:
+                edge_index_dict[('merchant', 'categorized_as', 'category')] = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+                edge_attr_dict[('merchant', 'categorized_as', 'category')] = torch.tensor(attr_list, dtype=torch.float)
+                self.edge_feature_dims[('merchant', 'categorized_as', 'category')] = 1
 
         # 3. Transaction -> Transaction (temporal) 
         edge_list, attr_list = [], []
@@ -621,30 +953,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # No y_user
         self.full_graph_data['transaction'].user_id_code = torch.tensor(df['user_id_code'].values, dtype=torch.long)
         
-        # Updated text feature extraction for minimal graph
-        text_cols = ['description', 'memo', 'merchant_name'] 
-        coa_text_list = []
-        if self.use_text_encoder and self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns:
-            for coa_json_str in df['chart_of_accounts_processed'].fillna('[]'):
-                try:
-                    coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
-                    acc_texts = [f"{acc.get('account_name', '')} {acc.get('account_description', '')}".strip() for acc in coa_list if isinstance(acc, dict)]
-                    coa_text_list.append(" || ".join(filter(None, acc_texts)))
-                except (json.JSONDecodeError, TypeError):
-                    coa_text_list.append("") 
-        elif self.use_text_encoder and self.use_coa_text_features: # COA enabled but column missing
-            print("  [WARN] Minimal graph: use_coa_text_features is True, but 'chart_of_accounts_processed' column not found.") # Optional print
-            coa_text_list = ["" for _ in range(len(df))]
-        else: # COA text disabled or text encoder disabled
-            coa_text_list = ["" for _ in range(len(df))]
-
-        raw_text_combined = []
-        for i in range(len(df)):
-            tx_parts = [str(df.iloc[i].get(col, '')) for col in text_cols]
-            tx_text = ' || '.join(filter(None, tx_parts))
-            coa_text = coa_text_list[i]
-            combined = f"{tx_text} || CHART: {coa_text}" if coa_text else tx_text
-            raw_text_combined.append(combined)
+        # Extract text features using refactored method
+        raw_text_combined = self._extract_text_features(df)
         
         self.full_graph_data['transaction']._raw_text = raw_text_combined
         print("Built minimal graph data.")

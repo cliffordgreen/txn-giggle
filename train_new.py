@@ -22,7 +22,286 @@ from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable
 # Import the new advanced model
 from models.advanced_transaction_classifier import AdvancedTransactionCategorizationModel
 
-# Helper function to load data (similar to old train.py)
+# Helper functions for two-pass loading
+def collect_statistics_pass(data_dir: str, max_files_for_stats: Optional[int] = None) -> Dict[str, Any]:
+    """Pass 1: Collect statistics needed for scaling without loading full data."""
+    print(f"=== PASS 1: Collecting Statistics from {data_dir} ===")
+    
+    arrow_files_pattern = os.path.join(data_dir, '**/*.arrow')
+    arrow_files = sorted(glob.glob(arrow_files_pattern, recursive=True))
+    
+    if not arrow_files:
+        raise FileNotFoundError(f"No .arrow files found in directory: {data_dir}")
+    
+    # Limit files for statistics if specified
+    if max_files_for_stats is not None:
+        arrow_files = arrow_files[:max_files_for_stats]
+        print(f"Limited to {len(arrow_files)} files for statistics collection")
+    
+    # Initialize statistics collectors
+    stats = {
+        'amount_stats': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0, 'min': float('inf'), 'max': float('-inf')},
+        'num_coa_stats': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+        'coa_feature_stats': {
+            'coa_size': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+            'hierarchy_depth': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+            'type_diversity': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+            'code_complexity': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+            'naming_consistency': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+            'description_richness': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+            'balance_diversity': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0},
+            'recent_accounts': {'sum': 0.0, 'sum_sq': 0.0, 'count': 0}
+        },
+        'category_counts': {},
+        'user_counts': {},
+        'total_transactions_seen': 0
+    }
+    
+    print(f"Processing {len(arrow_files)} files for statistics...")
+    
+    for file_path in tqdm(arrow_files, desc="Computing statistics"):
+        try:
+            with ipc.open_stream(file_path) as reader:
+                table = reader.read_all()
+                df_chunk = table.to_pandas()
+            
+            # Process each row for statistics
+            for _, row in df_chunk.iterrows():
+                try:
+                    # Extract target and user info
+                    if isinstance(row['target_transaction_processed'], dict):
+                        txn_dict = row['target_transaction_processed']
+                    else:
+                        txn_dict = json.loads(row['target_transaction_processed'])
+                    
+                    amount = float(txn_dict.get('amount', 0.0))
+                    category_str = str(row.get('txn_accepted_category_id_str', 'UNKNOWN'))
+                    company_name = str(row.get('company_name', 'UNKNOWN'))
+                    num_coa = pd.to_numeric(row.get('num_chart_of_accounts', 0), errors='coerce')
+                    if pd.isna(num_coa):
+                        num_coa = 0
+                    
+                    # Update amount statistics
+                    stats['amount_stats']['sum'] += amount
+                    stats['amount_stats']['sum_sq'] += amount**2
+                    stats['amount_stats']['count'] += 1
+                    stats['amount_stats']['min'] = min(stats['amount_stats']['min'], amount)
+                    stats['amount_stats']['max'] = max(stats['amount_stats']['max'], amount)
+                    
+                    # Update num_coa statistics (will be log-transformed)
+                    num_coa_log = np.log1p(float(num_coa))
+                    stats['num_coa_stats']['sum'] += num_coa_log
+                    stats['num_coa_stats']['sum_sq'] += num_coa_log**2
+                    stats['num_coa_stats']['count'] += 1
+                    
+                    # Extract and update COA feature statistics
+                    coa_features = extract_coa_features_single(row.get('chart_of_accounts_processed', '[]'))
+                    for feat_name, feat_val in zip(stats['coa_feature_stats'].keys(), coa_features):
+                        stats['coa_feature_stats'][feat_name]['sum'] += feat_val
+                        stats['coa_feature_stats'][feat_name]['sum_sq'] += feat_val**2
+                        stats['coa_feature_stats'][feat_name]['count'] += 1
+                    
+                    # Count categories and users
+                    stats['category_counts'][category_str] = stats['category_counts'].get(category_str, 0) + 1
+                    stats['user_counts'][company_name] = stats['user_counts'].get(company_name, 0) + 1
+                    stats['total_transactions_seen'] += 1
+                    
+                except Exception as e:
+                    continue  # Skip problematic rows
+                    
+        except Exception as e:
+            print(f"[WARN] Failed to process file {os.path.basename(file_path)}: {e}")
+            continue
+    
+    print(f"Statistics collected from {stats['total_transactions_seen']:,} transactions")
+    
+    # Compute scalers from statistics
+    stats['scalers'] = compute_scalers_from_stats(stats)
+    stats['category_map'] = {cat: idx for idx, cat in enumerate(sorted(stats['category_counts'].keys()))}
+    stats['user_map'] = {user: idx for idx, user in enumerate(sorted(stats['user_counts'].keys()))}
+    
+    print(f"Found {len(stats['category_map'])} unique categories, {len(stats['user_map'])} unique users")
+    return stats
+
+def extract_coa_features_single(coa_json_str) -> List[float]:
+    """Extract COA features for a single transaction (lightweight version)."""
+    try:
+        if pd.isna(coa_json_str):
+            return [0.0] * 8
+            
+        coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str
+        if not isinstance(coa_list, list) or len(coa_list) == 0:
+            return [0.0] * 8
+        
+        # Simplified feature extraction for statistics
+        account_codes = [acc.get('account_code', '') for acc in coa_list if isinstance(acc, dict)]
+        account_names = [acc.get('account_name', '') for acc in coa_list if isinstance(acc, dict)]
+        
+        # Basic features
+        coa_size = len(coa_list)
+        hierarchy_depth = np.mean([len(str(code).rstrip('0')) if str(code).isdigit() and str(code).rstrip('0') else 1 
+                                  for code in account_codes]) if account_codes else 0.0
+        
+        # Simplified versions of other features
+        type_diversity = len(set(str(code)[0] if str(code) and str(code)[0].isdigit() else 'other' 
+                               for code in account_codes)) / 6.0 if account_codes else 0.0
+        code_complexity = np.mean([len(str(code)) / 10.0 for code in account_codes]) if account_codes else 0.0
+        naming_consistency = 0.5  # Placeholder for statistics
+        description_richness = 0.5  # Placeholder for statistics  
+        balance_diversity = 0.5  # Placeholder for statistics
+        recent_accounts = 0.1  # Placeholder for statistics
+        
+        return [coa_size, hierarchy_depth, type_diversity, code_complexity, 
+                naming_consistency, description_richness, balance_diversity, recent_accounts]
+        
+    except Exception:
+        return [0.0] * 8
+
+def compute_scalers_from_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute StandardScaler parameters from collected statistics."""
+    scalers = {}
+    
+    # Compute scaler for all scalable transaction features
+    all_means = []
+    all_stds = []
+    
+    # Amount
+    if stats['amount_stats']['count'] > 0:
+        amount_mean = stats['amount_stats']['sum'] / stats['amount_stats']['count']
+        amount_var = (stats['amount_stats']['sum_sq'] / stats['amount_stats']['count']) - amount_mean**2
+        amount_std = np.sqrt(max(amount_var, 1e-8))
+        all_means.append(amount_mean)
+        all_stds.append(amount_std)
+    
+    # Num COA (log-transformed)
+    if stats['num_coa_stats']['count'] > 0:
+        coa_mean = stats['num_coa_stats']['sum'] / stats['num_coa_stats']['count']
+        coa_var = (stats['num_coa_stats']['sum_sq'] / stats['num_coa_stats']['count']) - coa_mean**2
+        coa_std = np.sqrt(max(coa_var, 1e-8))
+        all_means.append(coa_mean)
+        all_stds.append(coa_std)
+    
+    # COA features
+    for feat_name, feat_stats in stats['coa_feature_stats'].items():
+        if feat_stats['count'] > 0:
+            feat_mean = feat_stats['sum'] / feat_stats['count']
+            feat_var = (feat_stats['sum_sq'] / feat_stats['count']) - feat_mean**2
+            feat_std = np.sqrt(max(feat_var, 1e-8))
+            all_means.append(feat_mean)
+            all_stds.append(feat_std)
+    
+    # Create scaler parameters
+    scalers['transaction'] = {
+        'mean_': np.array(all_means),
+        'scale_': np.array(all_stds)
+    }
+    
+    print(f"Computed scalers: {len(all_means)} features")
+    return scalers
+
+def load_data_with_scalers(data_dir: str, stats: Dict[str, Any], max_transactions: int = 1000000) -> pd.DataFrame:
+    """Pass 2: Load and process data using pre-computed scalers."""
+    print(f"=== PASS 2: Loading {max_transactions:,} transactions with pre-computed scalers ===")
+    
+    arrow_files_pattern = os.path.join(data_dir, '**/*.arrow')
+    arrow_files = sorted(glob.glob(arrow_files_pattern, recursive=True))
+    
+    processed_chunks = []
+    total_loaded = 0
+    
+    for file_path in tqdm(arrow_files, desc="Loading data"):
+        if total_loaded >= max_transactions:
+            break
+            
+        try:
+            # Load and process chunk
+            with ipc.open_stream(file_path) as reader:
+                table = reader.read_all()
+                df_chunk = table.to_pandas()
+            
+            # Process chunk using existing logic but with pre-computed mappings
+            df_processed = process_chunk_with_mappings(df_chunk, stats)
+            
+            # Limit chunk size if needed
+            remaining = max_transactions - total_loaded
+            if len(df_processed) > remaining:
+                df_processed = df_processed.head(remaining)
+            
+            if len(df_processed) > 0:
+                processed_chunks.append(df_processed)
+                total_loaded += len(df_processed)
+                
+                if total_loaded % 50000 == 0:
+                    print(f"Loaded {total_loaded:,} / {max_transactions:,} transactions")
+                
+        except Exception as e:
+            print(f"[WARN] Failed to process file {os.path.basename(file_path)}: {e}")
+            continue
+    
+    if not processed_chunks:
+        raise ValueError("No valid data chunks were loaded")
+    
+    final_df = pd.concat(processed_chunks, ignore_index=True)
+    print(f"Final dataset: {len(final_df):,} transactions")
+    return final_df
+
+def process_chunk_with_mappings(df_chunk: pd.DataFrame, stats: Dict[str, Any]) -> pd.DataFrame:
+    """Process a data chunk using pre-computed category and user mappings."""
+    extracted_data = []
+    
+    for _, row in df_chunk.iterrows():
+        try:
+            # Extract transaction data
+            if isinstance(row['target_transaction_processed'], dict):
+                txn_dict = row['target_transaction_processed']
+            else:
+                txn_dict = json.loads(row['target_transaction_processed'])
+            
+            # Map category and user using pre-computed mappings
+            category_str = str(row.get('txn_accepted_category_id_str', 'UNKNOWN'))
+            company_name = str(row.get('company_name', 'UNKNOWN'))
+            
+            category_id = stats['category_map'].get(category_str, -1)
+            user_id_code = stats['user_map'].get(company_name, -1)
+            
+            extracted_data.append({
+                'amount': float(txn_dict.get('amount', 0.0)),
+                'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'),
+                'description': str(txn_dict.get('description', '')),
+                'memo': str(txn_dict.get('memo', '')),
+                'merchant_name': str(txn_dict.get('payee', '')),
+                'txn_accepted_category_id_str': category_str,
+                'company_name': company_name,
+                'category_id': category_id,
+                'user_id_code': user_id_code,
+                'industry_name': str(row.get('industry_name', 'UNKNOWN')),
+                'num_chart_of_accounts': pd.to_numeric(row.get('num_chart_of_accounts', 0), errors='coerce'),
+                'chart_of_accounts_processed': row.get('chart_of_accounts_processed', '[]')
+            })
+            
+        except Exception as e:
+            continue  # Skip problematic rows
+    
+    if not extracted_data:
+        return pd.DataFrame()
+    
+    df_processed = pd.DataFrame(extracted_data)
+    
+    # Handle timestamps
+    df_processed['timestamp'] = pd.to_datetime(df_processed['timestamp'], errors='coerce')
+    median_date = df_processed['timestamp'].dropna().median()
+    if pd.isna(median_date):
+        median_date = pd.Timestamp('2020-01-01')
+    df_processed['timestamp'].fillna(median_date, inplace=True)
+    
+    # Add time features
+    df_processed['weekday'] = df_processed['timestamp'].dt.weekday
+    df_processed['hour'] = df_processed['timestamp'].dt.hour
+    df_processed['num_chart_of_accounts'].fillna(0, inplace=True)
+    
+    return df_processed
+
+# Original load_data function (now deprecated)
 def load_data(data_dir: str, max_files_to_process: Optional[int] = None) -> pd.DataFrame:
     """Loads and preprocesses data from multiple Arrow streaming files, one by one.
     Processes up to max_files_to_process if specified.
@@ -144,6 +423,175 @@ def load_data(data_dir: str, max_files_to_process: Optional[int] = None) -> pd.D
     print("Preprocessing finished.") # Renamed log message
     return df_combined
 
+def train_advanced_streaming(
+    # Data/Output  
+    data_dir: str,
+    output_dir: str,
+    # Memory Management
+    max_transactions: int = 1000000,
+    max_files_for_stats: Optional[int] = None,
+    # Training params (same as before)
+    batch_size: int = 32,
+    num_workers: int = 0,
+    max_epochs: int = 50,
+    seed: int = 42,
+    model_config: dict = {},
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-5,
+    mtl_weights: dict = {'global': 1.0, 'user': 0.0},
+    focal_loss_alpha: float = 0.25,
+    focal_loss_gamma: float = 2.0,
+    accelerator: str = 'auto',
+    precision: str = '32',
+    hgt_num_samples: Optional[Dict[str, List[int]]] = None
+):
+    """Train using two-pass approach for large datasets."""
+    torch.set_float32_matmul_precision('high') 
+    pl.seed_everything(seed)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # === PASS 1: Collect Statistics ===
+    print("Starting two-pass training approach...")
+    stats = collect_statistics_pass(data_dir, max_files_for_stats)
+    
+    # === PASS 2: Load Data Subset ===
+    df = load_data_with_scalers(data_dir, stats, max_transactions)
+    
+    # === Continue with existing training logic ===
+    num_global_classes = len(stats['category_map'])
+    num_user_classes = 0 # Global-only prediction
+    num_users = len(stats['user_map'])
+    print(f"Dataset stats: #Global={num_global_classes}, #Users={num_users}, #Transactions={len(df):,}")
+    
+    # Create DataModule with pre-computed scalers
+    print("Initializing TransactionDataModuleV2 with pre-computed scalers...")
+    use_seq = model_config.get('use_sequence_encoder', False)
+    use_graph = model_config.get('use_graph_encoder', True)   
+    use_text = model_config.get('use_text_encoder', True)     
+    use_coa_text = model_config.get('use_coa_text_features', False)
+
+    num_hgt_layers = model_config['graph_encoder_params'].get('num_layers', 2) 
+    data_module = TransactionDataModuleV2(
+        transactions_df_ref=df,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        num_hgt_layers=num_hgt_layers,
+        hgt_num_samples=hgt_num_samples,
+        text_model_name=model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
+        max_seq_length=model_config.get('max_seq_length', 50),
+        text_max_length=model_config['text_encoder_params'].get('max_length', 128),
+        use_sequence_encoder=use_seq,
+        use_gnn_encoder=use_graph,
+        use_text_encoder=use_text,
+        use_coa_text_features=use_coa_text,
+        # Pass pre-computed scalers
+        fitted_scalers=stats['scalers'],
+        fitted_category_id_map=stats['category_map'],
+        fitted_user_map=stats['user_map']
+    )
+    
+    print("Setting up DataModuleV2...")
+    data_module.setup('fit') 
+    
+    # Continue with model creation and training (same as before)
+    # Update model config with dynamic values
+    model_config['graph_encoder_params']['in_channels'] = data_module.node_feature_dims
+    model_config['graph_encoder_params']['metadata'] = data_module.full_graph_data.metadata() 
+    model_config['num_users'] = num_users
+    model_config['num_global_classes'] = num_global_classes
+    model_config['num_user_classes'] = num_user_classes
+    
+    # Update fusion dims
+    model_config['fusion_params']['graph_dim'] = model_config['graph_encoder_params'].get('out_channels', 128)
+    model_config['fusion_params']['seq_dim'] = model_config['sequence_encoder_params'].get('output_dim', 128)
+    text_proj_dim = model_config['text_encoder_params'].get('projection_dim', 0)
+    finbert_hidden_size = 768
+    text_out_dim_for_fusion = text_proj_dim if text_proj_dim > 0 else finbert_hidden_size
+    model_config['fusion_params']['text_dim'] = text_out_dim_for_fusion
+    model_config['fusion_params']['user_dim'] = model_config['user_embed_dim']
+    
+    # Create model
+    print("Initializing AdvancedTransactionCategorizationModel...")
+    model = AdvancedTransactionCategorizationModel(
+        model_config=model_config,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        mtl_weights=mtl_weights,
+        focal_loss_alpha=focal_loss_alpha,
+        focal_loss_gamma=focal_loss_gamma,
+        transactions_df_ref=df
+    )
+    
+    # Training setup (same as before)
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=output_dir,
+            filename='adv_model-{epoch:02d}-{val_loss:.2f}',
+            save_top_k=1,
+            monitor='val_loss',
+            mode='min'
+        ),
+        EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            mode='min'
+        )
+    ]
+    logger = TensorBoardLogger(save_dir=output_dir, name='adv_logs')
+
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator=accelerator,
+        precision=precision,
+        devices=1,
+        callbacks=callbacks,
+        logger=logger,
+        log_every_n_steps=1000,
+        val_check_interval=1000,
+    )
+
+    # Train
+    print("Starting Training...")
+    try:
+        trainer.fit(model, datamodule=data_module)
+    except Exception as e:
+        print(f"!!! ERROR during training: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
+    finally:
+        # Save preprocessing state including original statistics
+        print("Saving preprocessing state...")
+        state_to_save = {
+            'scalers': stats['scalers'],
+            'category_id_map': stats['category_map'],
+            'user_map': stats['user_map'],
+            'original_stats': stats,  # Save original statistics for reference
+            'max_transactions_used': len(df)
+        }
+        save_path = os.path.join(output_dir, 'preprocessing_state.pkl')
+        try:
+            with open(save_path, 'wb') as f:
+                pickle.dump(state_to_save, f)
+            print(f"Preprocessing state saved to: {save_path}")
+        except Exception as save_e:
+            print(f"[ERROR] Failed to save preprocessing state: {save_e}")
+
+    # Test
+    print("Starting Testing...")
+    try:
+        test_results = trainer.test(datamodule=data_module, ckpt_path='best') 
+        print("Test Results:", test_results)
+        if test_results:
+            results_df = pd.DataFrame(test_results)
+            results_df.to_csv(os.path.join(output_dir, 'adv_test_results.csv'), index=False)
+    except Exception as e:
+        print(f"!!! ERROR during testing: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("Streaming training script finished.")
+
 def train_advanced(
     # Data/Output
     data_dir: str, # Changed from data_path
@@ -158,7 +606,7 @@ def train_advanced(
     # Training Strategy Params
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-5,
-    mtl_weights: dict = {'global': 0.5, 'user': 0.5},
+    mtl_weights: dict = {'global': 1.0, 'user': 0.0},
     focal_loss_alpha: float = 0.25,
     focal_loss_gamma: float = 2.0,
     # Add trainer specific args if needed (accelerator, precision etc.)
@@ -359,6 +807,14 @@ if __name__ == '__main__':
     parser.add_argument('--config_path', type=str, default='config/model_config.yaml', help='Path to YAML model configuration file')
     parser.add_argument('--max_files_to_process', type=int, default=None, 
                         help='Optional: Process only the first N files found in data_dir for testing.')
+    
+    # --- Memory Management Arguments (for streaming) ---
+    parser.add_argument('--streaming', action='store_true', 
+                        help='Use two-pass streaming approach for large datasets')
+    parser.add_argument('--max_transactions', type=int, default=1000000,
+                        help='Maximum number of transactions to load (streaming mode)')
+    parser.add_argument('--max_files_for_stats', type=int, default=None,
+                        help='Maximum number of files to use for statistics collection (streaming mode)')
 
     # --- Training Arguments --- 
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
@@ -377,8 +833,8 @@ if __name__ == '__main__':
                         help='JSON/YAML string defining num_samples per node type per layer for HGTLoader')
     
     # --- MTL/Focal Loss Arguments --- 
-    parser.add_argument('--mtl_weight_global', type=float, default=0.5, help='Weight for global loss')
-    parser.add_argument('--mtl_weight_user', type=float, default=0.5, help='Weight for user loss')
+    parser.add_argument('--mtl_weight_global', type=float, default=1.0, help='Weight for global loss')
+    parser.add_argument('--mtl_weight_user', type=float, default=0.0, help='Weight for user loss')
     parser.add_argument('--focal_alpha', type=float, default=0.25, help='Alpha for Focal Loss')
     parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma for Focal Loss')
 
@@ -421,22 +877,44 @@ if __name__ == '__main__':
             hgt_samples_dict = None # Fallback to default in DataModule init
 
     # --- Run Training --- 
-    train_advanced(
-        data_dir=args.data_dir,
-        output_dir=args.output_dir,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        max_epochs=args.max_epochs,
-        seed=args.seed,
-        model_config=model_config,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        mtl_weights={'global': args.mtl_weight_global, 'user': args.mtl_weight_user},
-        focal_loss_alpha=args.focal_alpha,
-        focal_loss_gamma=args.focal_gamma,
-        accelerator=args.accelerator,
-        precision=args.precision,
-        hgt_num_samples=hgt_samples_dict, # Pass parsed dict or None
-        # Pass max_files_to_process to load_data via train_advanced
-        max_files_to_process=args.max_files_to_process
-    ) 
+    if args.streaming:
+        print("Using streaming training approach...")
+        train_advanced_streaming(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            max_transactions=args.max_transactions,
+            max_files_for_stats=args.max_files_for_stats,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            max_epochs=args.max_epochs,
+            seed=args.seed,
+            model_config=model_config,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            mtl_weights={'global': args.mtl_weight_global, 'user': args.mtl_weight_user},
+            focal_loss_alpha=args.focal_alpha,
+            focal_loss_gamma=args.focal_gamma,
+            accelerator=args.accelerator,
+            precision=args.precision,
+            hgt_num_samples=hgt_samples_dict
+        )
+    else:
+        print("Using traditional training approach...")
+        train_advanced(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            max_epochs=args.max_epochs,
+            seed=args.seed,
+            model_config=model_config,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            mtl_weights={'global': args.mtl_weight_global, 'user': args.mtl_weight_user},
+            focal_loss_alpha=args.focal_alpha,
+            focal_loss_gamma=args.focal_gamma,
+            accelerator=args.accelerator,
+            precision=args.precision,
+            hgt_num_samples=hgt_samples_dict,
+            max_files_to_process=args.max_files_to_process
+        ) 
