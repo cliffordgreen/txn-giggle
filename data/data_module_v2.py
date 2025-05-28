@@ -151,7 +151,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # Ensure fillna happened in load_data
         if self.transactions_df[target_col].isnull().any():
             print(f"[WARN] Target column '{target_col}' still contains NaNs after load_data. Filling with 'UNKNOWN'.")
-            self.transactions_df[target_col] = self.transactions_df[target_col].fillna('UNKNOWN')
+            self.transactions_df[target_col] = self.transactions_df[target_col].fillna('UNKNOWN').infer_objects(copy=False)
             
         # Use fitted maps if provided (predicting), otherwise factorize
         if self.is_predicting:
@@ -159,8 +159,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             # Map strings to known ints, use -1 for unknowns
             map_cat_str_to_int = {v: k for k, v in self.category_id_map.items()}
             map_user_str_to_int = {v: k for k, v in self.user_map.items()}
-            self.transactions_df['category_id'] = self.transactions_df[target_col].map(map_cat_str_to_int).fillna(-1).astype(int)
-            self.transactions_df['user_id_code'] = self.transactions_df['company_name'].map(map_user_str_to_int).fillna(-1).astype(int)
+            self.transactions_df['category_id'] = self.transactions_df[target_col].map(map_cat_str_to_int).fillna(-1).infer_objects(copy=False).astype(int)
+            self.transactions_df['user_id_code'] = self.transactions_df['company_name'].map(map_user_str_to_int).fillna(-1).infer_objects(copy=False).astype(int)
             self.num_global_classes = len(self.category_id_map)
             self.num_users = len(self.user_map)
             if (self.transactions_df['user_id_code'] == -1).any():
@@ -358,7 +358,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         def analyze_transaction_coa(coa_json_str) -> List[float]:
             """Analyze COA structure for a single transaction."""
             try:
-                if pd.isna(coa_json_str):
+                # Safe null check that works with both scalars and arrays
+                if coa_json_str is None or str(coa_json_str).lower() in ['nan', 'none', '', 'null']:
                     return self._default_coa_features()
                     
                 coa_list = json.loads(coa_json_str) if isinstance(coa_json_str, str) else coa_json_str

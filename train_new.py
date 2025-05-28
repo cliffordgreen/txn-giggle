@@ -292,12 +292,12 @@ def process_chunk_with_mappings(df_chunk: pd.DataFrame, stats: Dict[str, Any]) -
     median_date = df_processed['timestamp'].dropna().median()
     if pd.isna(median_date):
         median_date = pd.Timestamp('2020-01-01')
-    df_processed['timestamp'].fillna(median_date, inplace=True)
+    df_processed['timestamp'] = df_processed['timestamp'].fillna(median_date)
     
     # Add time features
     df_processed['weekday'] = df_processed['timestamp'].dt.weekday
     df_processed['hour'] = df_processed['timestamp'].dt.hour
-    df_processed['num_chart_of_accounts'].fillna(0, inplace=True)
+    df_processed['num_chart_of_accounts'] = df_processed['num_chart_of_accounts'].fillna(0)
     
     return df_processed
 
