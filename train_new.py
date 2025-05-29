@@ -581,6 +581,13 @@ def train_advanced_streaming(
     ]
     logger = TensorBoardLogger(save_dir=output_dir, name='adv_logs')
 
+    # Calculate validation interval as a factor of total training batches
+    total_samples = len(df)
+    batches_per_epoch = (total_samples // batch_size) + (1 if total_samples % batch_size != 0 else 0)
+    # Check validation every 10% of an epoch, minimum 50 steps, maximum 1000 steps
+    val_check_interval = max(50, min(1000, batches_per_epoch // 10))
+    print(f"[INFO] Calculated val_check_interval: {val_check_interval} (batches_per_epoch: {batches_per_epoch})")
+    
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         accelerator=accelerator,
@@ -588,8 +595,8 @@ def train_advanced_streaming(
         devices=1,
         callbacks=callbacks,
         logger=logger,
-        log_every_n_steps=1000,
-        val_check_interval=1000,
+        log_every_n_steps=min(val_check_interval, 500),  # Log more frequently than validation
+        val_check_interval=val_check_interval,
         accumulate_grad_batches=4,  # Effective batch size = batch_size * 4
     )
 
@@ -805,6 +812,13 @@ def train_advanced(
 
     # --- Trainer --- 
     print("Initializing Trainer...")
+    # Calculate validation interval as a factor of total training batches
+    total_samples = len(df)
+    batches_per_epoch = (total_samples // batch_size) + (1 if total_samples % batch_size != 0 else 0)
+    # Check validation every 10% of an epoch, minimum 50 steps, maximum 1000 steps
+    val_check_interval = max(50, min(1000, batches_per_epoch // 10))
+    print(f"[INFO] Calculated val_check_interval: {val_check_interval} (batches_per_epoch: {batches_per_epoch})")
+    
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         accelerator=accelerator,
@@ -812,8 +826,8 @@ def train_advanced(
         devices=1, # Assuming single device for now
         callbacks=callbacks,
         logger=logger,
-        log_every_n_steps=1000,
-        val_check_interval=1000,# Log less frequently
+        log_every_n_steps=min(val_check_interval, 500),  # Log more frequently than validation
+        val_check_interval=val_check_interval,
         accumulate_grad_batches=4,  # Effective batch size = batch_size * 4
         # gradient_clip_val=1 # Optional
     )
