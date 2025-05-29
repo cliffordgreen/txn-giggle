@@ -451,7 +451,7 @@ def train_advanced_streaming(
     focal_loss_alpha: float = 0.25,
     focal_loss_gamma: float = 2.0,
     accelerator: str = 'auto',
-    precision: str = '32',
+    precision: str = 'bf16-mixed',
     hgt_num_samples: Optional[Dict[str, List[int]]] = None
 ):
     """Train using two-pass approach for large datasets."""
@@ -556,6 +556,15 @@ def train_advanced_streaming(
         transactions_df_ref=df
     )
     
+    # Compile model for faster training (PyTorch 2.0+)
+    if hasattr(torch, 'compile'):
+        print("[INFO] Compiling model with torch.compile for faster training...")
+        try:
+            model = torch.compile(model, mode='default')
+            print("[INFO] Model compilation successful")
+        except Exception as e:
+            print(f"[WARN] Model compilation failed: {e}. Continuing without compilation.")
+    
     # Training setup (same as before)
     callbacks = [
         ModelCheckpoint(
@@ -582,6 +591,7 @@ def train_advanced_streaming(
         logger=logger,
         log_every_n_steps=1000,
         val_check_interval=1000,
+        accumulate_grad_batches=4,  # Effective batch size = batch_size * 4
     )
 
     # Train
@@ -645,7 +655,7 @@ def train_advanced(
     focal_loss_gamma: float = 2.0,
     # Add trainer specific args if needed (accelerator, precision etc.)
     accelerator: str = 'auto',
-    precision: str = '32',
+    precision: str = 'bf16-mixed',
     # <<< HGTLoader specific config >>>
     hgt_num_samples: Optional[Dict[str, List[int]]] = None,
     # num_hgt_layers is derived from model_config now
@@ -753,6 +763,15 @@ def train_advanced(
         focal_loss_gamma=focal_loss_gamma,
         transactions_df_ref=df
     )
+    
+    # Compile model for faster training (PyTorch 2.0+)
+    if hasattr(torch, 'compile'):
+        print("[INFO] Compiling model with torch.compile for faster training...")
+        try:
+            model = torch.compile(model, mode='default')
+            print("[INFO] Model compilation successful")
+        except Exception as e:
+            print(f"[WARN] Model compilation failed: {e}. Continuing without compilation.")
     # No longer needed if we fetch labels within _step from df/graph ref passed here
     
     # --- Callbacks & Logger --- 
@@ -783,6 +802,7 @@ def train_advanced(
         logger=logger,
         log_every_n_steps=1000,
         val_check_interval=1000,# Log less frequently
+        accumulate_grad_batches=4,  # Effective batch size = batch_size * 4
         # gradient_clip_val=1 # Optional
     )
 
