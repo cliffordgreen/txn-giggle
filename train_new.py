@@ -4,6 +4,8 @@ import argparse
 # Set environment variables for CUDA debugging and memory optimization
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Enable synchronous CUDA for better error reporting
 os.environ['TORCH_USE_CUDA_DSA'] = '1'    # Enable device-side assertions for debugging
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'  # Reduce memory fragmentation
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable tokenizer parallelism to avoid fork warnings
 import pandas as pd
 import pyarrow.dataset as ds # Added for reading arrow datasets
 import json # Added for parsing JSON strings

@@ -39,6 +39,11 @@ class FinBERTEmbedder(nn.Module):
             print("Freezing FinBERT parameters.")
             for param in self.model.parameters():
                 param.requires_grad = False
+        else:
+            # Enable gradient checkpointing to save memory during fine-tuning
+            if hasattr(self.model, 'gradient_checkpointing_enable'):
+                self.model.gradient_checkpointing_enable()
+                print("Enabled gradient checkpointing for FinBERT to reduce memory usage.")
                 
         # Optional output projection
         self.projection = None
@@ -70,11 +75,20 @@ class FinBERTEmbedder(nn.Module):
         inputs = self.tokenizer(processed_text_batch, padding=True, truncation=True,
                                 return_tensors="pt", max_length=512).to(device)
 
-        # Pass inputs through the model
+        # Pass inputs through the model with memory optimization
         forward_context = torch.no_grad() if (not self.finetune and not self.training) else torch.enable_grad()
         
-        with forward_context:
-            outputs = self.model(**inputs)
+        try:
+            with forward_context:
+                outputs = self.model(**inputs)
+        except torch.cuda.OutOfMemoryError:
+            # Clear cache and try with reduced batch if OOM
+            torch.cuda.empty_cache()
+            print(f"[WARN] FinBERT OOM, cleared CUDA cache. Batch size: {len(text_batch)}")
+            
+            # Try again after clearing cache
+            with forward_context:
+                outputs = self.model(**inputs)
 
         last_hidden_state = outputs.last_hidden_state
 
@@ -89,6 +103,11 @@ class FinBERTEmbedder(nn.Module):
         
         if self.projection:
              embedding = self.projection(embedding)
+
+        # Clean up intermediate tensors to free memory
+        del outputs, last_hidden_state, inputs
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         return embedding
 
