@@ -226,11 +226,28 @@ class AdvancedTransactionCategorizationModel(pl.LightningModule):
         # --- 4. User Embedding --- 
         if self.user_embedding and user_ids is not None:
             try:
-                user_embed = self.user_embedding(user_ids.to(self.device))
+                user_ids_device = user_ids.to(self.device)
+                
+                # Validate user IDs are within bounds
+                max_user_id = self.user_embedding.num_embeddings - 1
+                min_user_id = user_ids_device.min().item()
+                max_user_id_batch = user_ids_device.max().item()
+                
+                if min_user_id < 0 or max_user_id_batch > max_user_id:
+                    raise ValueError(f"User ID out of bounds: batch range [{min_user_id}, {max_user_id_batch}] "
+                                   f"exceeds embedding range [0, {max_user_id}]. "
+                                   f"This indicates a data preprocessing error in user ID mapping.")
+                
+                user_embed = self.user_embedding(user_ids_device)
                 if user_embed is not None:
                     embeddings_to_fuse['user'] = user_embed.to(self.device)
             except Exception as e:
                 print(f"[ERROR] User Embedding forward failed: {e}")
+                if user_ids is not None:
+                    print(f"[DEBUG] user_ids shape: {user_ids.shape}")
+                    print(f"[DEBUG] user_ids range: [{user_ids.min().item()}, {user_ids.max().item()}]")
+                print(f"[DEBUG] embedding num_embeddings: {self.user_embedding.num_embeddings}")
+                # Don't add to embeddings_to_fuse if failed
                 
         # Check shapes and device consistency before fusion
         ref_batch_size = None

@@ -244,10 +244,23 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             self.category_id_map = {code: unique_val for code, unique_val in enumerate(uniques)}
             self.num_global_classes = len(uniques)
             
-            user_codes, user_uniques = pd.factorize(self.transactions_df['company_name'], sort=True)
-            self.transactions_df['user_id_code'] = user_codes 
-            self.user_map = {code: uid for code, uid in enumerate(user_uniques)}
-            self.num_users = len(user_uniques)
+            if self.use_precomputed_scalers and 'user_map' in self.original_stats:
+                # Use pre-computed user mapping (format: {user_name: user_id})
+                self.user_map = self.original_stats['user_map']
+                self.num_users = len(self.user_map)
+                # Apply the mapping to create user_id_code column
+                self.transactions_df['user_id_code'] = self.transactions_df['company_name'].map(self.user_map)
+                # Handle any unmapped users (shouldn't happen in streaming if stats are correct)
+                unmapped_mask = self.transactions_df['user_id_code'].isna()
+                if unmapped_mask.any():
+                    print(f"[WARN] Found {unmapped_mask.sum()} unmapped users in streaming data")
+                    self.transactions_df.loc[unmapped_mask, 'user_id_code'] = 0  # Map to first user as fallback
+            else:
+                # Create new user mapping (format: {user_name: user_id})
+                user_codes, user_uniques = pd.factorize(self.transactions_df['company_name'], sort=True)
+                self.transactions_df['user_id_code'] = user_codes 
+                self.user_map = {uid: code for code, uid in enumerate(user_uniques)}  # {user_name: user_id}
+                self.num_users = len(user_uniques)
         
         print(f"Final Counts: Global Classes={self.num_global_classes}, Users={self.num_users}")
         print(f"DataFrame pre-processing finished in {time.time() - start_time:.2f}s")
