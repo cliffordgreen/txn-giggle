@@ -560,6 +560,9 @@ def train_advanced_streaming(
     if hasattr(torch, 'compile'):
         print("[INFO] Compiling model with torch.compile for faster training...")
         try:
+            # Set fallback for compatibility with PyTorch Geometric
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
             model = torch.compile(model, mode='default')
             print("[INFO] Model compilation successful")
         except Exception as e:
@@ -768,6 +771,9 @@ def train_advanced(
     if hasattr(torch, 'compile'):
         print("[INFO] Compiling model with torch.compile for faster training...")
         try:
+            # Set fallback for compatibility with PyTorch Geometric
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
             model = torch.compile(model, mode='default')
             print("[INFO] Model compilation successful")
         except Exception as e:
