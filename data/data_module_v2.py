@@ -38,6 +38,78 @@ class SingleBatchIterable:
     def __len__(self):
         return 1
 
+# --- TextInjectingDataLoader Class ---
+class TextInjectingDataLoader:
+    """Wrapper around HGTLoader that injects text data into each batch."""
+    
+    def __init__(self, hgt_loader: HGTLoader, transaction_raw_text: List[str], use_text_encoder: bool):
+        self.hgt_loader = hgt_loader
+        self.transaction_raw_text = transaction_raw_text
+        self.use_text_encoder = use_text_encoder
+        
+    def __iter__(self):
+        for batch in self.hgt_loader:
+            if self.use_text_encoder and 'transaction' in batch.node_types:
+                self._inject_text_data(batch)
+            yield batch
+    
+    def _inject_text_data(self, batch):
+        """Inject text data into the batch based on transaction indices."""
+        try:
+            # Get the transaction node store
+            tx_store = batch['transaction']
+            
+            # Method 1: Try to use input_id (seed nodes for the batch)
+            batch_indices = None
+            if hasattr(tx_store, 'input_id'):
+                try:
+                    batch_indices = tx_store.input_id.cpu().numpy()
+                except Exception:
+                    pass
+            
+            # Method 2: Try to use batch_size + original_index
+            if batch_indices is None and hasattr(tx_store, 'batch_size') and hasattr(tx_store, 'original_index'):
+                try:
+                    batch_size = tx_store.batch_size
+                    if batch_size is not None and batch_size > 0 and tx_store.original_index.shape[0] >= batch_size:
+                        batch_indices = tx_store.original_index[:batch_size].cpu().numpy()
+                except Exception:
+                    pass
+            
+            # Method 3: Try to use all original_index if we can't determine batch_size
+            if batch_indices is None and hasattr(tx_store, 'original_index'):
+                try:
+                    # This might include neighbor nodes too, but we'll limit by available data
+                    batch_indices = tx_store.original_index.cpu().numpy()
+                except Exception:
+                    pass
+            
+            # Inject text data if we have valid indices
+            if batch_indices is not None:
+                # Ensure indices are within bounds and get corresponding text
+                valid_indices = [idx for idx in batch_indices if 0 <= idx < len(self.transaction_raw_text)]
+                batch_text = [self.transaction_raw_text[idx] for idx in valid_indices]
+                
+                # Add text data to the transaction store
+                tx_store._raw_text = batch_text
+                
+                # Debug info
+                if len(batch_text) != len(batch_indices):
+                    print(f"[INFO] Text injection: {len(batch_text)} texts for {len(batch_indices)} indices "
+                          f"(some indices out of bounds)")
+            else:
+                print(f"[WARN] Could not determine batch indices for text injection")
+                tx_store._raw_text = []
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to inject text data into batch: {e}")
+            # Ensure _raw_text exists even if empty
+            if 'transaction' in batch.node_types:
+                batch['transaction']._raw_text = []
+    
+    def __len__(self):
+        return len(self.hgt_loader)
+
 # --- V2 DataModule with HGTLoader --- 
 class TransactionDataModuleV2(pl.LightningDataModule):
     """
@@ -754,9 +826,11 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         category_map = {cat_id: i for i, cat_id in enumerate(valid_categories)}
         num_categories = len(category_map)
 
-        data['transaction'].num_nodes = num_transactions
-        if num_merchants > 0: data['merchant'].num_nodes = num_merchants
-        if num_categories > 0: data['category'].num_nodes = num_categories
+        # Store node counts as class attributes instead of directly in graph data
+        # to avoid PyTorch Geometric trying to move integers to device
+        self._num_transaction_nodes = num_transactions
+        self._num_merchant_nodes = num_merchants if num_merchants > 0 else 0
+        self._num_category_nodes = num_categories if num_categories > 0 else 0
         
         print(f"  Graph node counts: transaction={num_transactions}, merchant={num_merchants}, category={num_categories}")
 
@@ -801,7 +875,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # Extract text features using refactored method
         raw_text_combined = self._extract_text_features(df)
         
-        data['transaction']._raw_text = raw_text_combined
+        # Store raw text as class attribute to avoid device transfer issues
+        self._transaction_raw_text = raw_text_combined
         if self.use_text_encoder: print(f"  Combined raw text features created (COA included: {self.use_coa_text_features and 'chart_of_accounts_processed' in df.columns}).")
 
         print("  Creating edges and edge features...")
@@ -967,7 +1042,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         self.full_graph_data = HeteroData()
         df = self.transactions_df
         num_transactions = len(df) # Renamed from num_nodes for clarity
-        self.full_graph_data['transaction'].num_nodes = num_transactions
+        # Store node count as class attribute to avoid device transfer issues
+        self._num_transaction_nodes = num_transactions
         self.full_graph_data['transaction'].original_index = torch.tensor(df.index.values, dtype=torch.long)
         # Use the factorized integer 'category_id' for labels
         self.full_graph_data['transaction'].y_global = torch.tensor(df['category_id'].values, dtype=torch.long)
@@ -977,7 +1053,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # Extract text features using refactored method
         raw_text_combined = self._extract_text_features(df)
         
-        self.full_graph_data['transaction']._raw_text = raw_text_combined
+        # Store raw text as class attribute to avoid device transfer issues  
+        self._transaction_raw_text = raw_text_combined
         print("Built minimal graph data.")
 
     def _prepare_and_add_sequences(self, train_indices: torch.Tensor):
@@ -1179,7 +1256,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         self.full_graph_data['transaction'].test_mask = test_mask
         
     # --- Dataloader Methods using HGTLoader --- 
-    def train_dataloader(self) -> HGTLoader:
+    def train_dataloader(self) -> DataLoader:
         print("Creating train HGTLoader...")
         if self.train_indices is None: self.setup('fit')
         if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
@@ -1197,11 +1274,14 @@ class TransactionDataModuleV2(pl.LightningDataModule):
 
         # Move graph data to CPU before passing to loader if it's not already
         graph_data_cpu = self.full_graph_data.cpu()
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=True,
-                         input_nodes=('transaction', self.train_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        hgt_loader = HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=True,
+                               input_nodes=('transaction', self.train_indices.cpu()), batch_size=self.batch_size,
+                               num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        
+        # Wrap the HGTLoader to inject text data
+        return TextInjectingDataLoader(hgt_loader, self._transaction_raw_text, self.use_text_encoder)
 
-    def val_dataloader(self) -> HGTLoader:
+    def val_dataloader(self) -> DataLoader:
         print("Creating val HGTLoader...")
         if self.val_indices is None: self.setup('fit')
         if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
@@ -1215,11 +1295,14 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             else:
                  raise ValueError("No valid node types for HGT sampling found.")
         graph_data_cpu = self.full_graph_data.cpu()
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
-                         input_nodes=('transaction', self.val_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        hgt_loader = HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
+                               input_nodes=('transaction', self.val_indices.cpu()), batch_size=self.batch_size,
+                               num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        
+        # Wrap the HGTLoader to inject text data
+        return TextInjectingDataLoader(hgt_loader, self._transaction_raw_text, self.use_text_encoder)
 
-    def test_dataloader(self) -> HGTLoader:
+    def test_dataloader(self) -> DataLoader:
         print("Creating test HGTLoader...")
         if self.test_indices is None: self.setup('test')
         if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
@@ -1233,12 +1316,15 @@ class TransactionDataModuleV2(pl.LightningDataModule):
             else:
                  raise ValueError("No valid node types for HGT sampling found.")
         graph_data_cpu = self.full_graph_data.cpu()
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
-                         input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        hgt_loader = HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
+                               input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
+                               num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        
+        # Wrap the HGTLoader to inject text data
+        return TextInjectingDataLoader(hgt_loader, self._transaction_raw_text, self.use_text_encoder)
 
     # Add predict_dataloader
-    def predict_dataloader(self) -> HGTLoader:
+    def predict_dataloader(self) -> DataLoader:
         print("Creating predict HGTLoader...")
         if self.test_indices is None: self.setup('predict') # Ensure setup is called
         if self.full_graph_data is None: raise RuntimeError("Graph data not available.")
@@ -1258,8 +1344,11 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                  
         graph_data_cpu = self.full_graph_data.cpu()
         # Input nodes should be the test_indices, which contain all nodes for predict stage
-        return HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
-                         input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
-                         num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        hgt_loader = HGTLoader(graph_data_cpu, num_samples=valid_hgt_num_samples, shuffle=False,
+                               input_nodes=('transaction', self.test_indices.cpu()), batch_size=self.batch_size,
+                               num_workers=self.num_workers, persistent_workers=(self.num_workers > 0))
+        
+        # Wrap the HGTLoader to inject text data
+        return TextInjectingDataLoader(hgt_loader, self._transaction_raw_text, self.use_text_encoder)
 
 

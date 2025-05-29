@@ -1,5 +1,9 @@
 import os
 import argparse
+
+# Set environment variables for CUDA debugging and memory optimization
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Enable synchronous CUDA for better error reporting
+os.environ['TORCH_USE_CUDA_DSA'] = '1'    # Enable device-side assertions for debugging
 import pandas as pd
 import pyarrow.dataset as ds # Added for reading arrow datasets
 import json # Added for parsing JSON strings
@@ -557,16 +561,8 @@ def train_advanced_streaming(
         transactions_df_ref=df
     )
     
-    # Compile model for faster training (PyTorch 2.0+)
-    if hasattr(torch, 'compile'):
-        print("[INFO] Compiling model with torch.compile for faster training...")
-        try:
-            # Set fallback for compatibility with PyTorch Geometric
-            torch._dynamo.config.suppress_errors = True
-            model = torch.compile(model, mode='default')
-            print("[INFO] Model compilation successful")
-        except Exception as e:
-            print(f"[WARN] Model compilation failed: {e}. Continuing without compilation.")
+    # Disable torch.compile due to CUDA compatibility issues with PyTorch Geometric
+    print("[INFO] Skipping torch.compile due to CUDA compatibility issues with PyTorch Geometric")
     
     # Training setup (same as before)
     callbacks = [
@@ -601,8 +597,27 @@ def train_advanced_streaming(
     print("Starting Training...")
     try:
         trainer.fit(model, datamodule=data_module)
+    except RuntimeError as e:
+        if "CUDA error" in str(e):
+            print(f"!!! CUDA ERROR during training: {e}")
+            print("This may be due to:")
+            print("1. Out of GPU memory - try reducing batch_size")
+            print("2. Invalid CUDA operations - check data types and tensor operations")
+            print("3. Hardware/driver issues - try restarting the training process")
+            
+            # Try to clear CUDA cache
+            try:
+                torch.cuda.empty_cache()
+                print("CUDA cache cleared")
+            except:
+                pass
+        else:
+            print(f"!!! RUNTIME ERROR during training: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
     except Exception as e:
-        print(f"!!! ERROR during training: {e}")
+        print(f"!!! UNEXPECTED ERROR during training: {e}")
         import traceback
         traceback.print_exc()
         raise e
@@ -767,16 +782,8 @@ def train_advanced(
         transactions_df_ref=df
     )
     
-    # Compile model for faster training (PyTorch 2.0+)
-    if hasattr(torch, 'compile'):
-        print("[INFO] Compiling model with torch.compile for faster training...")
-        try:
-            # Set fallback for compatibility with PyTorch Geometric
-            torch._dynamo.config.suppress_errors = True
-            model = torch.compile(model, mode='default')
-            print("[INFO] Model compilation successful")
-        except Exception as e:
-            print(f"[WARN] Model compilation failed: {e}. Continuing without compilation.")
+    # Disable torch.compile due to CUDA compatibility issues with PyTorch Geometric
+    print("[INFO] Skipping torch.compile due to CUDA compatibility issues with PyTorch Geometric")
     # No longer needed if we fetch labels within _step from df/graph ref passed here
     
     # --- Callbacks & Logger --- 
