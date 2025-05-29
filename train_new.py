@@ -10,6 +10,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_forecasting.metrics import MAE # Use MAE for TFT init placeholder
 from pytorch_lightning.loggers import TensorBoardLogger
 import torch
+import torch._dynamo  # Import for compilation compatibility
 import yaml # For loading potential YAML configs
 from typing import Optional, Dict, List, Any
 import pyarrow as pa # Added for ArrowInvalid check
@@ -561,7 +562,6 @@ def train_advanced_streaming(
         print("[INFO] Compiling model with torch.compile for faster training...")
         try:
             # Set fallback for compatibility with PyTorch Geometric
-            import torch._dynamo
             torch._dynamo.config.suppress_errors = True
             model = torch.compile(model, mode='default')
             print("[INFO] Model compilation successful")
@@ -772,7 +772,6 @@ def train_advanced(
         print("[INFO] Compiling model with torch.compile for faster training...")
         try:
             # Set fallback for compatibility with PyTorch Geometric
-            import torch._dynamo
             torch._dynamo.config.suppress_errors = True
             model = torch.compile(model, mode='default')
             print("[INFO] Model compilation successful")
