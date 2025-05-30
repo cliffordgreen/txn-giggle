@@ -227,6 +227,7 @@ def load_data_with_scalers(data_dir: str, stats: Dict[str, Any], max_transaction
                 df_chunk = table.to_pandas()
             
             # Process chunk using existing logic but with pre-computed mappings
+            # This df_processed will have user_id_code based on stats['user_map'] which might be incomplete
             df_processed = process_chunk_with_mappings(df_chunk, stats)
             
             # Limit chunk size if needed
@@ -248,18 +249,18 @@ def load_data_with_scalers(data_dir: str, stats: Dict[str, Any], max_transaction
     if not processed_chunks:
         raise ValueError("No valid data chunks were loaded")
     
-    final_df = pd.concat(processed_chunks, ignore_index=True)
+    df = pd.concat(processed_chunks, ignore_index=True) # Renamed from final_df to df
     
     # Ensure clean index for graph building
-    final_df.reset_index(drop=True, inplace=True)
+    df.reset_index(drop=True, inplace=True)
     
     # Verify index is continuous
-    if not final_df.index.equals(pd.RangeIndex(len(final_df))):
+    if not df.index.equals(pd.RangeIndex(len(df))):
         print(f"[WARN] Index discontinuity in streaming, forcing reset...")
-        final_df.index = pd.RangeIndex(len(final_df))
+        df.index = pd.RangeIndex(len(df))
     
-    print(f"Final dataset: {len(final_df):,} transactions")
-    return final_df
+    print(f"Final dataset: {len(df):,} transactions")
+    return df # Return df instead of final_df
 
 def process_chunk_with_mappings(df_chunk: pd.DataFrame, stats: Dict[str, Any]) -> pd.DataFrame:
     """Process a data chunk using pre-computed category and user mappings."""
@@ -471,24 +472,41 @@ def train_advanced_streaming(
     stats = collect_statistics_pass(data_dir, max_files_for_stats)
     
     # === PASS 2: Load Data Subset ===
+    # df now contains data, user_id_code might have -1s from incomplete stats['user_map']
     df = load_data_with_scalers(data_dir, stats, max_transactions)
     
-    # DEBUG: Check DataFrame index integrity
-    print(f"[DEBUG] df.index range: {df.index.min()} to {df.index.max()}, len={len(df)}")
-    print(f"[DEBUG] df.index is continuous: {df.index.equals(pd.RangeIndex(len(df)))}")
-    print(f"[DEBUG] df.index dtype: {df.index.dtype}")
-    if not df.index.equals(pd.RangeIndex(len(df))):
-        print(f"[DEBUG] Index discontinuity detected! Expected 0-{len(df)-1}, but got min={df.index.min()}, max={df.index.max()}")
-        print(f"[DEBUG] First 10 index values: {df.index[:10].tolist()}")
-        print(f"[DEBUG] Last 10 index values: {df.index[-10:].tolist()}")
+    # === Regenerate user_map and user_id_code from the loaded DataFrame ===
+    print("Regenerating user_map and user_id_code from the fully loaded training DataFrame...")
+    # Ensure 'company_name' exists, fill NaNs if necessary before factorizing
+    if 'company_name' not in df.columns:
+        raise ValueError("Critical error: 'company_name' column is missing from the loaded DataFrame.")
+    df['company_name'] = df['company_name'].fillna('UNKNOWN_COMPANY_IN_REGEN').astype(str)
     
+    final_user_codes, final_user_uniques = pd.factorize(df['company_name'], sort=True)
+    df['user_id_code'] = final_user_codes # Overwrite potentially incomplete user_id_code
+    final_user_map = {user_name: code for code, user_name in enumerate(final_user_uniques)}
+    
+    # Update num_users based on the comprehensive map from the fully loaded df
+    num_users = len(final_user_map) 
+    print(f"Regenerated user map with {num_users} unique users from the loaded data.")
+
+    # DEBUGGING: Check for -1 user_id_codes AFTER regeneration
+    if 'user_id_code' in df.columns and (df['user_id_code'] < 0).any(): # Check for any negative IDs
+        # This should ideally not happen if factorize assigns 0-N
+        print(f"[!!!! CRITICAL DEBUG !!!!] Found {(df['user_id_code'] < 0).sum()} transactions with negative user_id_code AFTER REGENERATION.")
+        print(f"Problematic user_id_codes: {df.loc[df['user_id_code'] < 0, 'user_id_code'].unique()}")
+    else:
+        print("[!!!! DEBUG !!!!] No negative user_id_code found in DataFrame 'df' AFTER REGENERATION.")
+        
     # === Continue with existing training logic ===
+    # num_global_classes is from stats, which is fine as categories are usually fixed
     num_global_classes = len(stats['category_map'])
     num_user_classes = 0 # Global-only prediction
-    num_users = len(stats['user_map'])
+    # num_users is now correctly updated above from the final_user_map
+
     print(f"Dataset stats: #Global={num_global_classes}, #Users={num_users}, #Transactions={len(df):,}")
 
-    # DEBUGGING: Check for -1 user_id_codes
+    # DEBUGGING: Check for -1 user_id_codes (this check is now after regeneration)
     if 'user_id_code' in df.columns and (df['user_id_code'] == -1).any():
         print(f"[!!!! DEBUG !!!!] Found {(df['user_id_code'] == -1).sum()} transactions with user_id_code == -1 in the DataFrame 'df'.")
         problematic_companies = df.loc[df['user_id_code'] == -1, 'company_name'].unique()
@@ -528,7 +546,7 @@ def train_advanced_streaming(
         # Pass pre-computed scalers
         fitted_scalers=stats['scalers'],
         fitted_category_id_map=stats['category_map'],
-        fitted_user_map=stats['user_map']
+        fitted_user_map=final_user_map # Use the REGENERATED complete user map
     )
     
     print("Setting up DataModuleV2...")
@@ -538,7 +556,7 @@ def train_advanced_streaming(
     # Update model config with dynamic values
     model_config['graph_encoder_params']['in_channels'] = data_module.node_feature_dims
     model_config['graph_encoder_params']['metadata'] = data_module.full_graph_data.metadata() 
-    model_config['num_users'] = num_users
+    model_config['num_users'] = num_users # num_users is now from the regenerated final_user_map
     model_config['num_global_classes'] = num_global_classes
     model_config['num_user_classes'] = num_user_classes
     
