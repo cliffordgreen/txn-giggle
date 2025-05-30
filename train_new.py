@@ -477,36 +477,53 @@ def train_advanced_streaming(
     
     # === Regenerate user_map and user_id_code from the loaded DataFrame ===
     print("Regenerating user_map and user_id_code from the fully loaded training DataFrame...")
-    # Ensure 'company_name' exists, fill NaNs if necessary before factorizing
     if 'company_name' not in df.columns:
         raise ValueError("Critical error: 'company_name' column is missing from the loaded DataFrame.")
     df['company_name'] = df['company_name'].fillna('UNKNOWN_COMPANY_IN_REGEN').astype(str)
     
     final_user_codes, final_user_uniques = pd.factorize(df['company_name'], sort=True)
-    df['user_id_code'] = final_user_codes # Overwrite potentially incomplete user_id_code
-    final_user_map = {user_name: code for code, user_name in enumerate(final_user_uniques)}
+    df['user_id_code'] = final_user_codes 
+    final_user_map = {user_name: code for code, user_name in enumerate(final_user_uniques)} # {name: code}
     
-    # Update num_users based on the comprehensive map from the fully loaded df
     num_users = len(final_user_map) 
     print(f"Regenerated user map with {num_users} unique users from the loaded data.")
 
-    # DEBUGGING: Check for -1 user_id_codes AFTER regeneration
-    if 'user_id_code' in df.columns and (df['user_id_code'] < 0).any(): # Check for any negative IDs
-        # This should ideally not happen if factorize assigns 0-N
+    if 'user_id_code' in df.columns and (df['user_id_code'] < 0).any():
         print(f"[!!!! CRITICAL DEBUG !!!!] Found {(df['user_id_code'] < 0).sum()} transactions with negative user_id_code AFTER REGENERATION.")
         print(f"Problematic user_id_codes: {df.loc[df['user_id_code'] < 0, 'user_id_code'].unique()}")
     else:
         print("[!!!! DEBUG !!!!] No negative user_id_code found in DataFrame 'df' AFTER REGENERATION.")
         
+    # === Regenerate category_map and category_id from the loaded DataFrame ===
+    print("Regenerating category_map and category_id from the fully loaded training DataFrame...")
+    target_col = 'txn_accepted_category_id_str' 
+    if target_col not in df.columns:
+        raise ValueError(f"Critical error: Target category column '{target_col}' is missing from the loaded DataFrame.")
+    df[target_col] = df[target_col].fillna('UNKNOWN_CATEGORY_IN_REGEN').astype(str)
+
+    final_category_codes, final_category_uniques = pd.factorize(df[target_col], sort=True)
+    df['category_id'] = final_category_codes # Overwrite with 0 to N-1 codes
+
+    # Create the map {code: name_str} to be passed as fitted_category_id_map, as expected by DataModuleV2's inversion.
+    final_fitted_category_map = {code: name_str for code, name_str in enumerate(final_category_uniques)}
+    
+    num_global_classes = len(final_fitted_category_map) 
+    print(f"Regenerated category map with {num_global_classes} unique global classes from the loaded data.")
+
+    if 'category_id' in df.columns and (df['category_id'] < 0).any(): 
+        print(f"[!!!! CRITICAL DEBUG !!!!] Found {(df['category_id'] < 0).sum()} transactions with negative category_id AFTER REGENERATION.")
+        print(f"Problematic category_ids: {df.loc[df['category_id'] < 0, 'category_id'].unique()}")
+    else:
+        print("[!!!! DEBUG !!!!] No negative category_id found in DataFrame 'df' AFTER REGENERATION.")
+
     # === Continue with existing training logic ===
-    # num_global_classes is from stats, which is fine as categories are usually fixed
-    num_global_classes = len(stats['category_map'])
-    num_user_classes = 0 # Global-only prediction
-    # num_users is now correctly updated above from the final_user_map
+    # num_global_classes is now from the regenerated map
+    num_user_classes = 0 
+    # num_users is already updated from final_user_map
 
     print(f"Dataset stats: #Global={num_global_classes}, #Users={num_users}, #Transactions={len(df):,}")
 
-    # DEBUGGING: Check for -1 user_id_codes (this check is now after regeneration)
+    # DEBUGGING for user_id_code (already present, now after regen)
     if 'user_id_code' in df.columns and (df['user_id_code'] == -1).any():
         print(f"[!!!! DEBUG !!!!] Found {(df['user_id_code'] == -1).sum()} transactions with user_id_code == -1 in the DataFrame 'df'.")
         problematic_companies = df.loc[df['user_id_code'] == -1, 'company_name'].unique()
@@ -543,10 +560,9 @@ def train_advanced_streaming(
         use_gnn_encoder=use_graph,
         use_text_encoder=use_text,
         use_coa_text_features=use_coa_text,
-        # Pass pre-computed scalers
         fitted_scalers=stats['scalers'],
-        fitted_category_id_map=stats['category_map'],
-        fitted_user_map=final_user_map # Use the REGENERATED complete user map
+        fitted_category_id_map=final_fitted_category_map, # Use the REGENERATED {code: name} category map
+        fitted_user_map=final_user_map 
     )
     
     print("Setting up DataModuleV2...")
@@ -556,8 +572,8 @@ def train_advanced_streaming(
     # Update model config with dynamic values
     model_config['graph_encoder_params']['in_channels'] = data_module.node_feature_dims
     model_config['graph_encoder_params']['metadata'] = data_module.full_graph_data.metadata() 
-    model_config['num_users'] = num_users # num_users is now from the regenerated final_user_map
-    model_config['num_global_classes'] = num_global_classes
+    model_config['num_users'] = num_users 
+    model_config['num_global_classes'] = num_global_classes # num_global_classes is now from the regenerated map
     model_config['num_user_classes'] = num_user_classes
     
     # Update fusion dims
