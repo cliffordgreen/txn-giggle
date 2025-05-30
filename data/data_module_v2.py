@@ -362,12 +362,14 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         df = self.transactions_df
         raw_features_dict = {}
         print("Calculating raw transaction features (vectorized)...")
-        # Features: amount (scaled), num_chart_of_accounts (log-normalized), COA features (scaled), time features (not scaled)
+        # Features: amount (scaled), num_chart_of_accounts (log-normalized), COA features (scaled), similar txn features (scaled), time features (not scaled)
         self.tx_feat_cols_to_scale = ['amount']  # Continuous features
         self.tx_feat_cols_to_normalize = ['num_chart_of_accounts']  # Count features (log transform)
         self.tx_feat_cols_coa_scale = ['coa_size', 'hierarchy_depth', 'type_diversity', 
                                        'code_complexity', 'naming_consistency', 
                                        'description_richness', 'balance_diversity', 'recent_accounts']  # COA features
+        self.tx_feat_cols_similar_scale = ['num_similar_txns', 'avg_similarity', 'max_similarity', 'similarity_std',
+                                          'category_diversity', 'avg_similar_amount', 'unique_categories', 'top_similarity']  # Similar txn features  
         self.tx_feat_cols_no_scale = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos']
         
         # Ensure required columns exist
@@ -392,8 +394,12 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         coa_features = self._extract_transaction_coa_features(df)
         print(f"  COA features extracted. Shape: {coa_features.shape}")
         
-        # Stack: continuous (to scale), log-normalized counts (to scale), COA features (to scale), cyclical (no scale)
-        tx_features_array = np.column_stack([amount, num_coa_log, coa_features, hour_sin, hour_cos, day_sin, day_cos])
+        # Extract similar transaction features
+        similar_txn_features = self._extract_similar_txn_features(df)
+        print(f"  Similar transaction features extracted. Shape: {similar_txn_features.shape}")
+        
+        # Stack: continuous (to scale), log-normalized counts (to scale), COA features (to scale), similar txn features (to scale), cyclical (no scale)
+        tx_features_array = np.column_stack([amount, num_coa_log, coa_features, similar_txn_features, hour_sin, hour_cos, day_sin, day_cos])
         raw_features_dict['transaction'] = tx_features_array.astype(np.float64)
         print(f"  Raw transaction features calculated. Shape: {raw_features_dict['transaction'].shape}")
         
@@ -670,6 +676,67 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         
         return recent_indicators / total_accounts
 
+    def _extract_similar_txn_features(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract aggregated features from similar transactions data."""
+        features = []
+        
+        # Check if similar_txns_processed column exists
+        if 'similar_txns_processed' not in df.columns:
+            print("  [INFO] similar_txns_processed column not found, using zero features for all transactions")
+            return np.zeros((len(df), 8), dtype=np.float32)
+        
+        for similar_txns_str in df['similar_txns_processed']:
+            if pd.isna(similar_txns_str) or similar_txns_str == '[]':
+                # No similar transactions - use zero features
+                features.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                continue
+                
+            try:
+                similar_txns = json.loads(similar_txns_str)
+                if not similar_txns:
+                    features.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    continue
+                
+                # Extract similarity scores and categories
+                similarities = [txn.get('similarity', 0.0) for txn in similar_txns]
+                categories = [txn.get('category_id') for txn in similar_txns if txn.get('category_id') is not None]
+                amounts = [txn.get('amount', 0.0) for txn in similar_txns]
+                
+                # Feature 1: Number of similar transactions
+                num_similar = len(similar_txns)
+                
+                # Feature 2: Average similarity score
+                avg_similarity = np.mean(similarities) if similarities else 0.0
+                
+                # Feature 3: Maximum similarity score
+                max_similarity = max(similarities) if similarities else 0.0
+                
+                # Feature 4: Similarity score standard deviation
+                similarity_std = np.std(similarities) if len(similarities) > 1 else 0.0
+                
+                # Feature 5: Category diversity (number of unique categories)
+                unique_categories = len(set(categories)) if categories else 0
+                
+                # Feature 6: Average amount of similar transactions
+                avg_similar_amount = np.mean(amounts) if amounts else 0.0
+                
+                # Feature 7: Category diversity ratio (unique/total)
+                category_diversity = unique_categories / num_similar if num_similar > 0 else 0.0
+                
+                # Feature 8: Top similarity (95th percentile or max if < 20 samples)
+                top_similarity = np.percentile(similarities, 95) if len(similarities) >= 20 else max_similarity
+                
+                features.append([
+                    num_similar, avg_similarity, max_similarity, similarity_std,
+                    category_diversity, avg_similar_amount, unique_categories, top_similarity
+                ])
+                
+            except (json.JSONDecodeError, KeyError, ValueError):
+                # Malformed data - use zero features
+                features.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        
+        return np.array(features, dtype=np.float32)
+
     def _extract_text_features(self, df: pd.DataFrame) -> List[str]:
         """Extract and combine text features including COA text (DRY principle)."""
         text_cols = ['description', 'memo', 'merchant_name']
@@ -725,7 +792,8 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                 if node_type == 'transaction':
                     num_cols_to_scale = (len(self.tx_feat_cols_to_scale) + 
                                         len(self.tx_feat_cols_to_normalize) + 
-                                        len(self.tx_feat_cols_coa_scale))  # amount + num_coa_log + COA features
+                                        len(self.tx_feat_cols_coa_scale) + 
+                                        len(self.tx_feat_cols_similar_scale))  # amount + num_coa_log + COA features + similar txn features
                     if features.shape[1] >= num_cols_to_scale and num_cols_to_scale > 0:
                         scaler = StandardScaler()
                         # Ensure train_indices_np are valid indices for features array
@@ -734,7 +802,7 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                              # Fit on both continuous and log-normalized features
                              scaler.fit(features[valid_train_indices, :num_cols_to_scale])
                              self.scalers[node_type] = scaler
-                             print(f"  Fitted scaler for 'transaction' features ({self.tx_feat_cols_to_scale + self.tx_feat_cols_to_normalize + self.tx_feat_cols_coa_scale}) using {len(valid_train_indices)} training samples.")
+                             print(f"  Fitted scaler for 'transaction' features ({self.tx_feat_cols_to_scale + self.tx_feat_cols_to_normalize + self.tx_feat_cols_coa_scale + self.tx_feat_cols_similar_scale}) using {len(valid_train_indices)} training samples.")
                         else:
                              print(f"  [WARN] No valid training indices found for fitting 'transaction' scaler.")
                              self.scalers[node_type] = None # Indicate scaler couldn't be fitted
@@ -856,12 +924,13 @@ class TransactionDataModuleV2(pl.LightningDataModule):
                     if node_type == 'transaction':
                         num_cols_to_scale = (len(self.tx_feat_cols_to_scale) + 
                                             len(self.tx_feat_cols_to_normalize) + 
-                                            len(self.tx_feat_cols_coa_scale))
+                                            len(self.tx_feat_cols_coa_scale) + 
+                                            len(self.tx_feat_cols_similar_scale))
                         # Apply scaler fitted on training data TO ALL transaction nodes
                         scaled_part = (raw_feat_array[:, :num_cols_to_scale] - scaler.mean_) / (np.maximum(scaler.scale_, 1e-8))
                         non_scaled_part = raw_feat_array[:, num_cols_to_scale:]
                         final_features = np.concatenate([scaled_part, non_scaled_part], axis=1)
-                        print(f"    Applied TRAIN-fitted scaler to ALL 'transaction' nodes ({self.tx_feat_cols_to_scale + self.tx_feat_cols_to_normalize + self.tx_feat_cols_coa_scale}).")
+                        print(f"    Applied TRAIN-fitted scaler to ALL 'transaction' nodes ({self.tx_feat_cols_to_scale + self.tx_feat_cols_to_normalize + self.tx_feat_cols_coa_scale + self.tx_feat_cols_similar_scale}).")
                     elif node_type == 'merchant': # Apply globally fitted scaler to merchant nodes
                         final_features = (raw_feat_array - scaler.mean_) / (np.maximum(scaler.scale_, 1e-8))
                         print(f"    Applied GLOBALLY-fitted scaler to '{node_type}' nodes.")
