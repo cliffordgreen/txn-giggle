@@ -18,7 +18,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 import torch
 import torch._dynamo  # Import for compilation compatibility
 import yaml # For loading potential YAML configs
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 import pyarrow as pa # Added for ArrowInvalid check
 import pyarrow.ipc as ipc # Use ipc explicitly for stream reading
 import numpy as np # Added
@@ -30,7 +30,7 @@ from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable
 from models.advanced_transaction_classifier import AdvancedTransactionCategorizationModel
 
 # Helper functions for two-pass loading
-def collect_statistics_pass(data_dir: str, max_files_for_stats: Optional[int] = None) -> Dict[str, Any]:
+def collect_statistics_pass(data_dir: str, max_files_for_stats: Optional[int] = None, add_unknowns: bool = False) -> Dict[str, Any]:
     """Pass 1: Collect statistics needed for scaling without loading full data."""
     print(f"=== PASS 1: Collecting Statistics from {data_dir} ===")
     
@@ -114,20 +114,32 @@ def collect_statistics_pass(data_dir: str, max_files_for_stats: Optional[int] = 
                     stats['total_transactions_seen'] += 1
                     
                 except Exception as e:
+                    # print(f"[DEBUG] Skipping row due to error: {e}") # Optional debug
                     continue  # Skip problematic rows
                     
         except Exception as e:
-            print(f"[WARN] Failed to process file {os.path.basename(file_path)}: {e}")
+            print(f"[WARN] Failed to process file {os.path.basename(file_path)} for stats: {e}")
             continue
     
     print(f"Statistics collected from {stats['total_transactions_seen']:,} transactions")
     
+    # Add unknown tokens if requested, before creating maps
+    if add_unknowns:
+        if '<UNKNOWN_CATEGORY>' not in stats['category_counts']:
+            stats['category_counts']['<UNKNOWN_CATEGORY>'] = 1 # Add with a count of 1 to ensure it's in the map
+            print("Added <UNKNOWN_CATEGORY> to category_counts.")
+        if '<UNKNOWN_USER>' not in stats['user_counts']:
+            stats['user_counts']['<UNKNOWN_USER>'] = 1 # Add with a count of 1
+            print("Added <UNKNOWN_USER> to user_counts.")
+        print("Completed adding unknown tokens if they were missing.")
+
     # Compute scalers from statistics
     stats['scalers'] = compute_scalers_from_stats(stats)
-    stats['category_map'] = {cat: idx for idx, cat in enumerate(sorted(stats['category_counts'].keys()))}
-    stats['user_map'] = {user: idx for idx, user in enumerate(sorted(stats['user_counts'].keys()))}
+    # These maps are {name: code_int}
+    stats['category_map'] = {cat: idx for idx, cat in enumerate(sorted(stats['category_counts'].keys()))} 
+    stats['user_map'] = {user: idx for idx, user in enumerate(sorted(stats['user_counts'].keys()))}       
     
-    print(f"Found {len(stats['category_map'])} unique categories, {len(stats['user_map'])} unique users")
+    print(f"Found {len(stats['category_map'])} unique categories, {len(stats['user_map'])} unique users (including unknowns if added).")
     return stats
 
 def extract_coa_features_single(coa_json_str) -> List[float]:
@@ -318,127 +330,190 @@ def process_chunk_with_mappings(df_chunk: pd.DataFrame, stats: Dict[str, Any]) -
     
     return df_processed
 
-# Original load_data function (now deprecated)
-def load_data(data_dir: str, max_files_to_process: Optional[int] = None) -> pd.DataFrame:
-    """Loads and preprocesses data from multiple Arrow streaming files, one by one.
-    Processes up to max_files_to_process if specified.
+def process_chunk_with_global_maps(df_raw_chunk: pd.DataFrame, global_stats: Dict[str, Any]) -> pd.DataFrame:
     """
-    print(f"Loading data from directory: {data_dir}")
-    arrow_files_pattern = os.path.join(data_dir, '**/*.arrow')
-    # Sort files for deterministic behavior when using max_files_to_process
-    arrow_files = sorted(glob.glob(arrow_files_pattern, recursive=True))
+    Process a raw data chunk using pre-computed global category and user mappings.
+    Maps unknown entities to specific <UNKNOWN_...> IDs.
+    """
+    extracted_data = []
     
-    if not arrow_files:
-        if not os.path.isdir(data_dir):
-             raise FileNotFoundError(f"Data directory not found: {data_dir}")
-        raise FileNotFoundError(f"No .arrow files found in directory: {data_dir}")
+    # Get the pre-defined unknown IDs from the global maps
+    # These maps are {name: code_int}
+    unknown_user_id = global_stats['user_map'].get('<UNKNOWN_USER>')
+    unknown_category_id = global_stats['category_map'].get('<UNKNOWN_CATEGORY>')
 
-    # Limit number of files if max_files_to_process is set
-    files_to_process = arrow_files
-    if max_files_to_process is not None and max_files_to_process > 0:
-        print(f"Limiting processing to the first {max_files_to_process} files found.")
-        files_to_process = arrow_files[:max_files_to_process]
-    
-    print(f"Found {len(arrow_files)} arrow files. Processing {len(files_to_process)} file(s) file by file...")
-    
-    processed_dfs = []
-    skipped_files = []
-    
-    for file_path in tqdm(files_to_process, desc="Processing Arrow files"):
+    if unknown_user_id is None:
+        raise ValueError("'<UNKNOWN_USER>' not found in global_stats['user_map']. Ensure it was added during collect_statistics_pass.")
+    if unknown_category_id is None:
+        raise ValueError("'<UNKNOWN_CATEGORY>' not found in global_stats['category_map']. Ensure it was added during collect_statistics_pass.")
+
+    for _, row in df_raw_chunk.iterrows():
         try:
-            # 1. Read one Arrow stream file
-            with ipc.open_stream(file_path) as reader:
-                 table = reader.read_all()
-                 df_single = table.to_pandas()
+            # Extract transaction data
+            if isinstance(row['target_transaction_processed'], dict):
+                txn_dict = row['target_transaction_processed']
+            else:
+                txn_dict = json.loads(row['target_transaction_processed'])
             
-            # 2. Perform initial preprocessing on this single DataFrame
-            required_cols = ['target_transaction_processed', 'txn_accepted_category_id_str', 'company_name']
-            if not all(col in df_single.columns for col in required_cols):
-                print(f"[WARN] Skipping file {os.path.basename(file_path)} due to missing required columns.")
-                skipped_files.append(os.path.basename(file_path))
-                continue # Skip to next file
-                
-            extracted_data = []
-            for _, row in df_single.iterrows(): # Process rows within the small df
-                try:
-                    if isinstance(row['target_transaction_processed'], dict):
-                        txn_dict = row['target_transaction_processed']
-                    else:
-                        txn_dict = json.loads(row['target_transaction_processed'])
-                    
-                    extracted_data.append({
-                        'amount': float(txn_dict.get('amount', 0.0)),
-                        'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'),
-                        'description': str(txn_dict.get('description', '')),
-                        'memo': str(txn_dict.get('memo', '')),
-                        'merchant_name': str(txn_dict.get('payee', ''))
-                    })
-                except (json.JSONDecodeError, TypeError, ValueError) as e:
-                    # print(f"[WARN] Error parsing target_transaction_processed in file {os.path.basename(file_path)}, row {row.name}: {e}. Using defaults.")
-                    extracted_data.append({'amount': 0.0, 'timestamp': pd.NaT, 'description': '', 'memo': '', 'merchant_name': ''})
+            raw_category_str = str(row.get('txn_accepted_category_id_str', '<UNKNOWN_CATEGORY>'))
+            raw_company_name = str(row.get('company_name', '<UNKNOWN_USER>'))
             
-            extracted_df = pd.DataFrame(extracted_data, index=df_single.index)
-            df_processed_single = pd.concat([df_single, extracted_df], axis=1)
-
-            # Handle timestamps within the small df
-            if df_processed_single['timestamp'].isnull().any():
-                median_date = df_processed_single['timestamp'].dropna().median()
-                if pd.isna(median_date):
-                    median_date = pd.Timestamp('2020-01-01') 
-                df_processed_single['timestamp'].fillna(median_date, inplace=True)
-
-            # Extract time features within the small df
-            df_processed_single['weekday'] = df_processed_single['timestamp'].dt.weekday
-            df_processed_single['hour'] = df_processed_single['timestamp'].dt.hour
+            # Map category and user using global mappings, defaulting to <UNKNOWN_...> ID
+            category_id = global_stats['category_map'].get(raw_category_str, unknown_category_id)
+            user_id_code = global_stats['user_map'].get(raw_company_name, unknown_user_id)
             
-            # Ensure other columns exist and fill NaNs within the small df
-            df_processed_single['txn_accepted_category_id_str'] = df_processed_single['txn_accepted_category_id_str'].fillna('UNKNOWN').astype(str)
-            df_processed_single['company_name'] = df_processed_single['company_name'].fillna('UNKNOWN').astype(str)
-            if 'industry_name' in df_processed_single.columns:
-                 df_processed_single['industry_name'] = df_processed_single['industry_name'].fillna('UNKNOWN').astype(str)
-            else: df_processed_single['industry_name'] = 'UNKNOWN'
-            if 'num_chart_of_accounts' in df_processed_single.columns:
-                 df_processed_single['num_chart_of_accounts'] = pd.to_numeric(df_processed_single['num_chart_of_accounts'], errors='coerce').fillna(0).astype(int)
-            else: df_processed_single['num_chart_of_accounts'] = 0
-            # Don't drop target_transaction_processed yet, might be needed later? Keep it for now.
+            extracted_data.append({
+                'amount': float(txn_dict.get('amount', 0.0)),
+                'timestamp': pd.to_datetime(txn_dict.get('created_date'), errors='coerce'),
+                'description': str(txn_dict.get('description', '')),
+                'memo': str(txn_dict.get('memo', '')),
+                'merchant_name': str(txn_dict.get('payee', '')),
+                # Store the original category string and the mapped ID
+                'txn_accepted_category_id_str': raw_category_str, 
+                'category_id': category_id,
+                # Store the original company name and the mapped ID
+                'company_name': raw_company_name,
+                'user_id_code': user_id_code,
+                'industry_name': str(row.get('industry_name', 'UNKNOWN')),
+                'num_chart_of_accounts': pd.to_numeric(row.get('num_chart_of_accounts', 0), errors='coerce'),
+                'chart_of_accounts_processed': row.get('chart_of_accounts_processed', '[]')
+            })
             
-            # Select only the columns needed downstream to potentially save memory before append
-            cols_to_keep = [
-                'txn_accepted_category_id_str', 'company_name', 'industry_name', 
-                'num_chart_of_accounts', 'chart_of_accounts_processed', # Keep COA for DataModule
-                'amount', 'timestamp', 'description', 'memo', 'merchant_name', 
-                'weekday', 'hour'
-                # Add any other original columns if they are used by DataModule/Model
-            ]
-            # Filter df_processed_single to keep only necessary columns
-            df_filtered_single = df_processed_single[[col for col in cols_to_keep if col in df_processed_single.columns]]
-            
-            processed_dfs.append(df_filtered_single)
-
-        except pa.lib.ArrowInvalid as e:
-            print(f"[WARN] Skipping invalid Arrow stream file: {os.path.basename(file_path)} - Reason: {e}")
-            skipped_files.append(os.path.basename(file_path))
         except Exception as e:
-            print(f"[WARN] Skipping file {os.path.basename(file_path)} due to unexpected error: {e}")
-            skipped_files.append(os.path.basename(file_path))
-
-    if not processed_dfs:
-        raise ValueError(f"No valid Arrow files could be processed from {data_dir}. Skipped files: {skipped_files}")
-
-    # 3. Concatenate all *processed* DataFrames
-    print(f"Concatenating {len(processed_dfs)} processed DataFrames..." )
-    print("[WARNING] This step loads the full processed dataset into memory!")
-    df_combined = pd.concat(processed_dfs, ignore_index=True)
+            # print(f"[DEBUG] Skipping row in process_chunk_with_global_maps due to error: {e}") # Optional
+            continue  # Skip problematic rows
     
-    num_processed = len(processed_dfs)
-    num_skipped = len(skipped_files)
-    print(f"Data loading and initial processing complete: {len(df_combined)} records from {num_processed} files ({num_skipped} files skipped)." )
-    if skipped_files:
-         print(f"Skipped files: {skipped_files}")
+    if not extracted_data:
+        return pd.DataFrame()
+    
+    df_processed = pd.DataFrame(extracted_data)
+    
+    # Handle timestamps
+    df_processed['timestamp'] = pd.to_datetime(df_processed['timestamp'], errors='coerce')
+    # Fill NaNs with a placeholder or strategy if necessary, e.g., overall median from global_stats
+    # For simplicity here, using a fixed date if all in chunk are NaT.
+    # A more robust approach would be to use global_stats['median_timestamp'] if calculated.
+    median_date_chunk = df_processed['timestamp'].dropna().median()
+    if pd.isna(median_date_chunk):
+        median_date_chunk = pd.Timestamp('2020-01-01') 
+    df_processed['timestamp'] = df_processed['timestamp'].fillna(median_date_chunk)
+    
+    # Add time features
+    df_processed['weekday'] = df_processed['timestamp'].dt.weekday
+    df_processed['hour'] = df_processed['timestamp'].dt.hour
+    df_processed['num_chart_of_accounts'] = df_processed['num_chart_of_accounts'].fillna(0)
+    
+    return df_processed
 
-    # No further processing needed here, return the combined df
-    print("Preprocessing finished.") # Renamed log message
-    return df_combined
+def load_data_chunk_iteratively(
+    all_arrow_files: List[str],
+    current_file_idx: int,
+    current_row_offset_in_file: int,
+    max_transactions_per_chunk: int,
+    global_stats: Dict[str, Any]
+) -> Tuple[Optional[pd.DataFrame], int, int, bool]:
+    """
+    Loads and processes one chunk of data iteratively from a list of Arrow files.
+
+    Args:
+        all_arrow_files: Sorted list of all Arrow file paths.
+        current_file_idx: Index of the Arrow file to start reading from.
+        current_row_offset_in_file: Row offset within the starting Arrow file.
+        max_transactions_per_chunk: The desired number of transactions for this chunk.
+        global_stats: Statistics dictionary containing global scalers and maps.
+
+    Returns:
+        A tuple containing:
+        - DataFrame for the current chunk (or None if no more data).
+        - Next file index to resume from.
+        - Next row offset within that file.
+        - Boolean flag indicating if more data might be available.
+    """
+    processed_chunks_for_current_df = []
+    loaded_in_current_df = 0
+    
+    original_start_file_idx = current_file_idx
+    original_start_row_offset = current_row_offset_in_file
+
+    for file_idx in range(current_file_idx, len(all_arrow_files)):
+        file_path = all_arrow_files[file_idx]
+        
+        if loaded_in_current_df >= max_transactions_per_chunk:
+            break 
+            
+        try:
+            with ipc.open_stream(file_path) as reader:
+                table = reader.read_all()
+                df_raw_file_chunk = table.to_pandas()
+
+            # Apply row offset if this is the first file being processed in this call
+            if file_idx == original_start_file_idx and current_row_offset_in_file > 0:
+                if current_row_offset_in_file >= len(df_raw_file_chunk):
+                    # Offset is beyond this file, move to next file
+                    current_row_offset_in_file = 0 # Reset for next file
+                    continue 
+                df_raw_file_chunk = df_raw_file_chunk.iloc[current_row_offset_in_file:]
+            
+            # Process this part of the file
+            df_processed_part = process_chunk_with_global_maps(df_raw_file_chunk, global_stats)
+            
+            if df_processed_part.empty:
+                if file_idx == original_start_file_idx: # Reset offset if we skipped the rest of the starting file
+                     current_row_offset_in_file = 0
+                continue
+
+            # How many can we add to the current DF?
+            can_add = max_transactions_per_chunk - loaded_in_current_df
+            
+            if len(df_processed_part) > can_add:
+                df_to_add = df_processed_part.head(can_add)
+                rows_taken_from_processed_part = can_add
+                # Estimate rows taken from raw chunk to update offset (approximate if processing filters rows)
+                # This approximation assumes process_chunk_with_global_maps doesn't drastically change row count.
+                # A more precise way would be to track original indices if vital.
+                raw_rows_estimate_taken = rows_taken_from_processed_part 
+                current_row_offset_in_file += raw_rows_estimate_taken 
+            else:
+                df_to_add = df_processed_part
+                rows_taken_from_processed_part = len(df_to_add)
+                current_row_offset_in_file = 0 # Moved to next file or finished this one
+            
+            processed_chunks_for_current_df.append(df_to_add)
+            loaded_in_current_df += len(df_to_add)
+            
+            # If we took all rows from df_raw_file_chunk (after offset), reset offset for next file
+            if rows_taken_from_processed_part >= len(df_raw_file_chunk): # or if df_to_add was the whole df_processed_part
+                 current_row_offset_in_file = 0
+
+
+            if loaded_in_current_df >= max_transactions_per_chunk:
+                # Update current_file_idx for the next call
+                # If current_row_offset_in_file is non-zero, it means we stopped mid-file
+                # otherwise, we finished this file and should start the next one.
+                if current_row_offset_in_file == 0:
+                    current_file_idx = file_idx + 1
+                else:
+                    current_file_idx = file_idx 
+                break # Filled the chunk
+
+        except Exception as e:
+            print(f"[WARN] Failed to process file {os.path.basename(file_path)} during iterative loading: {e}")
+            current_row_offset_in_file = 0 # Skip to next file on error
+            continue # Move to the next file
+    
+    if not processed_chunks_for_current_df:
+        return None, current_file_idx, current_row_offset_in_file, False # No more data
+
+    final_df_chunk = pd.concat(processed_chunks_for_current_df, ignore_index=True)
+    final_df_chunk.reset_index(drop=True, inplace=True)
+    
+    # Determine if more data might be available
+    more_data_available = (current_file_idx < len(all_arrow_files)) or \
+                          (current_file_idx == len(all_arrow_files) -1 and current_row_offset_in_file > 0 and current_row_offset_in_file < len(df_raw_file_chunk))
+
+
+    print(f"Loaded chunk of {len(final_df_chunk)} transactions. Next file index: {current_file_idx}, Next offset: {current_row_offset_in_file}")
+    return final_df_chunk, current_file_idx, current_row_offset_in_file, more_data_available
 
 def train_advanced_streaming(
     # Data/Output  
@@ -460,242 +535,219 @@ def train_advanced_streaming(
     focal_loss_gamma: float = 2.0,
     accelerator: str = 'auto',
     precision: str = 'bf16-mixed',
-    hgt_num_samples: Optional[Dict[str, List[int]]] = None
+    hgt_num_samples: Optional[Dict[str, List[int]]] = None,
+    epochs_per_chunk: int = 1, # New parameter: how many epochs to train on each 500k chunk
+    total_chunks_to_process: Optional[int] = None # New: Limit total chunks for testing
 ):
-    """Train using two-pass approach for large datasets."""
+    """Train using iterative chunk-based approach for very large datasets."""
     torch.set_float32_matmul_precision('high') 
     pl.seed_everything(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    # === PASS 1: Collect Statistics ===
-    print("Starting two-pass training approach...")
-    stats = collect_statistics_pass(data_dir, max_files_for_stats)
+    # === PASS 1: Collect GLOBAL Statistics (ONCE) ===
+    print("Starting GLOBAL statistics collection pass...")
+    # CRITICAL: Ensure max_files_for_stats=None to scan all files for global stats
+    global_stats = collect_statistics_pass(data_dir, max_files_for_stats=None, add_unknowns=True) 
     
-    # === PASS 2: Load Data Subset ===
-    # df now contains data, user_id_code might have -1s from incomplete stats['user_map']
-    df = load_data_with_scalers(data_dir, stats, max_transactions)
+    # Global parameters for model initialization
+    # These maps are {name: code_int}
+    global_user_map = global_stats['user_map']
+    global_category_map_name_to_code = global_stats['category_map']
     
-    # === Regenerate user_map and user_id_code from the loaded DataFrame ===
-    print("Regenerating user_map and user_id_code from the fully loaded training DataFrame...")
-    if 'company_name' not in df.columns:
-        raise ValueError("Critical error: 'company_name' column is missing from the loaded DataFrame.")
-    df['company_name'] = df['company_name'].fillna('UNKNOWN_COMPANY_IN_REGEN').astype(str)
-    
-    final_user_codes, final_user_uniques = pd.factorize(df['company_name'], sort=True)
-    df['user_id_code'] = final_user_codes 
-    final_user_map = {user_name: code for code, user_name in enumerate(final_user_uniques)} # {name: code}
-    
-    num_users = len(final_user_map) 
-    print(f"Regenerated user map with {num_users} unique users from the loaded data.")
+    global_num_users = len(global_user_map)
+    global_num_global_classes = len(global_category_map_name_to_code)
+    global_num_user_classes = 0 # Assuming no user-specific classes for now
 
-    if 'user_id_code' in df.columns and (df['user_id_code'] < 0).any():
-        print(f"[!!!! CRITICAL DEBUG !!!!] Found {(df['user_id_code'] < 0).sum()} transactions with negative user_id_code AFTER REGENERATION.")
-        print(f"Problematic user_id_codes: {df.loc[df['user_id_code'] < 0, 'user_id_code'].unique()}")
-    else:
-        print("[!!!! DEBUG !!!!] No negative user_id_code found in DataFrame 'df' AFTER REGENERATION.")
-        
-    # === Regenerate category_map and category_id from the loaded DataFrame ===
-    print("Regenerating category_map and category_id from the fully loaded training DataFrame...")
-    target_col = 'txn_accepted_category_id_str' 
-    if target_col not in df.columns:
-        raise ValueError(f"Critical error: Target category column '{target_col}' is missing from the loaded DataFrame.")
-    df[target_col] = df[target_col].fillna('UNKNOWN_CATEGORY_IN_REGEN').astype(str)
+    print(f"Global Stats: #Users={global_num_users}, #GlobalClasses={global_num_global_classes}")
 
-    final_category_codes, final_category_uniques = pd.factorize(df[target_col], sort=True)
-    df['category_id'] = final_category_codes # Overwrite with 0 to N-1 codes
-
-    # Create the map {code: name_str} to be passed as fitted_category_id_map, as expected by DataModuleV2's inversion.
-    final_fitted_category_map = {code: name_str for code, name_str in enumerate(final_category_uniques)}
-    
-    num_global_classes = len(final_fitted_category_map) 
-    print(f"Regenerated category map with {num_global_classes} unique global classes from the loaded data.")
-
-    if 'category_id' in df.columns and (df['category_id'] < 0).any(): 
-        print(f"[!!!! CRITICAL DEBUG !!!!] Found {(df['category_id'] < 0).sum()} transactions with negative category_id AFTER REGENERATION.")
-        print(f"Problematic category_ids: {df.loc[df['category_id'] < 0, 'category_id'].unique()}")
-    else:
-        print("[!!!! DEBUG !!!!] No negative category_id found in DataFrame 'df' AFTER REGENERATION.")
-
-    # === Continue with existing training logic ===
-    # num_global_classes is now from the regenerated map
-    num_user_classes = 0 
-    # num_users is already updated from final_user_map
-
-    print(f"Dataset stats: #Global={num_global_classes}, #Users={num_users}, #Transactions={len(df):,}")
-
-    # DEBUGGING for user_id_code (already present, now after regen)
-    if 'user_id_code' in df.columns and (df['user_id_code'] == -1).any():
-        print(f"[!!!! DEBUG !!!!] Found {(df['user_id_code'] == -1).sum()} transactions with user_id_code == -1 in the DataFrame 'df'.")
-        problematic_companies = df.loc[df['user_id_code'] == -1, 'company_name'].unique()
-        print(f"[!!!! DEBUG !!!!] Unique company_names that mapped to -1 (first 10): {problematic_companies[:10]}")
-        # Check if these problematic_companies are in stats['user_map']
-        for comp in problematic_companies[:5]: # Check a few
-            # Ensure comp is a string for the dictionary lookup
-            comp_str = str(comp)
-            if comp_str in stats['user_map']:
-                print(f"[!!!! DEBUG !!!!] Problematic company '{comp_str}' IS in stats['user_map'] with ID {stats['user_map'][comp_str]} but df['user_id_code'] was -1. This is unexpected.")
-            else:
-                print(f"[!!!! DEBUG !!!!] Problematic company '{comp_str}' IS NOT in stats['user_map']. This is the primary issue.")
-    else:
-        print("[!!!! DEBUG !!!!] No user_id_code == -1 found in DataFrame 'df'.")
-    
-    # Create DataModule with pre-computed scalers
-    print("Initializing TransactionDataModuleV2 with pre-computed scalers...")
-    use_seq = model_config.get('use_sequence_encoder', False)
-    use_graph = model_config.get('use_graph_encoder', True)   
-    use_text = model_config.get('use_text_encoder', True)     
-    use_coa_text = model_config.get('use_coa_text_features', False)
-
-    num_hgt_layers = model_config['graph_encoder_params'].get('num_layers', 2) 
-    data_module = TransactionDataModuleV2(
-        transactions_df_ref=df,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        num_hgt_layers=num_hgt_layers,
-        hgt_num_samples=hgt_num_samples,
-        text_model_name=model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
-        max_seq_length=model_config.get('max_seq_length', 50),
-        text_max_length=model_config['text_encoder_params'].get('max_length', 128),
-        use_sequence_encoder=use_seq,
-        use_gnn_encoder=use_graph,
-        use_text_encoder=use_text,
-        use_coa_text_features=use_coa_text,
-        fitted_scalers=stats['scalers'],
-        fitted_category_id_map=final_fitted_category_map, # Use the REGENERATED {code: name} category map
-        fitted_user_map=final_user_map 
-    )
-    
-    print("Setting up DataModuleV2...")
-    data_module.setup('fit') 
-    
-    # Continue with model creation and training (same as before)
-    # Update model config with dynamic values
-    model_config['graph_encoder_params']['in_channels'] = data_module.node_feature_dims
-    model_config['graph_encoder_params']['metadata'] = data_module.full_graph_data.metadata() 
-    model_config['num_users'] = num_users 
-    model_config['num_global_classes'] = num_global_classes # num_global_classes is now from the regenerated map
-    model_config['num_user_classes'] = num_user_classes
-    
-    # Update fusion dims
-    model_config['fusion_params']['graph_dim'] = model_config['graph_encoder_params'].get('out_channels', 128)
-    model_config['fusion_params']['seq_dim'] = model_config['sequence_encoder_params'].get('output_dim', 128)
-    text_proj_dim = model_config['text_encoder_params'].get('projection_dim', 0)
-    finbert_hidden_size = 768
+    # === Initialize Model (ONCE) ===
+    # Update model_config with GLOBAL counts
+    current_model_config = model_config.copy() # Use a copy to avoid modifying the input dict directly
+    # graph_encoder_params will be set per-chunk by DataModule, but num_users/classes are global
+    current_model_config['num_users'] = global_num_users
+    current_model_config['num_global_classes'] = global_num_global_classes
+    current_model_config['num_user_classes'] = global_num_user_classes
+    # Fusion dims also need to be set based on what encoders are active and their output dims
+    # This part of model_config setup needs to be robust
+    current_model_config['fusion_params']['graph_dim'] = current_model_config['graph_encoder_params'].get('out_channels', 128)
+    current_model_config['fusion_params']['seq_dim'] = current_model_config['sequence_encoder_params'].get('output_dim', 128) # Ensure this key exists if seq encoder used
+    text_proj_dim = current_model_config['text_encoder_params'].get('projection_dim', 0)
+    finbert_hidden_size = 768 # Default for finbert
     text_out_dim_for_fusion = text_proj_dim if text_proj_dim > 0 else finbert_hidden_size
-    model_config['fusion_params']['text_dim'] = text_out_dim_for_fusion
-    model_config['fusion_params']['user_dim'] = model_config['user_embed_dim']
-    
-    # Create model
-    print("Initializing AdvancedTransactionCategorizationModel...")
+    current_model_config['fusion_params']['text_dim'] = text_out_dim_for_fusion
+    current_model_config['fusion_params']['user_dim'] = current_model_config['user_embed_dim']
+
+    print("Initializing AdvancedTransactionCategorizationModel globally...")
     model = AdvancedTransactionCategorizationModel(
-        model_config=model_config,
+        model_config=current_model_config,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         mtl_weights=mtl_weights,
         focal_loss_alpha=focal_loss_alpha,
         focal_loss_gamma=focal_loss_gamma,
-        transactions_df_ref=df
+        # transactions_df_ref is not really used by the model if data comes from dataloader
     )
-    
-    # Disable torch.compile due to CUDA compatibility issues with PyTorch Geometric
-    print("[INFO] Skipping torch.compile due to CUDA compatibility issues with PyTorch Geometric")
-    
-    # Training setup (same as before)
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=output_dir,
-            filename='adv_model-{epoch:02d}-{val_loss:.2f}',
+
+    # === Iterative Training Loop ===
+    all_arrow_files = sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
+    if not all_arrow_files:
+        raise FileNotFoundError(f"No .arrow files found in {data_dir} for iterative training.")
+
+    current_file_idx = 0
+    current_row_offset = 0
+    more_data_to_load = True
+    chunk_number = 0
+    last_checkpoint_path = None
+
+    while more_data_to_load:
+        if total_chunks_to_process is not None and chunk_number >= total_chunks_to_process:
+            print(f"Reached maximum number of chunks to process: {total_chunks_to_process}.")
+            break
+        chunk_number += 1
+        print(f"\n--- Processing Chunk {chunk_number} ---")
+
+        df_chunk, next_file_idx, next_row_offset, more_data_available_after_this_chunk = load_data_chunk_iteratively(
+            all_arrow_files=all_arrow_files,
+            current_file_idx=current_file_idx,
+            current_row_offset_in_file=current_row_offset,
+            max_transactions_per_chunk=max_transactions, # Your 500k limit
+            global_stats=global_stats
+        )
+
+        current_file_idx = next_file_idx
+        current_row_offset = next_row_offset
+        more_data_to_load = more_data_available_after_this_chunk
+
+        if df_chunk is None or df_chunk.empty:
+            print("No more data to load or empty chunk returned.")
+            break
+
+        print(f"Chunk {chunk_number} loaded with {len(df_chunk)} transactions.")
+        
+        # DataModule for the current chunk
+        # DataModuleV2 expects fitted_category_id_map as {code: name_str}
+        # global_category_map_name_to_code is {name: code}
+        # So we need to invert it for the DataModule or change DataModule
+        # For now, let's invert it here:
+        global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()}
+
+        data_module = TransactionDataModuleV2(
+            transactions_df_ref=df_chunk,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            # ... (other DataModule params like text_model_name, max_seq_length etc.) ...
+            # Make sure these are passed correctly:
+            text_model_name=current_model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
+            max_seq_length=current_model_config.get('max_seq_length', 50), # Get from main config
+            text_max_length=current_model_config['text_encoder_params'].get('max_length', 128),
+            use_sequence_encoder=current_model_config.get('use_sequence_encoder', False),
+            use_gnn_encoder=current_model_config.get('use_gnn_encoder', True),   
+            use_text_encoder=current_model_config.get('use_text_encoder', True),     
+            use_coa_text_features=current_model_config.get('use_coa_text_features', False),
+            num_hgt_layers = current_model_config['graph_encoder_params'].get('num_layers', 2),
+            hgt_num_samples = hgt_num_samples, # From main args
+
+            fitted_scalers=global_stats['scalers'],
+            fitted_category_id_map=global_category_map_code_to_name, # {code:name}
+            fitted_user_map=global_user_map # {name:code} - check DataModuleV2 consumes this correctly
+        )
+        
+        print(f"Setting up DataModule for chunk {chunk_number}...")
+        data_module.setup('fit') 
+        
+        # Update graph-specific parts of model_config if they change per chunk (e.g. metadata from HeteroData)
+        # This is tricky because GNN metadata/in_channels depend on the *current chunk's graph structure*
+        # If node types or feature dims can vary wildly per chunk, this is complex.
+        # Assuming for now that the *types* of nodes/edges are consistent enough for global GNN init.
+        # The DataModule must provide consistent node_feature_dims keys.
+        # If HGT metadata changes, the model cannot be simply resumed.
+        # For now, assume metadata from the first chunk's setup (or a global one) is okay.
+        # It's safer if the model's GNN part is initialized with metadata from global_stats or a representative first chunk.
+        # The `in_channels` for HGT must match what DataModule produces.
+        
+        # Let's assume metadata is stable, and we set it once during model init
+        # If model.graph_encoder.metadata is not set, it needs to be.
+        # And model_config['graph_encoder_params']['in_channels'] needs to be accurate.
+        # This might require a "dry run" of data_module.setup() on a small sample with global_stats
+        # just to get metadata and node_feature_dims before initializing the main model.
+        # For now, the model was initialized with a placeholder metadata. Let's try to update it IF POSSIBLE,
+        # but this is a complex aspect of iterative GNN training.
+        # The safest is to ensure the GNN config used for the *single model instance* is compatible with all chunks.
+        # This means `data_module.node_feature_dims` and `data_module.full_graph_data.metadata()` from any chunk
+        # must be compatible with the one-time initialized HGT.
+        # This usually means all possible node types and their feature dimensions are known upfront.
+
+        # Trainer for the current chunk
+        # Checkpoint callback needs to be specific for this chunk or managed globally
+        chunk_output_dir = os.path.join(output_dir, f"chunk_{chunk_number}")
+        os.makedirs(chunk_output_dir, exist_ok=True)
+
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=chunk_output_dir, # Save chunk-specific checkpoints
+            filename=f'model-chunk{chunk_number}-{{epoch:02d}}-{{val_loss:.2f}}',
             save_top_k=1,
             monitor='val_loss',
             mode='min'
-        ),
-        EarlyStopping(
-            monitor='val_loss',
-            patience=10,
-            mode='min'
         )
-    ]
-    logger = TensorBoardLogger(save_dir=output_dir, name='adv_logs')
+        # Early stopping might be per chunk or global; per-chunk is simpler here.
+        early_stop_callback = EarlyStopping(monitor='val_loss', patience=5, mode='min', verbose=True) # Increased patience
+        
+        # Logger can also be per chunk
+        logger = TensorBoardLogger(save_dir=os.path.join(output_dir, "tensorboard_logs"), name=f"chunk_{chunk_number}")
 
-    # Calculate validation interval as a factor of total training batches
-    total_samples = len(df)
-    batches_per_epoch = (total_samples // batch_size) + (1 if total_samples % batch_size != 0 else 0)
-    # Check validation every 10% of an epoch, minimum 50 steps, maximum 1000 steps
-    val_check_interval = max(50, min(1000, batches_per_epoch // 10))
-    print(f"[INFO] Calculated val_check_interval: {val_check_interval} (batches_per_epoch: {batches_per_epoch})")
-    
-    trainer = pl.Trainer(
-        max_epochs=max_epochs,
-        accelerator=accelerator,
-        precision=precision,
-        devices=1,
-        callbacks=callbacks,
-        logger=logger,
-        log_every_n_steps=min(val_check_interval, 500),  # Log more frequently than validation
-        val_check_interval=val_check_interval,
-        accumulate_grad_batches=4,  # Effective batch size = batch_size * 4
-    )
+        trainer = pl.Trainer(
+            max_epochs=epochs_per_chunk, 
+            accelerator=accelerator,
+            precision=precision,
+            devices=1, # Assuming single device
+            callbacks=[checkpoint_callback, early_stop_callback],
+            logger=logger,
+            log_every_n_steps=min(val_check_interval if 'val_check_interval' in locals() else 100, 50), 
+            val_check_interval=0.5, # Or some fraction of steps in the chunk
+            accumulate_grad_batches=4, # From original args
+        )
 
-    # Train
-    print("Starting Training...")
+        print(f"Fitting model on chunk {chunk_number}...")
+        trainer.fit(model, datamodule=data_module, ckpt_path=last_checkpoint_path)
+        
+        # Update last_checkpoint_path for the next iteration
+        last_checkpoint_path = checkpoint_callback.best_model_path
+        if not last_checkpoint_path or not os.path.exists(last_checkpoint_path):
+            print(f"[WARN] Best model path from checkpoint_callback for chunk {chunk_number} is invalid: {last_checkpoint_path}. Resuming may fail.")
+            # Fallback or error handling needed here if checkpoints are critical for resumption
+            # For simplicity, if no checkpoint, next iteration will train from current model state in memory.
+
+        print(f"Finished training on chunk {chunk_number}. Best model for this chunk: {last_checkpoint_path}")
+
+        # Optional: Clean up older non-best checkpoints for this chunk if needed to save space
+
+    print("Finished processing all data chunks.")
+
+    # --- Final Steps (e.g., Save final model, preprocessing state, Test) ---
+    final_model_save_path = os.path.join(output_dir, "final_trained_model.ckpt")
+    trainer.save_checkpoint(final_model_save_path) # Save the very last state
+    print(f"Final trained model saved to {final_model_save_path}")
+
+    print("Saving final (global) preprocessing state...")
+    state_to_save = {
+        'scalers': global_stats['scalers'],
+        'category_id_map_name_to_code': global_category_map_name_to_code, # {name:code}
+        'user_map_name_to_code': global_user_map, # {name:code}
+        # Add other relevant global stats if needed
+    }
+    save_path = os.path.join(output_dir, 'global_preprocessing_state.pkl')
     try:
-        trainer.fit(model, datamodule=data_module)
-    except RuntimeError as e:
-        if "CUDA error" in str(e):
-            print(f"!!! CUDA ERROR during training: {e}")
-            print("This may be due to:")
-            print("1. Out of GPU memory - try reducing batch_size")
-            print("2. Invalid CUDA operations - check data types and tensor operations")
-            print("3. Hardware/driver issues - try restarting the training process")
-            
-            # Try to clear CUDA cache
-            try:
-                torch.cuda.empty_cache()
-                print("CUDA cache cleared")
-            except:
-                pass
-        else:
-            print(f"!!! RUNTIME ERROR during training: {e}")
-        import traceback
-        traceback.print_exc()
-        raise e
-    except Exception as e:
-        print(f"!!! UNEXPECTED ERROR during training: {e}")
-        import traceback
-        traceback.print_exc()
-        raise e
-    finally:
-        # Save preprocessing state including original statistics
-        print("Saving preprocessing state...")
-        state_to_save = {
-            'scalers': stats['scalers'],
-            'category_id_map': stats['category_map'],
-            'user_map': stats['user_map'],
-            'original_stats': stats,  # Save original statistics for reference
-            'max_transactions_used': len(df)
-        }
-        save_path = os.path.join(output_dir, 'preprocessing_state.pkl')
-        try:
-            with open(save_path, 'wb') as f:
-                pickle.dump(state_to_save, f)
-            print(f"Preprocessing state saved to: {save_path}")
-        except Exception as save_e:
-            print(f"[ERROR] Failed to save preprocessing state: {save_e}")
+        with open(save_path, 'wb') as f:
+            pickle.dump(state_to_save, f)
+        print(f"Global preprocessing state saved to: {save_path}")
+    except Exception as save_e:
+        print(f"[ERROR] Failed to save global preprocessing state: {save_e}")
 
-    # Test
-    print("Starting Testing...")
-    try:
-        test_results = trainer.test(datamodule=data_module, ckpt_path='best') 
-        print("Test Results:", test_results)
-        if test_results:
-            results_df = pd.DataFrame(test_results)
-            results_df.to_csv(os.path.join(output_dir, 'adv_test_results.csv'), index=False)
-    except Exception as e:
-        print(f"!!! ERROR during testing: {e}")
-        import traceback
-        traceback.print_exc()
+    # Testing (optional, on a held-out test set or a final validation chunk)
+    # This would require loading a test chunk and using trainer.test()
+    # ...
 
-    print("Streaming training script finished.")
+    print("Iterative streaming training script finished.")
 
 def train_advanced(
     # Data/Output
