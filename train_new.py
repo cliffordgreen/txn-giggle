@@ -1052,11 +1052,17 @@ if __name__ == '__main__':
     
     # --- Memory Management Arguments (for streaming) ---
     parser.add_argument('--streaming', action='store_true', 
-                        help='Use two-pass streaming approach for large datasets')
-    parser.add_argument('--max_transactions', type=int, default=1000000,
-                        help='Maximum number of transactions to load (streaming mode)')
+                        help='Use iterative chunk-based streaming approach for large datasets')
+    parser.add_argument('--max_transactions', type=int, default=500000,
+                        help='Maximum number of transactions per chunk (streaming mode)')
     parser.add_argument('--max_files_for_stats', type=int, default=None,
                         help='Maximum number of files to use for statistics collection (streaming mode)')
+    
+    # --- Iterative Training Arguments (for streaming) ---
+    parser.add_argument('--epochs_per_chunk', type=int, default=1,
+                        help='Number of epochs to train on each chunk (streaming mode)')
+    parser.add_argument('--total_chunks_to_process', type=int, default=None,
+                        help='Maximum number of chunks to process for testing/debugging (streaming mode)')
 
     # --- Training Arguments --- 
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
@@ -1138,7 +1144,9 @@ if __name__ == '__main__':
             focal_loss_gamma=args.focal_gamma,
             accelerator=args.accelerator,
             precision=args.precision,
-            hgt_num_samples=hgt_samples_dict
+            hgt_num_samples=hgt_samples_dict,
+            epochs_per_chunk=args.epochs_per_chunk,
+            total_chunks_to_process=args.total_chunks_to_process
         )
     else:
         print("Using traditional training approach...")
