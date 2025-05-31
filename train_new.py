@@ -577,6 +577,80 @@ def train_advanced_streaming(
     current_model_config['fusion_params']['text_dim'] = text_out_dim_for_fusion
     current_model_config['fusion_params']['user_dim'] = current_model_config['user_embed_dim']
 
+    # === Perform Dry Run to Get HGT Metadata ===
+    print("Performing dry run to determine HGT metadata and node feature dimensions...")
+    
+    # Load a small sample to get metadata
+    dry_run_chunk, _, _, _ = load_data_chunk_iteratively(
+        all_arrow_files=sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True)),
+        current_file_idx=0,
+        current_row_offset_in_file=0,
+        max_transactions_per_chunk=min(10000, max_transactions // 10),  # Small sample for dry run
+        global_stats=global_stats
+    )
+    
+    if dry_run_chunk is None or dry_run_chunk.empty:
+        raise ValueError("Dry run failed: Could not load sample data for metadata determination")
+    
+    print(f"Dry run loaded {len(dry_run_chunk)} transactions for metadata extraction")
+    
+    # Create temporary DataModule to extract metadata
+    global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()}
+    
+    temp_data_module = TransactionDataModuleV2(
+        transactions_df_ref=dry_run_chunk,
+        batch_size=32,  # Small batch for dry run
+        num_workers=0,  # No workers for dry run
+        text_model_name=current_model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
+        max_seq_length=current_model_config.get('max_seq_length', 50),
+        text_max_length=current_model_config['text_encoder_params'].get('max_length', 128),
+        use_sequence_encoder=current_model_config.get('use_sequence_encoder', False),
+        use_gnn_encoder=current_model_config.get('use_gnn_encoder', True),
+        use_text_encoder=current_model_config.get('use_text_encoder', True),
+        use_coa_text_features=current_model_config.get('use_coa_text_features', False),
+        num_hgt_layers=current_model_config['graph_encoder_params'].get('num_layers', 2),
+        hgt_num_samples=hgt_num_samples,
+        fitted_scalers=global_stats['scalers'],
+        fitted_category_id_map=global_category_map_code_to_name,
+        fitted_user_map=global_user_map
+    )
+    
+    print("Setting up temporary DataModule for metadata extraction...")
+    temp_data_module.setup('fit')
+    
+    # Extract metadata
+    initial_node_feature_dims = temp_data_module.node_feature_dims
+    initial_graph_metadata = temp_data_module.full_graph_data.metadata()
+    
+    print(f"Extracted node_feature_dims: {initial_node_feature_dims}")
+    print(f"Extracted graph metadata: {initial_graph_metadata}")
+    
+    # Clean up temporary DataModule
+    del temp_data_module
+    del dry_run_chunk
+    
+    # Ensure graph_encoder_params exists and is a dict
+    if not isinstance(current_model_config.get('graph_encoder_params'), dict):
+        print("[DEBUG] 'graph_encoder_params' was not a dict or not found in current_model_config. Initializing.")
+        current_model_config['graph_encoder_params'] = {}
+    
+    # Set GNN params from dry run
+    print(f"[DEBUG] Assigning initial_graph_metadata: {type(initial_graph_metadata)}")
+    current_model_config['graph_encoder_params']['metadata'] = initial_graph_metadata
+    
+    print(f"[DEBUG] Assigning initial_node_feature_dims: {initial_node_feature_dims} (type: {type(initial_node_feature_dims)}) to 'in_channels'")
+    current_model_config['graph_encoder_params']['in_channels'] = initial_node_feature_dims
+    
+    print(f"[DEBUG] current_model_config['graph_encoder_params'] content after setting 'in_channels':")
+    print(f"         {current_model_config['graph_encoder_params']}")
+    
+    if 'in_channels' in current_model_config['graph_encoder_params']:
+        print(f"[DEBUG] Key 'in_channels' IS PRESENT in current_model_config['graph_encoder_params'].")
+        print(f"         Value: {current_model_config['graph_encoder_params']['in_channels']}")
+    else:
+        print(f"[DEBUG] Key 'in_channels' IS MISSING from current_model_config['graph_encoder_params'] just before model init!")
+        print(f"         Keys present: {current_model_config['graph_encoder_params'].keys()}")
+
     print("Initializing AdvancedTransactionCategorizationModel globally...")
     model = AdvancedTransactionCategorizationModel(
         model_config=current_model_config,
