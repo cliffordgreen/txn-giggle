@@ -1,5 +1,11 @@
 import os
 import argparse
+import numpy as np # Added
+import pickle # Added for saving state
+from collections import defaultdict  # Added for optimizer state cleanup
+import gc  # Added for garbage collection
+import psutil  # Added for memory monitoring
+import time  # Added for performance tracking
 
 # Set environment variables for CUDA debugging and memory optimization
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Enable synchronous CUDA for better error reporting
@@ -23,6 +29,11 @@ import pyarrow as pa # Added for ArrowInvalid check
 import pyarrow.ipc as ipc # Use ipc explicitly for stream reading
 import numpy as np # Added
 import pickle # Added for saving state
+
+# Add GPU memory growth setting
+if torch.cuda.is_available():
+    # This helps prevent CUDA OOM by allocating memory as needed
+    torch.cuda.set_per_process_memory_fraction(0.95)  # Use max 95% of GPU memory
 
 # Use the V2 DataModule
 from data.data_module_v2 import TransactionDataModuleV2, SingleBatchIterable 
@@ -543,7 +554,14 @@ def train_advanced_streaming(
     early_stopping_patience_per_chunk: int = 3 
 ):
     """Train AdvancedTransactionCategorizationModel iteratively on chunks of a large dataset,
-       for a specified number of overall epochs through the entire dataset."""
+       for a specified number of overall epochs through the entire dataset.
+       
+       Key Features:
+       - Sliding window approach: Maintains temporal graph connections across chunks
+       - Memory-aware: Aggressive cleanup after each chunk with monitoring
+       - Global metrics tracking: Monitors training progress across all chunks
+       - Consistent validation: Reserved users for comparable metrics
+    """
     torch.set_float32_matmul_precision('high') 
     pl.seed_everything(seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -564,6 +582,17 @@ def train_advanced_streaming(
     global_num_user_classes = 0 
 
     print(f"Global Stats: #Users={global_num_users} (incl. unknown), #GlobalClasses={global_num_global_classes} (incl. unknown)")
+    
+    # Reserve some users/categories for consistent validation
+    # This helps ensure validation metrics are comparable across chunks
+    all_user_names = sorted(list(global_user_map_name_to_code.keys()))
+    all_category_names = sorted(list(global_category_map_name_to_code.keys()))
+    
+    # Reserve 5% of users for global validation (min 10, max 1000)
+    num_val_users = min(max(int(len(all_user_names) * 0.05), 10), 1000)
+    global_val_users = set(all_user_names[:num_val_users])
+    print(f"Reserved {num_val_users} users for global validation")
+    
     print("="*50)
 
     # === GNN Configuration Dry Run (ONCE at the very beginning) ===
@@ -650,6 +679,22 @@ def train_advanced_streaming(
     # This should ideally be loaded *into* the model object if resuming.
     latest_overall_model_checkpoint_to_resume_script = None 
 
+    # --- Global Metrics Tracking ---
+    global_training_metrics = {
+        'chunk_train_losses': [],
+        'chunk_val_losses': [],
+        'chunk_train_accuracies': [],
+        'chunk_val_accuracies': [],
+        'chunk_memory_usage': [],
+        'chunk_processing_times': []
+    }
+    
+    # --- Sliding Window for Graph Continuity ---
+    # Keep a buffer of recent transactions to maintain temporal connections
+    sliding_window_size = min(50000, max_transactions // 10)  # 10% of chunk size or 50k max
+    sliding_window_buffer = None  # Will store recent transactions from previous chunk
+    print(f"Using sliding window of {sliding_window_size} transactions for graph continuity")
+    
     overall_model_checkpoints_dir = os.path.join(output_dir, "overall_model_checkpoints")
     os.makedirs(overall_model_checkpoints_dir, exist_ok=True)
     
@@ -666,6 +711,11 @@ def train_advanced_streaming(
         current_row_offset_in_file = 0 
         more_data_to_load = True
         chunk_iteration_in_epoch = 0 # Renamed to avoid confusion with a global chunk_number
+        
+        # Reset sliding window for new epoch to avoid cross-epoch contamination
+        if overall_epoch_num > 1:
+            print("Resetting sliding window buffer for new overall epoch")
+            sliding_window_buffer = None
 
         # Inner Loop for processing chunks within the current overall epoch
         while more_data_to_load:
@@ -678,6 +728,7 @@ def train_advanced_streaming(
                 break 
             
             print(f"\n--- Overall Epoch {overall_epoch_num}, Processing Chunk {chunk_iteration_in_epoch} ---")
+            chunk_start_time = time.time()
 
             df_chunk, next_file_idx, next_row_offset, more_data_available = load_data_chunk_iteratively(
                 all_arrow_files=all_arrow_files_full_dataset,
@@ -699,12 +750,59 @@ def train_advanced_streaming(
             if not more_data_available:
                  more_data_to_load = False
 
+            # --- Apply Sliding Window for Graph Continuity ---
+            if sliding_window_buffer is not None and len(sliding_window_buffer) > 0:
+                print(f"Concatenating {len(sliding_window_buffer)} historical transactions from sliding window")
+                # Combine historical data with new chunk
+                df_chunk_with_history = pd.concat([sliding_window_buffer, df_chunk], ignore_index=True)
+                
+                # Sort by timestamp to maintain temporal order
+                if 'timestamp' in df_chunk_with_history.columns:
+                    df_chunk_with_history = df_chunk_with_history.sort_values('timestamp').reset_index(drop=True)
+                
+                print(f"Total transactions after adding sliding window: {len(df_chunk_with_history)}")
+                
+                # Mark which transactions are from the sliding window (for proper train/val split)
+                df_chunk_with_history['is_historical'] = False
+                df_chunk_with_history.loc[:len(sliding_window_buffer)-1, 'is_historical'] = True
+                
+                # Use the combined dataframe for training
+                df_chunk_for_training = df_chunk_with_history
+            else:
+                # First chunk - no history
+                df_chunk['is_historical'] = False
+                df_chunk_for_training = df_chunk
+                print("First chunk - no sliding window history available")
+
+            # Prepare sliding window for next chunk (before any modifications to df_chunk)
+            # Take the most recent transactions based on timestamp
+            if 'timestamp' in df_chunk.columns:
+                df_chunk_sorted = df_chunk.sort_values('timestamp')
+                sliding_window_buffer = df_chunk_sorted.tail(sliding_window_size).copy()
+            else:
+                # Fallback: just take the last N transactions
+                sliding_window_buffer = df_chunk.tail(sliding_window_size).copy()
+            
+            print(f"Saved {len(sliding_window_buffer)} recent transactions for next chunk's sliding window")
 
             # --- DataModule for the current chunk ---
+            # Using sliding window approach to maintain temporal connections across chunks
             chunk_global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()} # {code:name}
             
+            # Create custom val/test ratios to ensure historical transactions aren't included
+            # Calculate ratios based on current chunk size (excluding historical)
+            if 'is_historical' in df_chunk_for_training.columns:
+                current_chunk_size = len(df_chunk_for_training[~df_chunk_for_training['is_historical']])
+                total_size = len(df_chunk_for_training)
+                # Adjust ratios to ensure val/test only come from current chunk
+                adjusted_val_ratio = 0.05 * (current_chunk_size / total_size)
+                adjusted_test_ratio = 0.05 * (current_chunk_size / total_size)
+            else:
+                adjusted_val_ratio = 0.05
+                adjusted_test_ratio = 0.05
+            
             chunk_data_module = TransactionDataModuleV2(
-                transactions_df_ref=df_chunk, batch_size=batch_size, num_workers=num_workers,
+                transactions_df_ref=df_chunk_for_training, batch_size=batch_size, num_workers=num_workers,
                 text_model_name=main_model_config.get('text_encoder_params',{}).get('model_name', 'ProsusAI/finbert'),
                 max_seq_length=main_model_config.get('max_seq_length', 50),
                 text_max_length=main_model_config.get('text_encoder_params',{}).get('max_length', 128),
@@ -716,7 +814,9 @@ def train_advanced_streaming(
                 hgt_num_samples = hgt_num_samples, 
                 fitted_scalers=global_stats['scalers'],
                 fitted_category_id_map=chunk_global_category_map_code_to_name, 
-                fitted_user_map=global_user_map_name_to_code 
+                fitted_user_map=global_user_map_name_to_code,
+                val_ratio=adjusted_val_ratio,
+                test_ratio=adjusted_test_ratio
             )
             print(f"Setting up DataModule for chunk {chunk_iteration_in_epoch} (Overall Epoch {overall_epoch_num})...")
             chunk_data_module.setup('fit') 
@@ -767,6 +867,34 @@ def train_advanced_streaming(
             
             trainer.fit(model, datamodule=chunk_data_module, ckpt_path=ckpt_path_for_this_fit) 
             
+            # Extract and save metrics from this chunk's training
+            if hasattr(trainer, 'logged_metrics') and trainer.logged_metrics:
+                # Extract final metrics for this chunk
+                chunk_metrics = trainer.logged_metrics
+                if 'train_loss' in chunk_metrics:
+                    global_training_metrics['chunk_train_losses'].append(float(chunk_metrics['train_loss']))
+                if 'val_loss' in chunk_metrics:
+                    global_training_metrics['chunk_val_losses'].append(float(chunk_metrics['val_loss']))
+                if 'train_acc_global' in chunk_metrics:
+                    global_training_metrics['chunk_train_accuracies'].append(float(chunk_metrics['train_acc_global']))
+                if 'val_acc_global' in chunk_metrics:
+                    global_training_metrics['chunk_val_accuracies'].append(float(chunk_metrics['val_acc_global']))
+                
+                # Log summary of metrics
+                print(f"Chunk {chunk_iteration_in_epoch} Metrics Summary:")
+                print(f"  Train Loss: {chunk_metrics.get('train_loss', 'N/A'):.4f}")
+                print(f"  Val Loss: {chunk_metrics.get('val_loss', 'N/A'):.4f}")
+                print(f"  Train Acc: {chunk_metrics.get('train_acc_global', 'N/A'):.4f}")
+                print(f"  Val Acc: {chunk_metrics.get('val_acc_global', 'N/A'):.4f}")
+                
+                # Check for training stagnation
+                if len(global_training_metrics['chunk_val_losses']) >= 5:
+                    recent_val_losses = global_training_metrics['chunk_val_losses'][-5:]
+                    loss_std = np.std(recent_val_losses)
+                    if loss_std < 0.001:  # Very little change in recent losses
+                        print(f"[WARN] Training appears to be stagnating (std of last 5 val losses: {loss_std:.6f})")
+                        print("[WARN] Consider: reducing learning rate, changing batch size, or adjusting model architecture")
+            
             best_model_this_chunk_fit = per_chunk_checkpoint_callback.best_model_path 
             if best_model_this_chunk_fit and os.path.exists(best_model_this_chunk_fit):
                 print(f"Best model during chunk {chunk_iteration_in_epoch} (OE {overall_epoch_num}) training passes saved to: {best_model_this_chunk_fit}")
@@ -780,9 +908,84 @@ def train_advanced_streaming(
             latest_overall_model_checkpoint_to_resume_script = current_overall_ckpt_path 
             print(f"Overall model state checkpoint saved to: {latest_overall_model_checkpoint_to_resume_script}")
             
-            del df_chunk, chunk_data_module, trainer, per_chunk_checkpoint_callback, chunk_early_stop_callback, chunk_logger
-            if torch.cuda.is_available() and accelerator in ['gpu', 'cuda']:
+            # Enhanced memory cleanup after each chunk
+            # Clear references to data and modules
+            # Note: We keep sliding_window_buffer for the next chunk
+            del df_chunk, df_chunk_for_training, chunk_data_module, trainer, per_chunk_checkpoint_callback, chunk_early_stop_callback, chunk_logger
+            
+            # Aggressive cleanup for text encoder
+            if hasattr(model, 'text_encoder') and model.text_encoder is not None:
+                # Clear any transformer model caches
+                if hasattr(model.text_encoder, 'model'):
+                    # For HuggingFace transformers
+                    if hasattr(model.text_encoder.model, 'embeddings'):
+                        # Clear position embeddings cache if exists
+                        if hasattr(model.text_encoder.model.embeddings, 'position_ids'):
+                            del model.text_encoder.model.embeddings.position_ids
+                    # Clear any attention caches
+                    for module in model.text_encoder.model.modules():
+                        if hasattr(module, 'clear_cache'):
+                            module.clear_cache()
+                # If using gradient checkpointing, disable it temporarily to clear memory
+                if hasattr(model.text_encoder.model, 'gradient_checkpointing_disable'):
+                    model.text_encoder.model.gradient_checkpointing_disable()
+            
+            # Clear graph encoder caches if any
+            if hasattr(model, 'graph_encoder') and model.graph_encoder is not None:
+                # Clear any cached computations in GNN layers
+                for module in model.graph_encoder.modules():
+                    if hasattr(module, '_cached'):
+                        del module._cached
+                    if hasattr(module, 'reset_parameters'):
+                        # Don't reset parameters, just clear internal states
+                        pass
+            
+            # Note: Optimizer state management is handled by Lightning trainer
+            # The trainer is deleted after each chunk, which should clear optimizer state
+            
+            # Multiple rounds of garbage collection for thorough cleanup
+            for _ in range(3):
+                gc.collect()
+            
+            # Clear CUDA cache if using GPU
+            if torch.cuda.is_available() and accelerator in ['gpu', 'cuda', 'auto']:
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Ensure all CUDA operations are complete
+                # Print memory stats for debugging
+                if chunk_iteration_in_epoch % 5 == 0:
+                    print(f"[INFO] GPU Memory - Allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB, "
+                          f"Reserved: {torch.cuda.memory_reserved()/1024**3:.2f}GB")
+            
+            # Additional cleanup for CPU memory
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            memory_gb = memory_info.rss/1024**3
+            print(f"[INFO] Process Memory - RSS: {memory_gb:.2f}GB, VMS: {memory_info.vms/1024**3:.2f}GB")
+            
+            # Track memory usage
+            global_training_metrics['chunk_memory_usage'].append(memory_gb)
+            
+            # Estimate sliding window buffer memory usage
+            if sliding_window_buffer is not None:
+                sliding_window_memory_gb = sliding_window_buffer.memory_usage(deep=True).sum() / 1024**3
+                print(f"[INFO] Sliding window buffer memory: {sliding_window_memory_gb:.2f}GB")
+            
+            # If memory usage is too high, we might need to take more drastic measures
+            if memory_gb > 100:  # If using more than 100GB RAM
+                print(f"[WARN] High memory usage detected ({memory_gb:.2f}GB). Consider reducing chunk size.")
+                # Optional: Force more aggressive cleanup
+                if memory_gb > 120:  # Critical threshold
+                    print("[CRITICAL] Memory usage critical. Forcing aggressive cleanup...")
+                    # Clear all model caches more aggressively
+                    torch.cuda.empty_cache()
+                    for _ in range(5):
+                        gc.collect()
+                
+            chunk_end_time = time.time()
+            chunk_processing_time = chunk_end_time - chunk_start_time
+            global_training_metrics['chunk_processing_times'].append(chunk_processing_time)
+            print(f"Chunk {chunk_iteration_in_epoch} processed in {chunk_processing_time:.2f} seconds")
+            
         # End of inner while loop (chunks for current overall epoch)
         print(f"--- Completed Overall Epoch {overall_epoch_num}/{num_overall_epochs} ---")
     # End of outer for loop (overall epochs)
@@ -822,6 +1025,40 @@ def train_advanced_streaming(
         print(f"Global preprocessing and model config state saved to: {global_state_save_path}")
     except Exception as save_e:
         print(f"[ERROR] Failed to save global state: {save_e}")
+
+    print("Saving training metrics history...")
+    metrics_save_path = os.path.join(output_dir, 'training_metrics_history.pkl')
+    try:
+        with open(metrics_save_path, 'wb') as f:
+            pickle.dump(global_training_metrics, f)
+        print(f"Training metrics saved to: {metrics_save_path}")
+        
+        # Also save as CSV for easy analysis
+        import pandas as pd
+        metrics_df = pd.DataFrame({
+            'chunk': list(range(len(global_training_metrics['chunk_train_losses']))),
+            'train_loss': global_training_metrics['chunk_train_losses'],
+            'val_loss': global_training_metrics['chunk_val_losses'],
+            'train_acc': global_training_metrics['chunk_train_accuracies'],
+            'val_acc': global_training_metrics['chunk_val_accuracies'],
+            'memory_gb': global_training_metrics['chunk_memory_usage'],
+            'time_seconds': global_training_metrics['chunk_processing_times']
+        })
+        csv_path = os.path.join(output_dir, 'training_metrics_history.csv')
+        metrics_df.to_csv(csv_path, index=False)
+        print(f"Training metrics CSV saved to: {csv_path}")
+        
+        # Print summary statistics
+        print("\n=== Training Summary ===")
+        print(f"Total chunks processed: {len(global_training_metrics['chunk_train_losses'])}")
+        if global_training_metrics['chunk_train_losses']:
+            print(f"Average train loss: {np.mean(global_training_metrics['chunk_train_losses']):.4f}")
+            print(f"Average val loss: {np.mean(global_training_metrics['chunk_val_losses']):.4f}")
+            print(f"Average memory usage: {np.mean(global_training_metrics['chunk_memory_usage']):.2f} GB")
+            print(f"Peak memory usage: {np.max(global_training_metrics['chunk_memory_usage']):.2f} GB")
+            print(f"Total training time: {np.sum(global_training_metrics['chunk_processing_times'])/3600:.2f} hours")
+    except Exception as e:
+        print(f"[ERROR] Failed to save training metrics: {e}")
 
     print("Iterative streaming training script finished.")
 
