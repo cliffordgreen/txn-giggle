@@ -520,14 +520,18 @@ def train_advanced_streaming(
     data_dir: str,
     output_dir: str,
     # Memory Management
-    max_transactions: int = 1000000,
-    max_files_for_stats: Optional[int] = None,
-    # Training params (same as before)
+    max_transactions: int = 1000000, # Max records per chunk in memory
+    max_files_for_stats: Optional[int] = None, 
+    # Training params
     batch_size: int = 32,
     num_workers: int = 0,
-    max_epochs: int = 50,
+    # max_epochs CLI arg is not directly used by iterative trainer for epochs_per_chunk
+    # Instead, we now have num_overall_epochs and epochs_per_chunk
+    num_overall_epochs: int = 1, # New: Number of full passes over the entire dataset via chunks
+    epochs_per_chunk: int = 1, 
+    total_chunks_to_process: Optional[int] = None, # Limit total chunks processed *within one overall epoch*
     seed: int = 42,
-    model_config: dict = {},
+    model_config: dict = {}, 
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-5,
     mtl_weights: dict = {'global': 1.0, 'user': 0.0},
@@ -536,300 +540,288 @@ def train_advanced_streaming(
     accelerator: str = 'auto',
     precision: str = 'bf16-mixed',
     hgt_num_samples: Optional[Dict[str, List[int]]] = None,
-    epochs_per_chunk: int = 1, # New parameter: how many epochs to train on each 500k chunk
-    total_chunks_to_process: Optional[int] = None # New: Limit total chunks for testing
+    early_stopping_patience_per_chunk: int = 3 
 ):
-    """Train using iterative chunk-based approach for very large datasets."""
+    """Train AdvancedTransactionCategorizationModel iteratively on chunks of a large dataset,
+       for a specified number of overall epochs through the entire dataset."""
     torch.set_float32_matmul_precision('high') 
     pl.seed_everything(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    # === PASS 1: Collect GLOBAL Statistics (ONCE) ===
-    print("Starting GLOBAL statistics collection pass...")
-    # CRITICAL: Ensure max_files_for_stats=None to scan all files for global stats
-    global_stats = collect_statistics_pass(data_dir, max_files_for_stats=None, add_unknowns=True) 
+    # === PASS 1: Collect GLOBAL Statistics (ONCE at the very beginning) ===
+    print("="*50)
+    print("Starting GLOBAL statistics collection pass (will scan all relevant files)...")
+    print("="*50)
+    if max_files_for_stats is not None:
+        print(f"[INFO] max_files_for_stats is set to {max_files_for_stats}. For full dataset stats, this should ideally be None or cover all files.")
     
-    # Global parameters for model initialization
-    # These maps are {name: code_int}
-    global_user_map = global_stats['user_map']
+    global_stats = collect_statistics_pass(data_dir, max_files_for_stats=max_files_for_stats, add_unknowns=True) 
+    
+    global_user_map_name_to_code = global_stats['user_map']
     global_category_map_name_to_code = global_stats['category_map']
-    
-    global_num_users = len(global_user_map)
+    global_num_users = len(global_user_map_name_to_code)
     global_num_global_classes = len(global_category_map_name_to_code)
-    global_num_user_classes = 0 # Assuming no user-specific classes for now
+    global_num_user_classes = 0 
 
-    print(f"Global Stats: #Users={global_num_users}, #GlobalClasses={global_num_global_classes}")
+    print(f"Global Stats: #Users={global_num_users} (incl. unknown), #GlobalClasses={global_num_global_classes} (incl. unknown)")
+    print("="*50)
 
-    # === Initialize Model (ONCE) ===
-    # Update model_config with GLOBAL counts
-    current_model_config = model_config.copy() # Use a copy to avoid modifying the input dict directly
-    # graph_encoder_params will be set per-chunk by DataModule, but num_users/classes are global
-    current_model_config['num_users'] = global_num_users
-    current_model_config['num_global_classes'] = global_num_global_classes
-    current_model_config['num_user_classes'] = global_num_user_classes
-    # Fusion dims also need to be set based on what encoders are active and their output dims
-    # This part of model_config setup needs to be robust
-    current_model_config['fusion_params']['graph_dim'] = current_model_config['graph_encoder_params'].get('out_channels', 128)
-    current_model_config['fusion_params']['seq_dim'] = current_model_config['sequence_encoder_params'].get('output_dim', 128) # Ensure this key exists if seq encoder used
-    text_proj_dim = current_model_config['text_encoder_params'].get('projection_dim', 0)
-    finbert_hidden_size = 768 # Default for finbert
-    text_out_dim_for_fusion = text_proj_dim if text_proj_dim > 0 else finbert_hidden_size
-    current_model_config['fusion_params']['text_dim'] = text_out_dim_for_fusion
-    current_model_config['fusion_params']['user_dim'] = current_model_config['user_embed_dim']
+    # === GNN Configuration Dry Run (ONCE at the very beginning) ===
+    print("Starting GNN configuration dry run...")
+    all_arrow_files_for_dry_run = sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
+    if not all_arrow_files_for_dry_run: # Check needed here as well
+        raise FileNotFoundError(f"No .arrow files found in {data_dir} for GNN dry run.")
 
-    # === Perform Dry Run to Get HGT Metadata ===
-    print("Performing dry run to determine HGT metadata and node feature dimensions...")
-    
-    # Load a small sample to get metadata
-    dry_run_chunk, _, _, _ = load_data_chunk_iteratively(
-        all_arrow_files=sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True)),
+    dry_run_chunk_df, _, _, _ = load_data_chunk_iteratively(
+        all_arrow_files=all_arrow_files_for_dry_run, # Use the full list
         current_file_idx=0,
         current_row_offset_in_file=0,
-        max_transactions_per_chunk=min(10000, max_transactions // 10),  # Small sample for dry run
+        max_transactions_per_chunk=min(10000, max_transactions // 10 if max_transactions > 1000 else 1000),
         global_stats=global_stats
     )
-    
-    if dry_run_chunk is None or dry_run_chunk.empty:
+    if dry_run_chunk_df is None or dry_run_chunk_df.empty:
         raise ValueError("Dry run failed: Could not load sample data for metadata determination")
+    print(f"Dry run loaded {len(dry_run_chunk_df)} transactions for metadata extraction")
     
-    print(f"Dry run loaded {len(dry_run_chunk)} transactions for metadata extraction")
-    
-    # Create temporary DataModule to extract metadata
-    global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()}
-    
+    temp_global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()}
     temp_data_module = TransactionDataModuleV2(
-        transactions_df_ref=dry_run_chunk,
-        batch_size=32,  # Small batch for dry run
-        num_workers=0,  # No workers for dry run
-        text_model_name=current_model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
-        max_seq_length=current_model_config.get('max_seq_length', 50),
-        text_max_length=current_model_config['text_encoder_params'].get('max_length', 128),
-        use_sequence_encoder=current_model_config.get('use_sequence_encoder', False),
-        use_gnn_encoder=current_model_config.get('use_gnn_encoder', True),
-        use_text_encoder=current_model_config.get('use_text_encoder', True),
-        use_coa_text_features=current_model_config.get('use_coa_text_features', False),
-        num_hgt_layers=current_model_config['graph_encoder_params'].get('num_layers', 2),
-        hgt_num_samples=hgt_num_samples,
+        transactions_df_ref=dry_run_chunk_df, batch_size=min(32, len(dry_run_chunk_df)), num_workers=0,
+        text_model_name=model_config.get('text_encoder_params', {}).get('model_name', 'ProsusAI/finbert'),
+        max_seq_length=model_config.get('max_seq_length', 50),
+        text_max_length=model_config.get('text_encoder_params', {}).get('max_length', 128),
+        use_sequence_encoder=model_config.get('use_sequence_encoder', False),
+        use_gnn_encoder=model_config.get('use_gnn_encoder', True),   
+        use_text_encoder=model_config.get('use_text_encoder', True),     
+        use_coa_text_features=model_config.get('use_coa_text_features', False),
+        num_hgt_layers = model_config.get('graph_encoder_params', {}).get('num_layers', 2),
+        hgt_num_samples = hgt_num_samples,
         fitted_scalers=global_stats['scalers'],
-        fitted_category_id_map=global_category_map_code_to_name,
-        fitted_user_map=global_user_map
+        fitted_category_id_map=temp_global_category_map_code_to_name,
+        fitted_user_map=global_user_map_name_to_code 
     )
-    
-    print("Setting up temporary DataModule for metadata extraction...")
+    print("Setting up temporary DataModule for GNN config...")
     temp_data_module.setup('fit')
-    
-    # Extract metadata
-    initial_node_feature_dims = temp_data_module.node_feature_dims
     initial_graph_metadata = temp_data_module.full_graph_data.metadata()
+    initial_node_feature_dims = temp_data_module.node_feature_dims
+    del temp_data_module, dry_run_chunk_df, temp_global_category_map_code_to_name
+    print("GNN configuration dry run complete.")
+    print(f"  Initial Graph Metadata: {initial_graph_metadata}")
+    print(f"  Initial Node Feature Dims: {initial_node_feature_dims}")
+    print("="*50)
+
+    # === Initialize Main Model (ONCE) ===
+    main_model_config = model_config.copy()
+    main_model_config['num_users'] = global_num_users
+    main_model_config['num_global_classes'] = global_num_global_classes
+    main_model_config['num_user_classes'] = global_num_user_classes
+    if 'graph_encoder_params' not in main_model_config: main_model_config['graph_encoder_params'] = {}
+    main_model_config['graph_encoder_params']['metadata'] = initial_graph_metadata
+    main_model_config['graph_encoder_params']['in_channels'] = initial_node_feature_dims
     
-    print(f"Extracted node_feature_dims: {initial_node_feature_dims}")
-    print(f"Extracted graph metadata: {initial_graph_metadata}")
-    
-    # Clean up temporary DataModule
-    del temp_data_module
-    del dry_run_chunk
-    
-    # Ensure graph_encoder_params exists and is a dict
-    if not isinstance(current_model_config.get('graph_encoder_params'), dict):
-        print("[DEBUG] 'graph_encoder_params' was not a dict or not found in current_model_config. Initializing.")
-        current_model_config['graph_encoder_params'] = {}
-    
-    # Set GNN params from dry run
-    print(f"[DEBUG] Assigning initial_graph_metadata: {type(initial_graph_metadata)}")
-    current_model_config['graph_encoder_params']['metadata'] = initial_graph_metadata
-    
-    print(f"[DEBUG] Assigning initial_node_feature_dims: {initial_node_feature_dims} (type: {type(initial_node_feature_dims)}) to 'in_channels'")
-    current_model_config['graph_encoder_params']['in_channels'] = initial_node_feature_dims
-    
-    print(f"[DEBUG] current_model_config['graph_encoder_params'] content after setting 'in_channels':")
-    print(f"         {current_model_config['graph_encoder_params']}")
-    
-    if 'in_channels' in current_model_config['graph_encoder_params']:
-        print(f"[DEBUG] Key 'in_channels' IS PRESENT in current_model_config['graph_encoder_params'].")
-        print(f"         Value: {current_model_config['graph_encoder_params']['in_channels']}")
-    else:
-        print(f"[DEBUG] Key 'in_channels' IS MISSING from current_model_config['graph_encoder_params'] just before model init!")
-        print(f"         Keys present: {current_model_config['graph_encoder_params'].keys()}")
+    # Ensure fusion parameter keys exist before assignment
+    if 'fusion_params' not in main_model_config: main_model_config['fusion_params'] = {}
+    if main_model_config.get('use_gnn_encoder', True) and 'graph_encoder_params' in main_model_config:
+        main_model_config['fusion_params']['graph_dim'] = main_model_config['graph_encoder_params'].get('out_channels', 128)
+    if main_model_config.get('use_sequence_encoder', False) and 'sequence_encoder_params' in main_model_config:
+        main_model_config['fusion_params']['seq_dim'] = main_model_config.get('sequence_encoder_params',{}).get('output_dim', 128)
+    if main_model_config.get('use_text_encoder', True) and 'text_encoder_params' in main_model_config:
+        text_proj_dim = main_model_config.get('text_encoder_params',{}).get('projection_dim', 0)
+        finbert_hidden_size = 768 
+        text_out_dim_for_fusion = text_proj_dim if text_proj_dim > 0 else finbert_hidden_size
+        main_model_config['fusion_params']['text_dim'] = text_out_dim_for_fusion
+    if 'user_embed_dim' in main_model_config: # Ensure user_embed_dim is in config
+        main_model_config['fusion_params']['user_dim'] = main_model_config['user_embed_dim']
+    else: # Add a default if not present, or raise error
+        main_model_config['user_embed_dim'] = 64 # Example default
+        main_model_config['fusion_params']['user_dim'] = 64
+        print("[WARN] 'user_embed_dim' not found in model_config, defaulted to 64.")
+
 
     print("Initializing AdvancedTransactionCategorizationModel globally...")
     model = AdvancedTransactionCategorizationModel(
-        model_config=current_model_config,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        mtl_weights=mtl_weights,
-        focal_loss_alpha=focal_loss_alpha,
-        focal_loss_gamma=focal_loss_gamma,
-        # transactions_df_ref is not really used by the model if data comes from dataloader
+        model_config=main_model_config, learning_rate=learning_rate, weight_decay=weight_decay,
+        mtl_weights=mtl_weights, focal_loss_alpha=focal_loss_alpha, focal_loss_gamma=focal_loss_gamma
     )
+    print("Global model initialized.")
+    print("="*50)
 
-    # === Iterative Training Loop ===
-    all_arrow_files = sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
-    if not all_arrow_files:
+    # --- Script Resumption Logic ---
+    # TODO: Implement more robust script resumption. For now, this tracks the last overall checkpoint.
+    # This should ideally be loaded *into* the model object if resuming.
+    latest_overall_model_checkpoint_to_resume_script = None 
+
+    overall_model_checkpoints_dir = os.path.join(output_dir, "overall_model_checkpoints")
+    os.makedirs(overall_model_checkpoints_dir, exist_ok=True)
+    
+    all_arrow_files_full_dataset = sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
+    if not all_arrow_files_full_dataset:
         raise FileNotFoundError(f"No .arrow files found in {data_dir} for iterative training.")
 
-    current_file_idx = 0
-    current_row_offset = 0
-    more_data_to_load = True
-    chunk_number = 0
-    last_checkpoint_path = None
-
-    while more_data_to_load:
-        if total_chunks_to_process is not None and chunk_number >= total_chunks_to_process:
-            print(f"Reached maximum number of chunks to process: {total_chunks_to_process}.")
-            break
-        chunk_number += 1
-        print(f"\n--- Processing Chunk {chunk_number} ---")
-
-        df_chunk, next_file_idx, next_row_offset, more_data_available_after_this_chunk = load_data_chunk_iteratively(
-            all_arrow_files=all_arrow_files,
-            current_file_idx=current_file_idx,
-            current_row_offset_in_file=current_row_offset,
-            max_transactions_per_chunk=max_transactions, # Your 500k limit
-            global_stats=global_stats
-        )
-
-        current_file_idx = next_file_idx
-        current_row_offset = next_row_offset
-        more_data_to_load = more_data_available_after_this_chunk
-
-        if df_chunk is None or df_chunk.empty:
-            print("No more data to load or empty chunk returned.")
-            break
-
-        print(f"Chunk {chunk_number} loaded with {len(df_chunk)} transactions.")
+    # === Outer Loop for Overall Epochs ===
+    for overall_epoch_num in range(1, num_overall_epochs + 1):
+        print(f"\n{'='*25} Starting Overall Epoch {overall_epoch_num}/{num_overall_epochs} {'='*25}")
         
-        # DataModule for the current chunk
-        # DataModuleV2 expects fitted_category_id_map as {code: name_str}
-        # global_category_map_name_to_code is {name: code}
-        # So we need to invert it here:
-        global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()}
+        # Reset chunk iteration state for each overall epoch
+        current_file_idx = 0
+        current_row_offset_in_file = 0 
+        more_data_to_load = True
+        chunk_iteration_in_epoch = 0 # Renamed to avoid confusion with a global chunk_number
 
-        data_module = TransactionDataModuleV2(
-            transactions_df_ref=df_chunk,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            # ... (other DataModule params like text_model_name, max_seq_length etc.) ...
-            # Make sure these are passed correctly:
-            text_model_name=current_model_config['text_encoder_params'].get('model_name', 'ProsusAI/finbert'),
-            max_seq_length=current_model_config.get('max_seq_length', 50), # Get from main config
-            text_max_length=current_model_config['text_encoder_params'].get('max_length', 128),
-            use_sequence_encoder=current_model_config.get('use_sequence_encoder', False),
-            use_gnn_encoder=current_model_config.get('use_gnn_encoder', True),   
-            use_text_encoder=current_model_config.get('use_text_encoder', True),     
-            use_coa_text_features=current_model_config.get('use_coa_text_features', False),
-            num_hgt_layers = current_model_config['graph_encoder_params'].get('num_layers', 2),
-            hgt_num_samples = hgt_num_samples, # From main args
+        # Inner Loop for processing chunks within the current overall epoch
+        while more_data_to_load:
+            chunk_iteration_in_epoch += 1
+            current_global_chunk_num = ((overall_epoch_num - 1) * (len(all_arrow_files_full_dataset) * 10000 // max_transactions +1 )) + chunk_iteration_in_epoch # Approx for logging
 
-            fitted_scalers=global_stats['scalers'],
-            fitted_category_id_map=global_category_map_code_to_name, # {code:name}
-            fitted_user_map=global_user_map # {name:code} - check DataModuleV2 consumes this correctly
-        )
-        
-        print(f"Setting up DataModule for chunk {chunk_number}...")
-        data_module.setup('fit') 
-        
-        # Update graph-specific parts of model_config if they change per chunk (e.g. metadata from HeteroData)
-        # This is tricky because GNN metadata/in_channels depend on the *current chunk's graph structure*
-        # If node types or feature dims can vary wildly per chunk, this is complex.
-        # Assuming for now that the *types* of nodes/edges are consistent enough for global GNN init.
-        # The DataModule must provide consistent node_feature_dims keys.
-        # If HGT metadata changes, the model cannot be simply resumed.
-        # For now, assume metadata from the first chunk's setup (or a global one) is okay.
-        # It's safer if the model's GNN part is initialized with metadata from global_stats or a representative first chunk.
-        # The `in_channels` for HGT must match what DataModule produces.
-        
-        # Let's assume metadata is stable, and we set it once during model init
-        # If model.graph_encoder.metadata is not set, it needs to be.
-        # And model_config['graph_encoder_params']['in_channels'] needs to be accurate.
-        # This might require a "dry run" of data_module.setup() on a small sample with global_stats
-        # just to get metadata and node_feature_dims before initializing the main model.
-        # For now, the model was initialized with a placeholder metadata. Let's try to update it IF POSSIBLE,
-        # but this is a complex aspect of iterative GNN training.
-        # The safest is to ensure the GNN config used for the *single model instance* is compatible with all chunks.
-        # This means `data_module.node_feature_dims` and `data_module.full_graph_data.metadata()` from any chunk
-        # must be compatible with the one-time initialized HGT.
-        # This usually means all possible node types and their feature dimensions are known upfront.
+            if total_chunks_to_process is not None and chunk_iteration_in_epoch > total_chunks_to_process:
+                print(f"Reached total_chunks_to_process limit ({total_chunks_to_process}) for overall_epoch {overall_epoch_num}.")
+                more_data_to_load = False # Stop processing chunks for this overall epoch
+                break 
+            
+            print(f"\n--- Overall Epoch {overall_epoch_num}, Processing Chunk {chunk_iteration_in_epoch} ---")
 
-        # Trainer for the current chunk
-        # Checkpoint callback needs to be specific for this chunk or managed globally
-        chunk_output_dir = os.path.join(output_dir, f"chunk_{chunk_number}")
-        os.makedirs(chunk_output_dir, exist_ok=True)
+            df_chunk, next_file_idx, next_row_offset, more_data_available = load_data_chunk_iteratively(
+                all_arrow_files=all_arrow_files_full_dataset,
+                current_file_idx=current_file_idx,
+                current_row_offset_in_file=current_row_offset_in_file,
+                max_transactions_per_chunk=max_transactions,
+                global_stats=global_stats
+            )
 
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=chunk_output_dir, # Save chunk-specific checkpoints
-            filename=f'model-chunk{chunk_number}-{{epoch:02d}}-{{val_loss:.2f}}',
-            save_top_k=1,
-            monitor='val_loss',
-            mode='min'
-        )
-        # Early stopping might be per chunk or global; per-chunk is simpler here.
-        early_stop_callback = EarlyStopping(monitor='val_loss', patience=5, mode='min', verbose=True) # Increased patience
-        
-        # Logger can also be per chunk
-        logger = TensorBoardLogger(save_dir=os.path.join(output_dir, "tensorboard_logs"), name=f"chunk_{chunk_number}")
+            if df_chunk is None or df_chunk.empty:
+                print(f"No more data loaded for chunk {chunk_iteration_in_epoch} in overall epoch {overall_epoch_num}. Ending this overall epoch.")
+                break # End of data for this overall epoch
 
-        trainer = pl.Trainer(
-            max_epochs=epochs_per_chunk, 
-            accelerator=accelerator,
-            precision=precision,
-            devices=1, # Assuming single device
-            callbacks=[checkpoint_callback, early_stop_callback],
-            logger=logger,
-            log_every_n_steps=min(val_check_interval if 'val_check_interval' in locals() else 100, 50), 
-            val_check_interval=0.5, # Or some fraction of steps in the chunk
-            accumulate_grad_batches=4, # From original args
-        )
+            print(f"Chunk {chunk_iteration_in_epoch} (Overall Epoch {overall_epoch_num}) loaded with {len(df_chunk)} transactions.")
+            current_file_idx = next_file_idx
+            current_row_offset_in_file = next_row_offset
+            # more_data_to_load is primarily for this inner loop; outer loop controls overall epochs.
+            # If load_data_chunk_iteratively says no more data, this inner loop for the current overall epoch ends.
+            if not more_data_available:
+                 more_data_to_load = False
 
-        print(f"Fitting model on chunk {chunk_number} for {epochs_per_chunk} epoch(s)...")
-        if chunk_number == 1 and last_checkpoint_path: # Only for the very first chunk if resuming the whole script
-            print(f"Resuming trainer state for chunk 1 from: {last_checkpoint_path}")
-            trainer.fit(model, datamodule=data_module, ckpt_path=last_checkpoint_path)
-        else:
-            # For subsequent chunks, or if no initial checkpoint, train the existing model instance
-            # The 'model' object has the updated weights from previous chunks.
-            trainer.fit(model, datamodule=data_module) 
-        
-        # This now gets the best model path from the *current* chunk's training
-        best_model_this_chunk = checkpoint_callback.best_model_path 
-        if not best_model_this_chunk or not os.path.exists(best_model_this_chunk):
-            print(f"[WARN] No best model checkpoint saved by ModelCheckpoint for chunk {chunk_number}.")
-            # If no model was saved by the per-chunk callback (e.g. training didn't improve for save_top_k=1)
-            # then the "best" state is the current state of 'model' after fitting.
-            # We rely on current_overall_ckpt_path below to save the model state.
-        else:
-            print(f"Best model during chunk {chunk_number} training saved to: {best_model_this_chunk}")
 
-        # After training on a chunk, save the current state of the *overall model*
-        current_overall_ckpt_path = os.path.join(output_dir, f"overall_model_after_chunk_{chunk_number}.ckpt")
-        trainer.save_checkpoint(current_overall_ckpt_path)
-        last_checkpoint_path = current_overall_ckpt_path # This is for resuming the *entire script* if it crashes
-        print(f"Overall model state saved to: {last_checkpoint_path} after chunk {chunk_number}")
+            # --- DataModule for the current chunk ---
+            chunk_global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()} # {code:name}
+            
+            chunk_data_module = TransactionDataModuleV2(
+                transactions_df_ref=df_chunk, batch_size=batch_size, num_workers=num_workers,
+                text_model_name=main_model_config.get('text_encoder_params',{}).get('model_name', 'ProsusAI/finbert'),
+                max_seq_length=main_model_config.get('max_seq_length', 50),
+                text_max_length=main_model_config.get('text_encoder_params',{}).get('max_length', 128),
+                use_sequence_encoder=main_model_config.get('use_sequence_encoder', False),
+                use_gnn_encoder=main_model_config.get('use_gnn_encoder', True),   
+                use_text_encoder=main_model_config.get('use_text_encoder', True),     
+                use_coa_text_features=main_model_config.get('use_coa_text_features', False),
+                num_hgt_layers = main_model_config.get('graph_encoder_params',{}).get('num_layers', 2),
+                hgt_num_samples = hgt_num_samples, 
+                fitted_scalers=global_stats['scalers'],
+                fitted_category_id_map=chunk_global_category_map_code_to_name, 
+                fitted_user_map=global_user_map_name_to_code 
+            )
+            print(f"Setting up DataModule for chunk {chunk_iteration_in_epoch} (Overall Epoch {overall_epoch_num})...")
+            chunk_data_module.setup('fit') 
+            
+            # --- Trainer for the current chunk ---
+            per_chunk_artifacts_dir = os.path.join(output_dir, "per_chunk_artifacts", f"overall_epoch_{overall_epoch_num}", f"chunk_{chunk_iteration_in_epoch}")
+            os.makedirs(per_chunk_artifacts_dir, exist_ok=True)
 
-    print("Finished processing all data chunks.")
+            per_chunk_checkpoint_callback = ModelCheckpoint(
+                dirpath=per_chunk_artifacts_dir, 
+                filename=f'model-oe{overall_epoch_num}-c{chunk_iteration_in_epoch}-best-{{epoch:02d}}-{{val_loss:.2f}}',
+                save_top_k=1, monitor='val_loss', mode='min'
+            )
+            
+            trainer_early_stop_patience = main_model_config.get('trainer_params',{}).get('early_stopping_patience_per_chunk', early_stopping_patience_per_chunk)
+            chunk_early_stop_callback = EarlyStopping(
+                monitor='val_loss', patience=trainer_early_stop_patience, mode='min', verbose=True
+            )
+            
+            chunk_logger = TensorBoardLogger(
+                save_dir=os.path.join(output_dir, "tensorboard_logs_per_chunk"), 
+                name=f"oe{overall_epoch_num}_chunk_{chunk_iteration_in_epoch}"
+            )
+            
+            num_batches_in_chunk = (len(df_chunk) // batch_size) + (1 if len(df_chunk) % batch_size != 0 else 0)
+            val_check_interval_steps = max(1, num_batches_in_chunk // 4) if epochs_per_chunk > 0 else num_batches_in_chunk 
+            log_steps = main_model_config.get('trainer_params',{}).get('log_every_n_steps', max(1, num_batches_in_chunk // 20))
 
-    # --- Final Steps (e.g., Save final model, preprocessing state, Test) ---
-    final_model_save_path = os.path.join(output_dir, "final_trained_model.ckpt")
-    trainer.save_checkpoint(final_model_save_path) # Save the very last state
-    print(f"Final trained model saved to {final_model_save_path}")
+            trainer = pl.Trainer(
+                max_epochs=epochs_per_chunk, 
+                accelerator=accelerator, precision=precision, devices=1, 
+                callbacks=[per_chunk_checkpoint_callback, chunk_early_stop_callback],
+                logger=chunk_logger, log_every_n_steps=log_steps,
+                val_check_interval=val_check_interval_steps,
+                accumulate_grad_batches=main_model_config.get('trainer_params',{}).get('accumulate_grad_batches', 4),
+            )
+
+            print(f"Fitting model on chunk {chunk_iteration_in_epoch} (Overall Epoch {overall_epoch_num}) for {epochs_per_chunk} epoch(s)...")
+            
+            # For the very first chunk of the very first overall epoch, potentially resume script state.
+            # Otherwise, train the 'model' instance which holds weights from previous chunks/overall epochs.
+            ckpt_path_for_this_fit = None
+            if overall_epoch_num == 1 and chunk_iteration_in_epoch == 1 and \
+               latest_overall_model_checkpoint_to_resume_script and \
+               os.path.exists(latest_overall_model_checkpoint_to_resume_script):
+                print(f"Resuming trainer state for first chunk of first overall epoch from: {latest_overall_model_checkpoint_to_resume_script}")
+                ckpt_path_for_this_fit = latest_overall_model_checkpoint_to_resume_script
+            
+            trainer.fit(model, datamodule=chunk_data_module, ckpt_path=ckpt_path_for_this_fit) 
+            
+            best_model_this_chunk_fit = per_chunk_checkpoint_callback.best_model_path 
+            if best_model_this_chunk_fit and os.path.exists(best_model_this_chunk_fit):
+                print(f"Best model during chunk {chunk_iteration_in_epoch} (OE {overall_epoch_num}) training passes saved to: {best_model_this_chunk_fit}")
+            else:
+                print(f"[INFO] No new 'best' checkpoint saved by ModelCheckpoint for this chunk's fit.")
+
+            # Save the overall model state after training on this chunk.
+            current_overall_ckpt_filename = f"overall_model_oe{overall_epoch_num}_after_chunk_{chunk_iteration_in_epoch}.ckpt"
+            current_overall_ckpt_path = os.path.join(overall_model_checkpoints_dir, current_overall_ckpt_filename)
+            trainer.save_checkpoint(current_overall_ckpt_path)
+            latest_overall_model_checkpoint_to_resume_script = current_overall_ckpt_path 
+            print(f"Overall model state checkpoint saved to: {latest_overall_model_checkpoint_to_resume_script}")
+            
+            del df_chunk, chunk_data_module, trainer, per_chunk_checkpoint_callback, chunk_early_stop_callback, chunk_logger
+            if torch.cuda.is_available() and accelerator in ['gpu', 'cuda']:
+                torch.cuda.empty_cache()
+        # End of inner while loop (chunks for current overall epoch)
+        print(f"--- Completed Overall Epoch {overall_epoch_num}/{num_overall_epochs} ---")
+    # End of outer for loop (overall epochs)
+
+    print("="*50)
+    print("Finished processing all overall epochs and their chunks.")
+    print("="*50)
+
+    final_model_save_path = os.path.join(output_dir, "final_trained_model_after_all_epochs.ckpt")
+    if latest_overall_model_checkpoint_to_resume_script and os.path.exists(latest_overall_model_checkpoint_to_resume_script):
+        # Copy the very last "overall" checkpoint to a fixed final name
+        import shutil
+        shutil.copy(latest_overall_model_checkpoint_to_resume_script, final_model_save_path)
+        print(f"Final trained model (copied from last overall checkpoint) saved to: {final_model_save_path}")
+    elif model: # If model exists but no checkpoints were made (e.g. dry run, 1 chunk, no save_top_k match)
+        # This trainer instance is from the last chunk, might not be ideal but better than nothing.
+        # A better approach would be to reinstantiate a trainer just for saving if needed.
+        # For simplicity, we'll assume latest_overall_model_checkpoint_to_resume_script is preferred.
+        print(f"[WARN] No overall checkpoint path found to copy as final model. Attempting to save current model state if possible.")
+        # Need a trainer to save, the last one was deleted. Re-create a simple one.
+        simple_trainer_for_save = pl.Trainer(accelerator='cpu', devices=1) # Simple trainer just to save
+        simple_trainer_for_save.save_checkpoint(final_model_save_path, weights_only=True) # Or full
+        print(f"Saved current model state to {final_model_save_path}. This might not be from a val checkpoint.")
+
 
     print("Saving final (global) preprocessing state...")
     state_to_save = {
         'scalers': global_stats['scalers'],
-        'category_id_map_name_to_code': global_category_map_name_to_code, # {name:code}
-        'user_map_name_to_code': global_user_map, # {name:code}
-        # Add other relevant global stats if needed
+        'global_category_map_name_to_code': global_category_map_name_to_code, 
+        'global_user_map_name_to_code': global_user_map_name_to_code,
+        'model_config_used_for_init': main_model_config 
     }
-    save_path = os.path.join(output_dir, 'global_preprocessing_state.pkl')
+    global_state_save_path = os.path.join(output_dir, 'global_preprocessing_and_model_config_state.pkl')
     try:
-        with open(save_path, 'wb') as f:
+        with open(global_state_save_path, 'wb') as f:
             pickle.dump(state_to_save, f)
-        print(f"Global preprocessing state saved to: {save_path}")
+        print(f"Global preprocessing and model config state saved to: {global_state_save_path}")
     except Exception as save_e:
-        print(f"[ERROR] Failed to save global preprocessing state: {save_e}")
-
-    # Testing (optional, on a held-out test set or a final validation chunk)
-    # This would require loading a test chunk and using trainer.test()
-    # ...
+        print(f"[ERROR] Failed to save global state: {save_e}")
 
     print("Iterative streaming training script finished.")
 
