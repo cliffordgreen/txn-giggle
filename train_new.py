@@ -1061,10 +1061,14 @@ if __name__ == '__main__':
                         help='Maximum number of files to use for statistics collection (streaming mode)')
     
     # --- Iterative Training Arguments (for streaming) ---
+    parser.add_argument('--num_overall_epochs', type=int, default=1,
+                        help='Number of full passes over the entire dataset via chunks (streaming mode)')
     parser.add_argument('--epochs_per_chunk', type=int, default=1,
                         help='Number of epochs to train on each chunk (streaming mode)')
     parser.add_argument('--total_chunks_to_process', type=int, default=None,
                         help='Maximum number of chunks to process for testing/debugging (streaming mode)')
+    parser.add_argument('--early_stopping_patience_per_chunk', type=int, default=3,
+                        help='Early stopping patience for each chunk training (streaming mode)')
 
     # --- Training Arguments --- 
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
@@ -1136,7 +1140,9 @@ if __name__ == '__main__':
             max_files_for_stats=args.max_files_for_stats,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            max_epochs=args.max_epochs,
+            num_overall_epochs=args.num_overall_epochs,
+            epochs_per_chunk=args.epochs_per_chunk,
+            total_chunks_to_process=args.total_chunks_to_process,
             seed=args.seed,
             model_config=model_config,
             learning_rate=args.learning_rate,
@@ -1147,8 +1153,7 @@ if __name__ == '__main__':
             accelerator=args.accelerator,
             precision=args.precision,
             hgt_num_samples=hgt_samples_dict,
-            epochs_per_chunk=args.epochs_per_chunk,
-            total_chunks_to_process=args.total_chunks_to_process
+            early_stopping_patience_per_chunk=args.early_stopping_patience_per_chunk
         )
     else:
         print("Using traditional training approach...")
