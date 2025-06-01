@@ -199,7 +199,12 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         self.node_feature_dims: Dict[str, int] = {}
         self.edge_feature_dims: Dict[Tuple[str, str, str], int] = {}
         self.sequence_feature_dim: Optional[int] = None
-        self.scalers: Dict[str, StandardScaler] = {} if fitted_scalers is None else fitted_scalers
+        
+        # self.scalers will store actual StandardScaler objects
+        self.scalers: Dict[str, StandardScaler] = {} 
+        # self.fitted_scalers (from __init__ arg) stores the parameter dicts if provided
+        self.fitted_scalers = fitted_scalers 
+
         self.seq_scalers: Dict[str, StandardScaler] = {} if fitted_seq_scalers is None else fitted_seq_scalers
         self.edge_scalers: Dict[str, StandardScaler] = {} if fitted_edge_scalers is None else fitted_edge_scalers
         self.user_map = None if fitted_user_map is None else fitted_user_map
@@ -828,28 +833,28 @@ class TransactionDataModuleV2(pl.LightningDataModule):
         # else: print warn? (Already done in fit_scalers)
 
     def _load_precomputed_scalers(self):
-        """Load pre-computed scalers from fitted_scalers."""
-        if self.fitted_scalers and 'transaction' in self.fitted_scalers:
-            # Convert pre-computed scaler parameters to StandardScaler-like objects
-            scaler_params = self.fitted_scalers['transaction']
-            
-            # Create a mock StandardScaler object
-            from sklearn.preprocessing import StandardScaler
-            mock_scaler = StandardScaler()
-            mock_scaler.mean_ = scaler_params['mean_']
-            mock_scaler.scale_ = scaler_params['scale_']
-            
-            self.scalers['transaction'] = mock_scaler
-            print(f"  Loaded pre-computed transaction scaler with {len(scaler_params['mean_'])} features")
-        
-        # Load other scalers if available
-        if self.fitted_scalers:
-            for scaler_name, scaler_params in self.fitted_scalers.items():
-                if scaler_name != 'transaction' and isinstance(scaler_params, dict):
-                    mock_scaler = StandardScaler()
-                    mock_scaler.mean_ = scaler_params['mean_']
-                    mock_scaler.scale_ = scaler_params['scale_']
-                    self.scalers[scaler_name] = mock_scaler
+        """Load pre-computed scalers from self.fitted_scalers (parameter dicts)
+           and store them as StandardScaler objects in self.scalers."""
+        if self.fitted_scalers: # Check if parameter dicts were provided via __init__
+            for scaler_name, scaler_params_dict in self.fitted_scalers.items():
+                if isinstance(scaler_params_dict, dict) and 'mean_' in scaler_params_dict and 'scale_' in scaler_params_dict:
+                    # Create a StandardScaler object
+                    actual_scaler_object = StandardScaler()
+                    # Ensure attributes are set as numpy arrays, as StandardScaler expects
+                    actual_scaler_object.mean_ = np.array(scaler_params_dict['mean_'], dtype=np.float64)
+                    actual_scaler_object.scale_ = np.array(scaler_params_dict['scale_'], dtype=np.float64)
+                    
+                    # Store the actual StandardScaler object in self.scalers
+                    self.scalers[scaler_name] = actual_scaler_object 
+                    print(f"  Loaded and created pre-computed {scaler_name} scaler with {len(actual_scaler_object.mean_)} features.")
+                elif isinstance(scaler_params_dict, StandardScaler):
+                    # If a StandardScaler object was somehow already passed (e.g. from a future refactor or different workflow)
+                    self.scalers[scaler_name] = scaler_params_dict # Directly assign it
+                    print(f"  Directly assigned pre-fitted StandardScaler object for {scaler_name}.")
+                else:
+                    print(f"  [WARN] Skipping pre-computed scaler for '{scaler_name}': Invalid format (not a dict with mean_/scale_ or a StandardScaler obj) or missing parameters in fitted_scalers.")
+        else:
+            print("  No fitted_scalers (parameter dicts) provided to _load_precomputed_scalers, self.scalers will remain empty or be populated by _fit_scalers.")
 
     def _build_graph_and_edges(self, raw_features: Dict[str, np.ndarray], train_indices: torch.Tensor):
         print("Building graph structure and applying SCALED features...")
