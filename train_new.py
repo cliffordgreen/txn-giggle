@@ -701,8 +701,7 @@ def train_advanced_streaming(
         # DataModule for the current chunk
         # DataModuleV2 expects fitted_category_id_map as {code: name_str}
         # global_category_map_name_to_code is {name: code}
-        # So we need to invert it for the DataModule or change DataModule
-        # For now, let's invert it here:
+        # So we need to invert it here:
         global_category_map_code_to_name = {v: k for k, v in global_category_map_name_to_code.items()}
 
         data_module = TransactionDataModuleV2(
@@ -781,19 +780,30 @@ def train_advanced_streaming(
             accumulate_grad_batches=4, # From original args
         )
 
-        print(f"Fitting model on chunk {chunk_number}...")
-        trainer.fit(model, datamodule=data_module, ckpt_path=last_checkpoint_path)
+        print(f"Fitting model on chunk {chunk_number} for {epochs_per_chunk} epoch(s)...")
+        if chunk_number == 1 and last_checkpoint_path: # Only for the very first chunk if resuming the whole script
+            print(f"Resuming trainer state for chunk 1 from: {last_checkpoint_path}")
+            trainer.fit(model, datamodule=data_module, ckpt_path=last_checkpoint_path)
+        else:
+            # For subsequent chunks, or if no initial checkpoint, train the existing model instance
+            # The 'model' object has the updated weights from previous chunks.
+            trainer.fit(model, datamodule=data_module) 
         
-        # Update last_checkpoint_path for the next iteration
-        last_checkpoint_path = checkpoint_callback.best_model_path
-        if not last_checkpoint_path or not os.path.exists(last_checkpoint_path):
-            print(f"[WARN] Best model path from checkpoint_callback for chunk {chunk_number} is invalid: {last_checkpoint_path}. Resuming may fail.")
-            # Fallback or error handling needed here if checkpoints are critical for resumption
-            # For simplicity, if no checkpoint, next iteration will train from current model state in memory.
+        # This now gets the best model path from the *current* chunk's training
+        best_model_this_chunk = checkpoint_callback.best_model_path 
+        if not best_model_this_chunk or not os.path.exists(best_model_this_chunk):
+            print(f"[WARN] No best model checkpoint saved by ModelCheckpoint for chunk {chunk_number}.")
+            # If no model was saved by the per-chunk callback (e.g. training didn't improve for save_top_k=1)
+            # then the "best" state is the current state of 'model' after fitting.
+            # We rely on current_overall_ckpt_path below to save the model state.
+        else:
+            print(f"Best model during chunk {chunk_number} training saved to: {best_model_this_chunk}")
 
-        print(f"Finished training on chunk {chunk_number}. Best model for this chunk: {last_checkpoint_path}")
-
-        # Optional: Clean up older non-best checkpoints for this chunk if needed to save space
+        # After training on a chunk, save the current state of the *overall model*
+        current_overall_ckpt_path = os.path.join(output_dir, f"overall_model_after_chunk_{chunk_number}.ckpt")
+        trainer.save_checkpoint(current_overall_ckpt_path)
+        last_checkpoint_path = current_overall_ckpt_path # This is for resuming the *entire script* if it crashes
+        print(f"Overall model state saved to: {last_checkpoint_path} after chunk {chunk_number}")
 
     print("Finished processing all data chunks.")
 
