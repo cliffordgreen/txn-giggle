@@ -944,22 +944,17 @@ def train_advanced_streaming(
             # Note: We keep sliding_window_buffer for the next chunk
             del df_chunk, df_chunk_for_training, chunk_data_module, trainer, per_chunk_checkpoint_callback, chunk_early_stop_callback, chunk_logger
             
-            # Aggressive cleanup for text encoder
+            # Cleanup for text encoder (less aggressive to avoid breaking the model)
             if hasattr(model, 'text_encoder') and model.text_encoder is not None:
-                # Clear any transformer model caches
+                # Clear any attention caches safely
                 if hasattr(model.text_encoder, 'model'):
-                    # For HuggingFace transformers
-                    if hasattr(model.text_encoder.model, 'embeddings'):
-                        # Clear position embeddings cache if exists
-                        if hasattr(model.text_encoder.model.embeddings, 'position_ids'):
-                            del model.text_encoder.model.embeddings.position_ids
-                    # Clear any attention caches
-                    for module in model.text_encoder.model.modules():
-                        if hasattr(module, 'clear_cache'):
-                            module.clear_cache()
-                # If using gradient checkpointing, disable it temporarily to clear memory
-                if hasattr(model.text_encoder.model, 'gradient_checkpointing_disable'):
-                    model.text_encoder.model.gradient_checkpointing_disable()
+                    for name, module in model.text_encoder.model.named_modules():
+                        # Only clear actual cache attributes, not model parameters
+                        if hasattr(module, 'past_key_values'):
+                            module.past_key_values = None
+                        if hasattr(module, '_cache'):
+                            module._cache = None
+                # Note: Don't delete position_ids or other model attributes as they may be needed
             
             # Clear graph encoder caches if any
             if hasattr(model, 'graph_encoder') and model.graph_encoder is not None:
