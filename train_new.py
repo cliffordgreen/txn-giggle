@@ -871,21 +871,50 @@ def train_advanced_streaming(
             if hasattr(trainer, 'logged_metrics') and trainer.logged_metrics:
                 # Extract final metrics for this chunk
                 chunk_metrics = trainer.logged_metrics
-                if 'train_loss' in chunk_metrics:
-                    global_training_metrics['chunk_train_losses'].append(float(chunk_metrics['train_loss']))
-                if 'val_loss' in chunk_metrics:
-                    global_training_metrics['chunk_val_losses'].append(float(chunk_metrics['val_loss']))
-                if 'train_acc_global' in chunk_metrics:
-                    global_training_metrics['chunk_train_accuracies'].append(float(chunk_metrics['train_acc_global']))
-                if 'val_acc_global' in chunk_metrics:
-                    global_training_metrics['chunk_val_accuracies'].append(float(chunk_metrics['val_acc_global']))
+                
+                # Debug: Print all available metrics
+                print(f"Available metrics in trainer.logged_metrics: {list(chunk_metrics.keys())}")
+                
+                # Try different possible metric names
+                # For train loss
+                train_loss_keys = ['train_loss', 'train/loss', 'train_loss_epoch']
+                for key in train_loss_keys:
+                    if key in chunk_metrics:
+                        global_training_metrics['chunk_train_losses'].append(float(chunk_metrics[key]))
+                        break
+                
+                # For val loss
+                val_loss_keys = ['val_loss', 'val/loss', 'val_loss_epoch']
+                for key in val_loss_keys:
+                    if key in chunk_metrics:
+                        global_training_metrics['chunk_val_losses'].append(float(chunk_metrics[key]))
+                        break
+                
+                # For train accuracy
+                train_acc_keys = ['train_acc_global', 'train/acc_global', 'train_acc_global_epoch']
+                for key in train_acc_keys:
+                    if key in chunk_metrics:
+                        global_training_metrics['chunk_train_accuracies'].append(float(chunk_metrics[key]))
+                        break
+                
+                # For val accuracy
+                val_acc_keys = ['val_acc_global', 'val/acc_global', 'val_acc_global_epoch']
+                for key in val_acc_keys:
+                    if key in chunk_metrics:
+                        global_training_metrics['chunk_val_accuracies'].append(float(chunk_metrics[key]))
+                        break
                 
                 # Log summary of metrics
                 print(f"Chunk {chunk_iteration_in_epoch} Metrics Summary:")
-                print(f"  Train Loss: {chunk_metrics.get('train_loss', 'N/A'):.4f}")
-                print(f"  Val Loss: {chunk_metrics.get('val_loss', 'N/A'):.4f}")
-                print(f"  Train Acc: {chunk_metrics.get('train_acc_global', 'N/A'):.4f}")
-                print(f"  Val Acc: {chunk_metrics.get('val_acc_global', 'N/A'):.4f}")
+                train_loss = chunk_metrics.get('train_loss', None)
+                val_loss = chunk_metrics.get('val_loss', None)
+                train_acc = chunk_metrics.get('train_acc_global', None)
+                val_acc = chunk_metrics.get('val_acc_global', None)
+                
+                print(f"  Train Loss: {train_loss:.4f}" if train_loss is not None else "  Train Loss: N/A")
+                print(f"  Val Loss: {val_loss:.4f}" if val_loss is not None else "  Val Loss: N/A")
+                print(f"  Train Acc: {train_acc:.4f}" if train_acc is not None else "  Train Acc: N/A")
+                print(f"  Val Acc: {val_acc:.4f}" if val_acc is not None else "  Val Acc: N/A")
                 
                 # Check for training stagnation
                 if len(global_training_metrics['chunk_val_losses']) >= 5:
@@ -1053,7 +1082,14 @@ def train_advanced_streaming(
         print(f"Total chunks processed: {len(global_training_metrics['chunk_train_losses'])}")
         if global_training_metrics['chunk_train_losses']:
             print(f"Average train loss: {np.mean(global_training_metrics['chunk_train_losses']):.4f}")
-            print(f"Average val loss: {np.mean(global_training_metrics['chunk_val_losses']):.4f}")
+            if global_training_metrics['chunk_val_losses']:
+                print(f"Average val loss: {np.mean(global_training_metrics['chunk_val_losses']):.4f}")
+            else:
+                print("Average val loss: N/A (no validation losses recorded)")
+            if global_training_metrics['chunk_train_accuracies']:
+                print(f"Average train accuracy: {np.mean(global_training_metrics['chunk_train_accuracies']):.4f}")
+            if global_training_metrics['chunk_val_accuracies']:
+                print(f"Average val accuracy: {np.mean(global_training_metrics['chunk_val_accuracies']):.4f}")
             print(f"Average memory usage: {np.mean(global_training_metrics['chunk_memory_usage']):.2f} GB")
             print(f"Peak memory usage: {np.max(global_training_metrics['chunk_memory_usage']):.2f} GB")
             print(f"Total training time: {np.sum(global_training_metrics['chunk_processing_times'])/3600:.2f} hours")
