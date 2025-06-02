@@ -754,6 +754,7 @@ def train_advanced_streaming(
             if sliding_window_buffer is not None and len(sliding_window_buffer) > 0:
                 print(f"Concatenating {len(sliding_window_buffer)} historical transactions from sliding window")
                 # Combine historical data with new chunk
+                import pandas as pd
                 df_chunk_with_history = pd.concat([sliding_window_buffer, df_chunk], ignore_index=True)
                 
                 # Sort by timestamp to maintain temporal order
@@ -906,9 +907,10 @@ def train_advanced_streaming(
                 
                 # Log summary of metrics
                 print(f"Chunk {chunk_iteration_in_epoch} Metrics Summary:")
-                train_loss = chunk_metrics.get('train_loss', None)
+                # Use the epoch-level metrics that are available
+                train_loss = chunk_metrics.get('train_loss_epoch', None)
                 val_loss = chunk_metrics.get('val_loss', None)
-                train_acc = chunk_metrics.get('train_acc_global', None)
+                train_acc = chunk_metrics.get('train_acc_global_epoch', None)
                 val_acc = chunk_metrics.get('val_acc_global', None)
                 
                 print(f"  Train Loss: {train_loss:.4f}" if train_loss is not None else "  Train Loss: N/A")
