@@ -829,7 +829,7 @@ def train_advanced_streaming(
             per_chunk_checkpoint_callback = ModelCheckpoint(
                 dirpath=per_chunk_artifacts_dir, 
                 filename=f'model-oe{overall_epoch_num}-c{chunk_iteration_in_epoch}-best-{{epoch:02d}}-{{val_loss:.2f}}',
-                save_top_k=1, monitor='val_loss', mode='min'
+                save_top_k=0, monitor='val_loss', mode='min'  # Set to 0 to disable per-chunk checkpoints
             )
             
             trainer_early_stop_patience = main_model_config.get('trainer_params',{}).get('early_stopping_patience_per_chunk', early_stopping_patience_per_chunk)
@@ -939,6 +939,17 @@ def train_advanced_streaming(
             latest_overall_model_checkpoint_to_resume_script = current_overall_ckpt_path 
             print(f"Overall model state checkpoint saved to: {latest_overall_model_checkpoint_to_resume_script}")
             
+            # Clean up old checkpoints - keep only last 3
+            import glob
+            all_ckpts = sorted(glob.glob(os.path.join(overall_model_checkpoints_dir, "overall_model_*.ckpt")))
+            if len(all_ckpts) > 3:
+                for old_ckpt in all_ckpts[:-3]:  # Keep last 3
+                    try:
+                        os.remove(old_ckpt)
+                        print(f"Removed old checkpoint: {os.path.basename(old_ckpt)}")
+                    except Exception as e:
+                        print(f"Failed to remove {old_ckpt}: {e}")
+            
             # Enhanced memory cleanup after each chunk
             # Clear references to data and modules
             # Note: We keep sliding_window_buffer for the next chunk
@@ -995,6 +1006,25 @@ def train_advanced_streaming(
             if sliding_window_buffer is not None:
                 sliding_window_memory_gb = sliding_window_buffer.memory_usage(deep=True).sum() / 1024**3
                 print(f"[INFO] Sliding window buffer memory: {sliding_window_memory_gb:.2f}GB")
+            
+            # Check disk space
+            import shutil
+            disk_usage = shutil.disk_usage(output_dir)
+            free_gb = disk_usage.free / (1024**3)
+            total_gb = disk_usage.total / (1024**3)
+            used_percent = (disk_usage.used / disk_usage.total) * 100
+            print(f"[INFO] Disk space - Free: {free_gb:.1f}GB / Total: {total_gb:.1f}GB ({used_percent:.1f}% used)")
+            
+            if free_gb < 10:  # Less than 10GB free
+                print(f"[WARN] Low disk space! Only {free_gb:.1f}GB remaining")
+                if free_gb < 5:  # Critical - less than 5GB
+                    print("[CRITICAL] Very low disk space! Cleaning up old files...")
+                    # Emergency cleanup of tensorboard logs
+                    tb_dir = os.path.join(output_dir, "tensorboard_logs_per_chunk")
+                    if os.path.exists(tb_dir):
+                        shutil.rmtree(tb_dir)
+                        os.makedirs(tb_dir)
+                        print("Cleared TensorBoard logs to free space")
             
             # If memory usage is too high, we might need to take more drastic measures
             if memory_gb > 100:  # If using more than 100GB RAM
