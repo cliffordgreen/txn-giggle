@@ -567,13 +567,39 @@ def train_advanced_streaming(
     os.makedirs(output_dir, exist_ok=True)
 
     # === PASS 1: Collect GLOBAL Statistics (ONCE at the very beginning) ===
-    print("="*50)
-    print("Starting GLOBAL statistics collection pass (will scan all relevant files)...")
-    print("="*50)
-    if max_files_for_stats is not None:
-        print(f"[INFO] max_files_for_stats is set to {max_files_for_stats}. For full dataset stats, this should ideally be None or cover all files.")
+    # Check if we already have saved statistics from a previous run
+    global_state_save_path = os.path.join(output_dir, 'global_preprocessing_and_model_config_state.pkl')
     
-    global_stats = collect_statistics_pass(data_dir, max_files_for_stats=max_files_for_stats, add_unknowns=True) 
+    if os.path.exists(global_state_save_path):
+        print("="*50)
+        print("Found existing global statistics, loading from file...")
+        print("="*50)
+        try:
+            with open(global_state_save_path, 'rb') as f:
+                saved_state = pickle.load(f)
+            global_stats = {
+                'scalers': saved_state['scalers'],
+                'category_map': saved_state['global_category_map_name_to_code'],
+                'user_map': saved_state['global_user_map_name_to_code'],
+                'category_counts': {k: 1 for k in saved_state['global_category_map_name_to_code'].keys()},
+                'user_counts': {k: 1 for k in saved_state['global_user_map_name_to_code'].keys()}
+            }
+            print(f"Loaded statistics with {len(global_stats['category_map'])} categories and {len(global_stats['user_map'])} users")
+        except Exception as e:
+            print(f"[ERROR] Failed to load saved statistics: {e}")
+            print("Falling back to collecting statistics from scratch...")
+            global_stats = None
+    else:
+        global_stats = None
+    
+    if global_stats is None:
+        print("="*50)
+        print("Starting GLOBAL statistics collection pass (will scan all relevant files)...")
+        print("="*50)
+        if max_files_for_stats is not None:
+            print(f"[INFO] max_files_for_stats is set to {max_files_for_stats}. For full dataset stats, this should ideally be None or cover all files.")
+        
+        global_stats = collect_statistics_pass(data_dir, max_files_for_stats=max_files_for_stats, add_unknowns=True) 
     
     global_user_map_name_to_code = global_stats['user_map']
     global_category_map_name_to_code = global_stats['category_map']
@@ -597,7 +623,8 @@ def train_advanced_streaming(
 
     # === GNN Configuration Dry Run (ONCE at the very beginning) ===
     print("Starting GNN configuration dry run...")
-    all_arrow_files_for_dry_run = sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
+    import glob as glob_module
+    all_arrow_files_for_dry_run = sorted(glob_module.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
     if not all_arrow_files_for_dry_run: # Check needed here as well
         raise FileNotFoundError(f"No .arrow files found in {data_dir} for GNN dry run.")
 
@@ -675,19 +702,44 @@ def train_advanced_streaming(
     print("="*50)
 
     # --- Script Resumption Logic ---
-    # TODO: Implement more robust script resumption. For now, this tracks the last overall checkpoint.
-    # This should ideally be loaded *into* the model object if resuming.
-    latest_overall_model_checkpoint_to_resume_script = None 
+    # Check for existing checkpoints to resume from
+    latest_overall_model_checkpoint_to_resume_script = None
+    existing_checkpoints = sorted(glob.glob(os.path.join(overall_model_checkpoints_dir, "overall_model_*.ckpt")))
+    if existing_checkpoints:
+        latest_overall_model_checkpoint_to_resume_script = existing_checkpoints[-1]
+        print(f"Found existing checkpoint to resume from: {latest_overall_model_checkpoint_to_resume_script}")
+        # Load the checkpoint to get the model state
+        checkpoint = torch.load(latest_overall_model_checkpoint_to_resume_script, map_location='cpu')
+        model.load_state_dict(checkpoint['state_dict'])
+        print("Loaded model weights from checkpoint") 
 
     # --- Global Metrics Tracking ---
-    global_training_metrics = {
-        'chunk_train_losses': [],
-        'chunk_val_losses': [],
-        'chunk_train_accuracies': [],
-        'chunk_val_accuracies': [],
-        'chunk_memory_usage': [],
-        'chunk_processing_times': []
-    }
+    # Try to load existing metrics if resuming
+    metrics_save_path = os.path.join(output_dir, 'training_metrics_history.pkl')
+    if os.path.exists(metrics_save_path):
+        try:
+            with open(metrics_save_path, 'rb') as f:
+                global_training_metrics = pickle.load(f)
+            print(f"Loaded existing training metrics: {len(global_training_metrics['chunk_train_losses'])} chunks already processed")
+        except Exception as e:
+            print(f"[WARN] Failed to load existing metrics: {e}")
+            global_training_metrics = {
+                'chunk_train_losses': [],
+                'chunk_val_losses': [],
+                'chunk_train_accuracies': [],
+                'chunk_val_accuracies': [],
+                'chunk_memory_usage': [],
+                'chunk_processing_times': []
+            }
+    else:
+        global_training_metrics = {
+            'chunk_train_losses': [],
+            'chunk_val_losses': [],
+            'chunk_train_accuracies': [],
+            'chunk_val_accuracies': [],
+            'chunk_memory_usage': [],
+            'chunk_processing_times': []
+        }
     
     # --- Sliding Window for Graph Continuity ---
     # Keep a buffer of recent transactions to maintain temporal connections
@@ -698,7 +750,7 @@ def train_advanced_streaming(
     overall_model_checkpoints_dir = os.path.join(output_dir, "overall_model_checkpoints")
     os.makedirs(overall_model_checkpoints_dir, exist_ok=True)
     
-    all_arrow_files_full_dataset = sorted(glob.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
+    all_arrow_files_full_dataset = sorted(glob_module.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
     if not all_arrow_files_full_dataset:
         raise FileNotFoundError(f"No .arrow files found in {data_dir} for iterative training.")
 
@@ -712,6 +764,32 @@ def train_advanced_streaming(
         more_data_to_load = True
         chunk_iteration_in_epoch = 0 # Renamed to avoid confusion with a global chunk_number
         
+        # Check if we should skip chunks based on existing checkpoints
+        resume_from_chunk = 0
+        if overall_epoch_num == 1 and existing_checkpoints:
+            # Extract chunk number from latest checkpoint filename
+            import re
+            match = re.search(r'_oe(\d+)_after_chunk_(\d+)\.ckpt', os.path.basename(latest_overall_model_checkpoint_to_resume_script))
+            if match:
+                resume_epoch = int(match.group(1))
+                resume_chunk = int(match.group(2))
+                if resume_epoch == overall_epoch_num:
+                    resume_from_chunk = resume_chunk
+                    print(f"Will resume from chunk {resume_from_chunk + 1} in epoch {overall_epoch_num}")
+                    
+                    # Calculate approximate file index and offset to skip processed data
+                    chunks_to_skip = resume_from_chunk
+                    transactions_to_skip = chunks_to_skip * max_transactions
+                    
+                    # Rough estimate: assume files have ~50k transactions each
+                    avg_transactions_per_file = 50000
+                    files_to_skip = transactions_to_skip // avg_transactions_per_file
+                    current_file_idx = min(files_to_skip, len(all_arrow_files_full_dataset) - 1)
+                    current_row_offset_in_file = transactions_to_skip % avg_transactions_per_file
+                    
+                    print(f"Skipping approximately {transactions_to_skip} transactions")
+                    print(f"Starting from file index {current_file_idx} with offset {current_row_offset_in_file}")
+        
         # Reset sliding window for new epoch to avoid cross-epoch contamination
         if overall_epoch_num > 1:
             print("Resetting sliding window buffer for new overall epoch")
@@ -721,6 +799,11 @@ def train_advanced_streaming(
         while more_data_to_load:
             chunk_iteration_in_epoch += 1
             current_global_chunk_num = ((overall_epoch_num - 1) * (len(all_arrow_files_full_dataset) * 10000 // max_transactions +1 )) + chunk_iteration_in_epoch # Approx for logging
+
+            # Skip chunks that have already been processed when resuming
+            if chunk_iteration_in_epoch <= resume_from_chunk:
+                print(f"Skipping already processed chunk {chunk_iteration_in_epoch}")
+                continue
 
             if total_chunks_to_process is not None and chunk_iteration_in_epoch > total_chunks_to_process:
                 print(f"Reached total_chunks_to_process limit ({total_chunks_to_process}) for overall_epoch {overall_epoch_num}.")
@@ -940,8 +1023,8 @@ def train_advanced_streaming(
             print(f"Overall model state checkpoint saved to: {latest_overall_model_checkpoint_to_resume_script}")
             
             # Clean up old checkpoints - keep only last 3
-            import glob
-            all_ckpts = sorted(glob.glob(os.path.join(overall_model_checkpoints_dir, "overall_model_*.ckpt")))
+            import glob as glob_cleanup
+            all_ckpts = sorted(glob_cleanup.glob(os.path.join(overall_model_checkpoints_dir, "overall_model_*.ckpt")))
             if len(all_ckpts) > 3:
                 for old_ckpt in all_ckpts[:-3]:  # Keep last 3
                     try:
