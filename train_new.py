@@ -562,35 +562,41 @@ def train_advanced_streaming(
        - Global metrics tracking: Monitors training progress across all chunks
        - Consistent validation: Reserved users for comparable metrics
     """
+    # 1. Seed and Paths
     torch.set_float32_matmul_precision('high') 
     pl.seed_everything(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    # === PASS 1: Collect GLOBAL Statistics (ONCE at the very beginning) ===
-    # Check if we already have saved statistics from a previous run
+    # 2. Load/Collect Global Statistics
     global_state_save_path = os.path.join(output_dir, 'global_preprocessing_and_model_config_state.pkl')
-    
+    global_stats = None
     if os.path.exists(global_state_save_path):
         print("="*50)
-        print("Found existing global statistics, loading from file...")
+        print(f"Found existing global statistics, loading from file: {global_state_save_path}")
         print("="*50)
         try:
             with open(global_state_save_path, 'rb') as f:
                 saved_state = pickle.load(f)
+            # Reconstruct global_stats similar to how it's built by collect_statistics_pass
             global_stats = {
                 'scalers': saved_state['scalers'],
                 'category_map': saved_state['global_category_map_name_to_code'],
                 'user_map': saved_state['global_user_map_name_to_code'],
+                # Reconstruct counts for consistency, actual counts might not be perfectly preserved but maps are key
                 'category_counts': {k: 1 for k in saved_state['global_category_map_name_to_code'].keys()},
-                'user_counts': {k: 1 for k in saved_state['global_user_map_name_to_code'].keys()}
+                'user_counts': {k: 1 for k in saved_state['global_user_map_name_to_code'].keys()},
+                'coa_feature_stats': {}, # These are not strictly needed for resume if scalers are present
+                'amount_stats': {}, # Not strictly needed
+                'num_coa_stats': {} # Not strictly needed
             }
-            print(f"Loaded statistics with {len(global_stats['category_map'])} categories and {len(global_stats['user_map'])} users")
+            # If model_config was saved, we might want to load and compare/use it
+            if 'model_config_used_for_init' in saved_state:
+                 print("[INFO] Found saved model_config in state file. Current CLI/YAML config will be used for training.")
+            print(f"Loaded statistics with {len(global_stats['category_map'])} categories and {len(global_stats['user_map'])} users.")
         except Exception as e:
-            print(f"[ERROR] Failed to load saved statistics: {e}")
+            print(f"[ERROR] Failed to load saved statistics from {global_state_save_path}: {e}")
             print("Falling back to collecting statistics from scratch...")
-            global_stats = None
-    else:
-        global_stats = None
+            global_stats = None # Ensure it's reset
     
     if global_stats is None:
         print("="*50)
@@ -598,8 +604,7 @@ def train_advanced_streaming(
         print("="*50)
         if max_files_for_stats is not None:
             print(f"[INFO] max_files_for_stats is set to {max_files_for_stats}. For full dataset stats, this should ideally be None or cover all files.")
-        
-        global_stats = collect_statistics_pass(data_dir, max_files_for_stats=max_files_for_stats, add_unknowns=True) 
+        global_stats = collect_statistics_pass(data_dir, max_files_for_stats=max_files_for_stats, add_unknowns=True)
     
     global_user_map_name_to_code = global_stats['user_map']
     global_category_map_name_to_code = global_stats['category_map']
@@ -609,27 +614,25 @@ def train_advanced_streaming(
 
     print(f"Global Stats: #Users={global_num_users} (incl. unknown), #GlobalClasses={global_num_global_classes} (incl. unknown)")
     
-    # Reserve some users/categories for consistent validation
-    # This helps ensure validation metrics are comparable across chunks
     all_user_names = sorted(list(global_user_map_name_to_code.keys()))
-    all_category_names = sorted(list(global_category_map_name_to_code.keys()))
-    
-    # Reserve 5% of users for global validation (min 10, max 1000)
     num_val_users = min(max(int(len(all_user_names) * 0.05), 10), 1000)
-    global_val_users = set(all_user_names[:num_val_users])
-    print(f"Reserved {num_val_users} users for global validation")
-    
+    # global_val_users = set(all_user_names[:num_val_users]) # Defined but not used elsewhere, consider removing if not needed
+    print(f"Reserved {num_val_users} users for global validation (for consistent val splits if enabled in DataModule)")
     print("="*50)
 
-    # === GNN Configuration Dry Run (ONCE at the very beginning) ===
+    # 3. Define overall_model_checkpoints_dir
+    overall_model_checkpoints_dir = os.path.join(output_dir, "overall_model_checkpoints")
+    os.makedirs(overall_model_checkpoints_dir, exist_ok=True)
+
+    # 4. GNN Configuration Dry Run (needs global_stats)
     print("Starting GNN configuration dry run...")
-    import glob as glob_module
+    import glob as glob_module # Ensure glob is imported correctly here
     all_arrow_files_for_dry_run = sorted(glob_module.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
-    if not all_arrow_files_for_dry_run: # Check needed here as well
+    if not all_arrow_files_for_dry_run:
         raise FileNotFoundError(f"No .arrow files found in {data_dir} for GNN dry run.")
 
     dry_run_chunk_df, _, _, _ = load_data_chunk_iteratively(
-        all_arrow_files=all_arrow_files_for_dry_run, # Use the full list
+        all_arrow_files=all_arrow_files_for_dry_run,
         current_file_idx=0,
         current_row_offset_in_file=0,
         max_transactions_per_chunk=min(10000, max_transactions // 10 if max_transactions > 1000 else 1000),
@@ -660,21 +663,21 @@ def train_advanced_streaming(
     initial_graph_metadata = temp_data_module.full_graph_data.metadata()
     initial_node_feature_dims = temp_data_module.node_feature_dims
     del temp_data_module, dry_run_chunk_df, temp_global_category_map_code_to_name
+    gc.collect() # Clean up dry run memory
     print("GNN configuration dry run complete.")
     print(f"  Initial Graph Metadata: {initial_graph_metadata}")
     print(f"  Initial Node Feature Dims: {initial_node_feature_dims}")
     print("="*50)
 
-    # === Initialize Main Model (ONCE) ===
+    # 5. Initialize Main Model (needs GNN config and global_stats)
     main_model_config = model_config.copy()
     main_model_config['num_users'] = global_num_users
     main_model_config['num_global_classes'] = global_num_global_classes
-    main_model_config['num_user_classes'] = global_num_user_classes
+    main_model_config['num_user_classes'] = global_num_user_classes # Typically 0 unless user-specific heads active
     if 'graph_encoder_params' not in main_model_config: main_model_config['graph_encoder_params'] = {}
     main_model_config['graph_encoder_params']['metadata'] = initial_graph_metadata
     main_model_config['graph_encoder_params']['in_channels'] = initial_node_feature_dims
     
-    # Ensure fusion parameter keys exist before assignment
     if 'fusion_params' not in main_model_config: main_model_config['fusion_params'] = {}
     if main_model_config.get('use_gnn_encoder', True) and 'graph_encoder_params' in main_model_config:
         main_model_config['fusion_params']['graph_dim'] = main_model_config['graph_encoder_params'].get('out_channels', 128)
@@ -685,13 +688,12 @@ def train_advanced_streaming(
         finbert_hidden_size = 768 
         text_out_dim_for_fusion = text_proj_dim if text_proj_dim > 0 else finbert_hidden_size
         main_model_config['fusion_params']['text_dim'] = text_out_dim_for_fusion
-    if 'user_embed_dim' in main_model_config: # Ensure user_embed_dim is in config
+    if 'user_embed_dim' in main_model_config:
         main_model_config['fusion_params']['user_dim'] = main_model_config['user_embed_dim']
-    else: # Add a default if not present, or raise error
-        main_model_config['user_embed_dim'] = 64 # Example default
+    else:
+        main_model_config['user_embed_dim'] = 64 
         main_model_config['fusion_params']['user_dim'] = 64
         print("[WARN] 'user_embed_dim' not found in model_config, defaulted to 64.")
-
 
     print("Initializing AdvancedTransactionCategorizationModel globally...")
     model = AdvancedTransactionCategorizationModel(
@@ -701,116 +703,245 @@ def train_advanced_streaming(
     print("Global model initialized.")
     print("="*50)
 
-    # --- Script Resumption Logic ---
-    # Check for existing checkpoints to resume from
+    # 6. Script Resumption Logic (Load Checkpoint)
     latest_overall_model_checkpoint_to_resume_script = None
-    existing_checkpoints = sorted(glob.glob(os.path.join(overall_model_checkpoints_dir, "overall_model_*.ckpt")))
+    existing_checkpoints = []
+    if os.path.exists(overall_model_checkpoints_dir):
+         import glob # Local import for this block
+         existing_checkpoints = sorted(glob.glob(os.path.join(overall_model_checkpoints_dir, "overall_model_*.ckpt")))
+    
     if existing_checkpoints:
         latest_overall_model_checkpoint_to_resume_script = existing_checkpoints[-1]
         print(f"Found existing checkpoint to resume from: {latest_overall_model_checkpoint_to_resume_script}")
-        # Load the checkpoint to get the model state
-        checkpoint = torch.load(latest_overall_model_checkpoint_to_resume_script, map_location='cpu')
-        model.load_state_dict(checkpoint['state_dict'])
-        print("Loaded model weights from checkpoint") 
+        try:
+            # Load the checkpoint to get the model state (and potentially optimizer, etc.)
+            # trainer.fit will handle actual resumption if ckpt_path is passed, 
+            # but loading weights here ensures model is up-to-date for first chunk if not using trainer.fit's ckpt_path
+            checkpoint_data = torch.load(latest_overall_model_checkpoint_to_resume_script, map_location='cpu')
+            model.load_state_dict(checkpoint_data['state_dict'])
+            print("Successfully loaded model weights from the latest checkpoint.")
+            # Note: We don't load optimizer state here as a new Trainer is created per chunk.
+            # Lightning handles optimizer state if ckpt_path is passed to trainer.fit() for the first chunk.
+        except Exception as e:
+            print(f"[ERROR] Failed to load state_dict from checkpoint {latest_overall_model_checkpoint_to_resume_script}: {e}")
+            print("Proceeding with a freshly initialized model.")
+            latest_overall_model_checkpoint_to_resume_script = None # Don't use a broken checkpoint
+    else:
+        print("No existing overall model checkpoints found. Starting fresh training.")
 
-    # --- Global Metrics Tracking ---
-    # Try to load existing metrics if resuming
+    # 7. Load Global Training Metrics
     metrics_save_path = os.path.join(output_dir, 'training_metrics_history.pkl')
-    if os.path.exists(metrics_save_path):
+    if os.path.exists(metrics_save_path) and latest_overall_model_checkpoint_to_resume_script: # Only load if resuming
+        print(f"Attempting to load existing training metrics from: {metrics_save_path}")
         try:
             with open(metrics_save_path, 'rb') as f:
                 global_training_metrics = pickle.load(f)
-            print(f"Loaded existing training metrics: {len(global_training_metrics['chunk_train_losses'])} chunks already processed")
+            print(f"Loaded existing training metrics: {len(global_training_metrics.get('chunk_train_losses', []))} chunks appear processed in metrics.")
         except Exception as e:
-            print(f"[WARN] Failed to load existing metrics: {e}")
-            global_training_metrics = {
-                'chunk_train_losses': [],
-                'chunk_val_losses': [],
-                'chunk_train_accuracies': [],
-                'chunk_val_accuracies': [],
-                'chunk_memory_usage': [],
-                'chunk_processing_times': []
-            }
+            print(f"[WARN] Failed to load existing metrics from {metrics_save_path}: {e}. Initializing fresh metrics.")
+            global_training_metrics = defaultdict(list) # Use defaultdict for easier append
     else:
-        global_training_metrics = {
-            'chunk_train_losses': [],
-            'chunk_val_losses': [],
-            'chunk_train_accuracies': [],
-            'chunk_val_accuracies': [],
-            'chunk_memory_usage': [],
-            'chunk_processing_times': []
-        }
-    
-    # --- Sliding Window for Graph Continuity ---
-    # Keep a buffer of recent transactions to maintain temporal connections
-    sliding_window_size = min(50000, max_transactions // 10)  # 10% of chunk size or 50k max
-    sliding_window_buffer = None  # Will store recent transactions from previous chunk
+        print("Initializing fresh training metrics.")
+        global_training_metrics = defaultdict(list)
+
+    # 8. Initialize Sliding Window & Get Full Dataset File List
+    sliding_window_size = min(50000, max_transactions // 10)
+    sliding_window_buffer = None
     print(f"Using sliding window of {sliding_window_size} transactions for graph continuity")
-    
-    overall_model_checkpoints_dir = os.path.join(output_dir, "overall_model_checkpoints")
-    os.makedirs(overall_model_checkpoints_dir, exist_ok=True)
     
     all_arrow_files_full_dataset = sorted(glob_module.glob(os.path.join(data_dir, '**/*.arrow'), recursive=True))
     if not all_arrow_files_full_dataset:
         raise FileNotFoundError(f"No .arrow files found in {data_dir} for iterative training.")
 
+    # 9. Determine resume_from_chunk and related offsets
+    resume_from_chunk = 0 # This means start from chunk 1 (as chunk_iteration_in_epoch is 1-indexed)
+    current_file_idx_on_resume = 0
+    current_row_offset_on_resume = 0
+
+    if latest_overall_model_checkpoint_to_resume_script: # If we are resuming
+        import re
+        match = re.search(r'_oe(\d+)_after_chunk_(\d+)\.ckpt$', os.path.basename(latest_overall_model_checkpoint_to_resume_script))
+        if match:
+            resume_epoch_from_ckpt = int(match.group(1))
+            resume_chunk_from_ckpt = int(match.group(2)) # This is the last COMPLETED chunk
+            
+            print(f"Checkpoint indicates training completed up to overall_epoch {resume_epoch_from_ckpt}, chunk {resume_chunk_from_ckpt}.")
+
+            # Determine where to start the current training run
+            # If the checkpoint's epoch is less than the target num_overall_epochs
+            if resume_epoch_from_ckpt < num_overall_epochs:
+                # If the checkpoint is from a previous overall_epoch, we start the new overall_epoch from chunk 0
+                # If the checkpoint is from the *current* overall_epoch (shouldn't happen if epochs are sequential),
+                # then we'd resume from the next chunk in that epoch.
+                # For simplicity, assume overall_epochs are processed sequentially.
+                # If we want to resume a specific overall_epoch, CLI args should reflect that.
+                
+                # The logic here is to determine the starting chunk for the *first overall_epoch* of *this run*.
+                # If the checkpoint is from overall_epoch 1, chunk 17, and we are starting overall_epoch 1 now,
+                # then we should resume from chunk 18 (i.e. resume_from_chunk = 17, meaning skip 17 chunks).
+                
+                # Let's align `resume_from_chunk` with the number of chunks ALREADY PROCESSED in the
+                # *first overall epoch* we are about to run.
+                # If the latest checkpoint is for oe1_chunk17, and our num_overall_epochs starts from 1:
+                # We set resume_from_chunk to 17. The loop for overall_epoch=1 will skip up to chunk 17.
+
+                # Number of chunks already processed in the metrics file might be more reliable
+                # if checkpoint saving failed but metrics were saved.
+                num_processed_chunks_in_metrics = len(global_training_metrics.get('chunk_train_losses', []))
+                
+                # Heuristic: if checkpoint chunk and metrics chunk count differ significantly, there might be an issue.
+                # For now, trust the checkpoint for determining the data loading point.
+                # `resume_chunk_from_ckpt` is the number of the last *completed* chunk.
+                # So, we need to start from `resume_chunk_from_ckpt + 1`.
+                # `resume_from_chunk` will be used to skip chunks, so it should be `resume_chunk_from_ckpt`.
+                
+                # This resume logic is for the *first overall epoch of the current script run*.
+                # It means we are trying to pick up where the *absolute last run* left off,
+                # but only if that last run was part of what would be the current script's first overall epoch.
+                
+                # Simplified: Assume the checkpoint is for the current series of overall epochs.
+                # `resume_chunk_from_ckpt` is the last chunk successfully processed in its overall epoch.
+                # We need to calculate the *absolute* number of chunks skipped across all previous overall epochs
+                # plus the chunks skipped in the *resuming* overall epoch.
+
+                # This part is tricky. Let's refine:
+                # `target_start_overall_epoch` is the first epoch this script intends to run (usually 1 unless specified)
+                # `target_end_overall_epoch` is `num_overall_epochs`
+                
+                # If `resume_epoch_from_ckpt` is the *same* as the `target_start_overall_epoch` for this run,
+                # then `resume_from_chunk` (for skipping within that first epoch) should be `resume_chunk_from_ckpt`.
+                
+                # For now, let's assume we always try to resume into the first overall epoch of the current run
+                # if a checkpoint from that logical epoch exists.
+                
+                # If current script is set to run oe=1 to oe=5,
+                # and last_ckpt was oe=1_chunk=17, then for this run's oe=1, skip 17 chunks.
+                # current_file_idx and current_row_offset should be set based on these 17 skipped chunks.
+
+                # The `overall_epoch_num` loop will handle which overall epoch we are in.
+                # The `resume_from_chunk` should apply *if* `overall_epoch_num` matches `resume_epoch_from_ckpt`.
+                
+                # Let's store these globally for the loop:
+                script_resume_info = {
+                    'resume_epoch_from_ckpt': resume_epoch_from_ckpt,
+                    'resume_chunk_from_ckpt': resume_chunk_from_ckpt # Last completed chunk in that epoch
+                }
+                print(f"Script will attempt to resume if running overall epoch {resume_epoch_from_ckpt}, starting after chunk {resume_chunk_from_ckpt}.")
+
+            else: # Checkpoint epoch is >= num_overall_epochs, so training should be complete
+                print(f"Checkpoint indicates training for {resume_epoch_from_ckpt} overall epochs is complete. "
+                      f"Current script is set for {num_overall_epochs} total. Nothing to do if resume_epoch >= num_overall_epochs.")
+                # Potentially exit here if all epochs are done.
+        else: # Regex didn't match, checkpoint name format might be different or old
+            print(f"[WARN] Could not parse epoch/chunk from checkpoint name: {os.path.basename(latest_overall_model_checkpoint_to_resume_script)}")
+            script_resume_info = {}
+    else: # No checkpoints exist
+        script_resume_info = {}
+
+
     # === Outer Loop for Overall Epochs ===
     for overall_epoch_num in range(1, num_overall_epochs + 1):
         print(f"\n{'='*25} Starting Overall Epoch {overall_epoch_num}/{num_overall_epochs} {'='*25}")
         
-        # Reset chunk iteration state for each overall epoch
+        # Reset chunk iteration state for each overall epoch for data loading
         current_file_idx = 0
         current_row_offset_in_file = 0 
         more_data_to_load = True
-        chunk_iteration_in_epoch = 0 # Renamed to avoid confusion with a global chunk_number
+        # chunk_iteration_in_epoch is 1-indexed (e.g. chunk 1, 2, ...)
         
-        # Check if we should skip chunks based on existing checkpoints
-        resume_from_chunk = 0
-        if overall_epoch_num == 1 and existing_checkpoints:
-            # Extract chunk number from latest checkpoint filename
-            import re
-            match = re.search(r'_oe(\d+)_after_chunk_(\d+)\.ckpt', os.path.basename(latest_overall_model_checkpoint_to_resume_script))
-            if match:
-                resume_epoch = int(match.group(1))
-                resume_chunk = int(match.group(2))
-                if resume_epoch == overall_epoch_num:
-                    resume_from_chunk = resume_chunk
-                    print(f"Will resume from chunk {resume_from_chunk + 1} in epoch {overall_epoch_num}")
-                    
-                    # Calculate approximate file index and offset to skip processed data
-                    chunks_to_skip = resume_from_chunk
-                    transactions_to_skip = chunks_to_skip * max_transactions
-                    
-                    # Rough estimate: assume files have ~50k transactions each
-                    avg_transactions_per_file = 50000
-                    files_to_skip = transactions_to_skip // avg_transactions_per_file
-                    current_file_idx = min(files_to_skip, len(all_arrow_files_full_dataset) - 1)
-                    current_row_offset_in_file = transactions_to_skip % avg_transactions_per_file
-                    
-                    print(f"Skipping approximately {transactions_to_skip} transactions")
-                    print(f"Starting from file index {current_file_idx} with offset {current_row_offset_in_file}")
-        
-        # Reset sliding window for new epoch to avoid cross-epoch contamination
-        if overall_epoch_num > 1:
-            print("Resetting sliding window buffer for new overall epoch")
-            sliding_window_buffer = None
+        # Determine how many chunks to skip for THIS specific overall_epoch_num if resuming
+        chunks_to_skip_this_epoch = 0
+        if script_resume_info and script_resume_info.get('resume_epoch_from_ckpt') == overall_epoch_num:
+            chunks_to_skip_this_epoch = script_resume_info.get('resume_chunk_from_ckpt', 0)
+            print(f"Resuming Overall Epoch {overall_epoch_num}: Will skip {chunks_to_skip_this_epoch} previously completed chunks.")
+            
+            # Adjust data loading pointers (current_file_idx, current_row_offset_in_file)
+            # This needs to be precise. Iterate through files to find the correct starting point.
+            transactions_actually_skipped = 0
+            temp_file_idx = 0
+            temp_row_offset = 0
+            
+            # Simulate loading to find the correct offset
+            # This is an estimation. A more robust way would be to save (file_idx, row_offset) in checkpoint.
+            # For now, approximate based on max_transactions per chunk.
+            if chunks_to_skip_this_epoch > 0:
+                # Simplified calculation for now:
+                # This estimates the total number of transactions processed in the chunks to be skipped.
+                # It assumes each of those chunks was full (max_transactions).
+                total_transactions_to_skip_in_epoch = chunks_to_skip_this_epoch * max_transactions
 
+                # Iterate through arrow files to find which file and offset this corresponds to.
+                # This is still an approximation as process_chunk_with_global_maps might filter rows.
+                # A truly robust resume needs to save precise (file_path, row_index_within_file) or (absolute_transaction_id).
+                skipped_txn_count_for_offset_calc = 0
+                for f_idx, f_path in enumerate(all_arrow_files_full_dataset):
+                    if skipped_txn_count_for_offset_calc >= total_transactions_to_skip_in_epoch:
+                        break
+                    try:
+                        with ipc.open_stream(f_path) as reader:
+                            table_len = reader.read_all().num_rows # More accurate than assuming file size
+                        
+                        if skipped_txn_count_for_offset_calc + table_len < total_transactions_to_skip_in_epoch:
+                            skipped_txn_count_for_offset_calc += table_len
+                            temp_file_idx = f_idx + 1 # Move to next file
+                            temp_row_offset = 0
+                        else: # Target skip point is within this file
+                            temp_file_idx = f_idx
+                            temp_row_offset = total_transactions_to_skip_in_epoch - skipped_txn_count_for_offset_calc
+                            skipped_txn_count_for_offset_calc = total_transactions_to_skip_in_epoch # Met the target
+                            break
+                    except Exception as e_read:
+                        print(f"[WARN] Error reading file {f_path} for resume offset calculation: {e_read}")
+                        # If a file can't be read, this approximation will be off.
+                        # Fallback to simpler division-based estimate if this fails consistently.
+                        pass # Continue to next file or break if count met
+                
+                current_file_idx = temp_file_idx
+                current_row_offset_in_file = temp_row_offset
+                print(f"  Adjusted data loading: Start from file index {current_file_idx}, offset {current_row_offset_in_file} "
+                      f"(approx. {total_transactions_to_skip_in_epoch} transactions).")
+
+        # Reset sliding window for new overall epoch to avoid cross-epoch contamination *unless*
+        # this is the first overall epoch and we are resuming within it.
+        # The sliding window should ideally be saved/loaded with the checkpoint if it's critical.
+        # For simplicity, resetting it unless resuming mid-epoch.
+        if overall_epoch_num > 1 or (overall_epoch_num == 1 and chunks_to_skip_this_epoch == 0):
+            print(f"Resetting sliding window buffer for Overall Epoch {overall_epoch_num} (or first chunk).")
+            sliding_window_buffer = None
+        elif chunks_to_skip_this_epoch > 0:
+            print(f"[INFO] Resuming Overall Epoch {overall_epoch_num} after chunk {chunks_to_skip_this_epoch}. "
+                  "Sliding window buffer is not reloaded from checkpoint (consider if needed). Starting fresh buffer.")
+            sliding_window_buffer = None # TODO: Enhance to save/load sliding_window_buffer with checkpoint if desired.
+
+
+        chunk_iteration_in_epoch = 0 # Reset for this overall epoch's loop
         # Inner Loop for processing chunks within the current overall epoch
         while more_data_to_load:
-            chunk_iteration_in_epoch += 1
-            current_global_chunk_num = ((overall_epoch_num - 1) * (len(all_arrow_files_full_dataset) * 10000 // max_transactions +1 )) + chunk_iteration_in_epoch # Approx for logging
-
-            # Skip chunks that have already been processed when resuming
-            if chunk_iteration_in_epoch <= resume_from_chunk:
-                print(f"Skipping already processed chunk {chunk_iteration_in_epoch}")
+            chunk_iteration_in_epoch += 1 # Current chunk number for this epoch (1-indexed)
+            
+            # Skip chunks that have already been processed in THIS overall_epoch when resuming
+            if chunk_iteration_in_epoch <= chunks_to_skip_this_epoch:
+                print(f"Overall Epoch {overall_epoch_num}: Skipping already processed chunk {chunk_iteration_in_epoch} (Resuming).")
+                # We need to "consume" data for this skipped chunk to advance file pointers correctly
+                # if the initial offset calculation wasn't perfect or if not all chunks were full.
+                # This is complex. The current_file_idx and current_row_offset_in_file set above
+                # should ideally position the loader correctly to start fetching data for the *actual* first chunk to process.
+                # So, the `load_data_chunk_iteratively` will use these updated pointers.
+                # We just need to ensure the loop continues to the next `chunk_iteration_in_epoch`.
+                
+                # If the current_file_idx / offset calculation was accurate for skipping,
+                # then the first call to load_data_chunk_iteratively will fetch the *actual*
+                # first chunk we need to train on. The loop counter `chunk_iteration_in_epoch`
+                # just needs to align with that.
                 continue
 
-            if total_chunks_to_process is not None and chunk_iteration_in_epoch > total_chunks_to_process:
-                print(f"Reached total_chunks_to_process limit ({total_chunks_to_process}) for overall_epoch {overall_epoch_num}.")
-                more_data_to_load = False # Stop processing chunks for this overall epoch
+            # Check against total_chunks_to_process limit for this specific overall epoch
+            if total_chunks_to_process is not None and (chunk_iteration_in_epoch - chunks_to_skip_this_epoch) > total_chunks_to_process:
+                print(f"Overall Epoch {overall_epoch_num}: Reached total_chunks_to_process limit ({total_chunks_to_process} new chunks).")
+                more_data_to_load = False
                 break 
             
-            print(f"\n--- Overall Epoch {overall_epoch_num}, Processing Chunk {chunk_iteration_in_epoch} ---")
+            print(f"\n--- Overall Epoch {overall_epoch_num}, Processing Chunk {chunk_iteration_in_epoch} (Targeting new data after any skips) ---")
             chunk_start_time = time.time()
 
             df_chunk, next_file_idx, next_row_offset, more_data_available = load_data_chunk_iteratively(
